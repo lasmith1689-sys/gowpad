@@ -548,6 +548,9 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
+    // VRAM may have changed since the cached page was copied (uploads, earlier draws
+    // into a buffer this one samples); games do not always TEXFLUSH in between.
+    m_texturePageCache.Invalidate();
     DrawPrimitive(batch);
 }
 
@@ -1484,6 +1487,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         return;
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
         return;
+    m_texturePageCache.Invalidate();
 
     const uint32_t dbp = m_transfer.bitbltbuf.dbp;
     const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);

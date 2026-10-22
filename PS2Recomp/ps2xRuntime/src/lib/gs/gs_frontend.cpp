@@ -4,8 +4,10 @@
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -1067,6 +1069,32 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    // Debug aid: PS2X_GS_TRACE_AT=<seconds> writes the next 40000 GS register writes
+    // after that point to gs_trace.txt in the working directory.
+    static const double s_traceAt = []
+    {
+        const char *value = std::getenv("PS2X_GS_TRACE_AT");
+        return value ? std::atof(value) : -1.0;
+    }();
+    if (s_traceAt >= 0.0)
+    {
+        static const auto s_start = std::chrono::steady_clock::now();
+        static FILE *s_trace = nullptr;
+        static uint32_t s_traced = 0u;
+        if (s_traced < 40000u &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count() >= s_traceAt)
+        {
+            if (!s_trace)
+                s_trace = std::fopen("gs_trace.txt", "w");
+            if (s_trace)
+            {
+                std::fprintf(s_trace, "%02x %016llx\n", regAddr, static_cast<unsigned long long>(value));
+                if (++s_traced == 40000u)
+                    std::fclose(s_trace);
+            }
+        }
+    }
+
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
