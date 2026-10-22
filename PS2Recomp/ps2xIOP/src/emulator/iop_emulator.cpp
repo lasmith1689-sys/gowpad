@@ -617,6 +617,34 @@ namespace ps2x::iop::detail
             }
         }
 
+        // Run threads that are ready now (e.g. woken by an RPC handler) until all of them
+        // block, without advancing time past idle periods. On hardware a woken thread with
+        // higher priority than the RPC server preempts it at once; drivers such as SMPD
+        // keep a single request slot that the next RPC would otherwise overwrite.
+        void runReadyThreads(uint64_t cycleBudget) noexcept
+        {
+            try
+            {
+                const uint64_t limit = totalCycles + cycleBudget;
+                while (totalCycles < limit)
+                {
+                    servicePendingDmaInterrupts();
+                    servicePendingGuestCallbacks();
+                    IopThread *next = kernel.beginNextReady(totalCycles);
+                    if (!next)
+                        break;
+                    const uint64_t before = totalCycles;
+                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, limit - totalCycles)));
+                    kernel.endTimeslice(*next, kThreadReturnSentinel);
+                    if (totalCycles == before)
+                        ++totalCycles;
+                }
+            }
+            catch (...)
+            {
+            }
+        }
+
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
@@ -808,7 +836,9 @@ namespace ps2x::iop::detail
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
-        return m_impl->rpc.handleRpc(request, *m_impl);
+        RpcResult result = m_impl->rpc.handleRpc(request, *m_impl);
+        m_impl->runReadyThreads(kPostRpcCycleBudget);
+        return result;
     }
 
     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept

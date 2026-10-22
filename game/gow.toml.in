@@ -15,6 +15,7 @@ patch_syscalls = false
 patch_cop0 = true
 patch_cache = true
 entry_points = [
+  "0x001001D8", "0x00131AB0", "0x001738D8", "0x00285870",
   "0x00100000",
   "0x00117DA8",
   "0x00118AC8",

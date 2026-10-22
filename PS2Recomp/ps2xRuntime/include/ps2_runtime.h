@@ -381,6 +381,9 @@ public:
     // their own sbrk-based allocator (God of War) never hand out the same memory.
     void pinGuestHeap(uint32_t guestBase, uint32_t guestLimit);
     bool guestHeapPinned() const;
+    // Move the stacks the scheduler runs interrupt handlers/callbacks on (default: the top
+    // 1 MB of RAM, which is where most games keep their main thread stack).
+    void pinAsyncCallbackStacks(uint32_t guestFloor, uint32_t guestTop);
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);

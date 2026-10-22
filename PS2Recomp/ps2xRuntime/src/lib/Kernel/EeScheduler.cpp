@@ -394,10 +394,23 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
-    if (m_pendingEeTimerInterrupts != 0u)
+    const GSRegisters &gs = m_runtime.memory().gs();
+    const uint32_t gsStatus = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
+    const bool gsInterrupt = (gsStatus & ~static_cast<uint32_t>(gs.imr >> 8u) & ~m_gsIrqLatched) != 0u;
+    if (m_pendingEeTimerInterrupts != 0u || gsInterrupt)
     {
         m_checkpointPending.store(true, std::memory_order_release);
     }
+}
+
+uint32_t EeScheduler::risingGsInterrupts()
+{
+    const GSRegisters &gs = m_runtime.memory().gs();
+    const uint32_t status = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
+    m_gsIrqLatched &= status;
+    const uint32_t rising = status & ~static_cast<uint32_t>(gs.imr >> 8u) & ~m_gsIrqLatched;
+    m_gsIrqLatched |= rising;
+    return rising;
 }
 
 bool EeScheduler::isExecutingGuest() const noexcept
@@ -1752,6 +1765,10 @@ void EeScheduler::processPendingEvents()
         {
             dispatchIrq(false, 9u + timer);
         }
+    }
+    if (risingGsInterrupts() != 0u)
+    {
+        dispatchIrq(false, 0u); // INTC_GS
     }
     std::deque<EeEvent> pending;
     {

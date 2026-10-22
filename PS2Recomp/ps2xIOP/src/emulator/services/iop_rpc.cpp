@@ -103,9 +103,17 @@ namespace ps2x::iop::detail
                 }
             }
 
+            static const bool s_logDma = std::getenv("PS2X_LOG_RPC") != nullptr;
             for (uint32_t i = 0u; i < pendingCount; ++i)
             {
                 const PendingTransfer &transfer = pending[i];
+                if (s_logDma)
+                {
+                    char line[128];
+                    std::snprintf(line, sizeof(line), "[IOP dma] iop 0x%x -> ee 0x%x size 0x%x",
+                                  transfer.source, transfer.destination, transfer.size);
+                    m_host.log(LogLevel::Info, line);
+                }
                 if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) || !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
                 {
                     setV0(0u);
@@ -294,6 +302,19 @@ namespace ps2x::iop::detail
             }
         }
 
+        static const bool s_logRequests = std::getenv("PS2X_LOG_RPC") != nullptr;
+        if (s_logRequests && server.buffer != 0u)
+        {
+            const uint32_t physical = IopMemory::physicalAddress(server.buffer);
+            uint32_t words[8] = {};
+            for (uint32_t i = 0; i < 8u && physical + i * 4u + 4u <= IopMemory::RamSize; ++i)
+                words[i] = m_memory.read32(physical + i * 4u);
+            char line[200];
+            std::snprintf(line, sizeof(line), "[IOP rpc] sid=0x%x fn=0x%x send %08x %08x %08x %08x %08x %08x %08x %08x",
+                          request.sid, request.function, words[0], words[1], words[2], words[3],
+                          words[4], words[5], words[6], words[7]);
+            m_host.log(LogLevel::Info, line);
+        }
         uint32_t returnPointer = executor.executeGuestFunction(server.function,
                                                                request.function,
                                                                server.buffer,

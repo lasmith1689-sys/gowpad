@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -1138,6 +1139,36 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
+    // PS2X_WATCH_ADDR=0x...: report every change of that guest word, seen at dispatch granularity
+    static const uint32_t watchAddr = []
+    {
+        const char *value = std::getenv("PS2X_WATCH_ADDR");
+        return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) & 0x01FFFFFCu : 0u;
+    }();
+    if (watchAddr != 0u)
+    {
+        static std::atomic<uint32_t> lastValue{0u};
+        static std::atomic<bool> primed{false};
+        uint32_t current = 0u;
+        std::memcpy(&current, m_memory.getRDRAM() + watchAddr, sizeof(current));
+        const uint32_t previous = lastValue.exchange(current);
+        if (!primed.exchange(true))
+        {
+            std::cerr << "[watch] 0x" << std::hex << watchAddr << " starts as 0x" << current << std::dec << std::endl;
+        }
+        else if (previous != current)
+        {
+            std::cerr << "[watch] 0x" << std::hex << watchAddr << ": 0x" << previous << " -> 0x" << current
+                      << " before dispatch to 0x" << address << " trace=" << formatDispatchHistory() << std::dec << std::endl;
+            static std::atomic<bool> dumped{false};
+            if (!dumped.exchange(true))
+            {
+                std::ofstream ram("watch_ram.bin", std::ios::binary);
+                ram.write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
+            }
+        }
+    }
+
     uint32_t slot = 0u;
     if (generatedFunctionTableSlot(address, slot))
     {
@@ -1811,6 +1842,13 @@ void PS2Runtime::pinGuestHeap(uint32_t guestBase, uint32_t guestLimit)
     m_guestHeapSuggestedBase = base;
     resetGuestHeapLocked(base, guestLimit);
     m_guestHeapPinned = true;
+}
+
+void PS2Runtime::pinAsyncCallbackStacks(uint32_t guestFloor, uint32_t guestTop)
+{
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    m_asyncCallbackStackFloor = alignGuestHeapValue(guestFloor, kGuestHeapDefaultAlignment);
+    m_asyncCallbackStackTop = guestTop & ~(kGuestHeapDefaultAlignment - 1u);
 }
 
 bool PS2Runtime::guestHeapPinned() const
