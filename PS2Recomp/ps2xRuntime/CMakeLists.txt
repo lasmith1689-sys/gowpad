@@ -114,6 +114,15 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
+    if(PS2X_IS_IOS)
+        # rlgl includes <GLES3/gl3.h>; iOS has <OpenGLES/ES3/gl.h> (ios/gles maps one to
+        # the other), and miniaudio needs Objective-C for its Apple backends
+        target_include_directories(raylib PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ios/gles")
+        target_compile_options(raylib PRIVATE $<$<COMPILE_LANGUAGE:C>:-xobjective-c>)
+        target_link_libraries(raylib PUBLIC "-framework OpenGLES" "-framework AVFoundation"
+            "-framework AudioToolbox" "-framework CoreAudio" "-framework Foundation")
+    endif()
+
     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
             imgui
