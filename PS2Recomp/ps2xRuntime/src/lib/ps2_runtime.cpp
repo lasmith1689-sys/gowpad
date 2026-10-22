@@ -445,6 +445,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
         ++s_uploadDebugCount;
     });
+    static const bool s_logDisplay = std::getenv("PS2X_LOG_DISPLAY") != nullptr;
+    if (s_logDisplay && (displayFbp != s_lastDisplayFbp || sourceFbp != s_lastSourceFbp ||
+                         width != s_lastWidth || height != s_lastHeight ||
+                         usedPreferredDisplaySource != s_lastPreferred))
+    {
+        std::cerr << "[display] displayFbp=" << displayFbp << " sourceFbp=" << sourceFbp
+                  << " size=" << width << "x" << height
+                  << " preferred=" << (usedPreferredDisplaySource ? 1 : 0) << std::endl;
+    }
     s_lastDisplayFbp = displayFbp;
     s_lastSourceFbp = sourceFbp;
     s_lastPreferred = usedPreferredDisplaySource;
@@ -476,6 +485,32 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+
+    // Debug aid: PS2X_FRAME_DUMP_EVERY=<seconds> saves the presented frame as
+    // frame_<n>.png in the working directory at that interval.
+    static const double s_dumpEvery = []
+    {
+        const char *value = std::getenv("PS2X_FRAME_DUMP_EVERY");
+        return value ? std::atof(value) : 0.0;
+    }();
+    if (s_dumpEvery > 0.0 && width != 0u && height != 0u)
+    {
+        static const auto s_dumpStart = std::chrono::steady_clock::now();
+        static uint32_t s_dumpIndex = 0u;
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_dumpStart).count();
+        if (elapsed >= s_dumpEvery * (s_dumpIndex + 1u))
+        {
+            ++s_dumpIndex;
+            Image frame{};
+            frame.data = s_uploadBuffer.data();
+            frame.width = static_cast<int>(FB_WIDTH);
+            frame.height = static_cast<int>(std::min<uint32_t>(height, FB_HEIGHT));
+            frame.mipmaps = 1;
+            frame.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            const std::string name = "frame_" + std::to_string(s_dumpIndex) + ".png";
+            ExportImage(frame, name.c_str());
+        }
+    }
 }
 
 PS2Runtime::PS2Runtime()
@@ -1149,6 +1184,12 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     {
         static std::atomic<uint32_t> lastValue{0u};
         static std::atomic<bool> primed{false};
+        // PS2X_WATCH_VALUE=0x...: only report changes to that value
+        static const uint32_t s_watchValue = []
+        {
+            const char *value = std::getenv("PS2X_WATCH_VALUE");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+        }();
         uint32_t current = 0u;
         std::memcpy(&current, m_memory.getRDRAM() + watchAddr, sizeof(current));
         const uint32_t previous = lastValue.exchange(current);
@@ -1156,7 +1197,7 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         {
             std::cerr << "[watch] 0x" << std::hex << watchAddr << " starts as 0x" << current << std::dec << std::endl;
         }
-        else if (previous != current)
+        else if (previous != current && (s_watchValue == 0u || current == s_watchValue))
         {
             std::cerr << "[watch] 0x" << std::hex << watchAddr << ": 0x" << previous << " -> 0x" << current
                       << " before dispatch to 0x" << address << " trace=" << formatDispatchHistory() << std::dec << std::endl;
@@ -1434,7 +1475,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (ctx->pc == entryPc)
+    // A handler that returns without touching ctx->pc has completed the call. A callee
+    // that unwound for a scheduler yield can also be left at its own entry (a nested,
+    // recursive call to the same function was preempted at its dispatch); that is a
+    // resume point, and treating it as completion resumes the caller on the callee's sp.
+    if (ctx->pc == entryPc && !(m_eeScheduler && m_eeScheduler->yieldUnwinding()))
     {
         ctx->pc = fallthroughPc;
     }

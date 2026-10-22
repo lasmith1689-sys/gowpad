@@ -6,6 +6,9 @@
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
+#include <cstdlib>
+#include <chrono>
+#include <cstdio>
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -543,6 +546,12 @@ void GSCpuBackend::ResetUnlocked()
     m_localToHostReadPos = 0u;
 }
 
+namespace
+{
+    // Reference point for the time-based debug traces (static initialization, i.e. process start).
+    const auto g_debugProcessStart = std::chrono::steady_clock::now();
+}
+
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -551,6 +560,58 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     // VRAM may have changed since the cached page was copied (uploads, earlier draws
     // into a buffer this one samples); games do not always TEXFLUSH in between.
     m_texturePageCache.Invalidate();
+    // Debug aid: PS2X_GS_PRIM_TRACE_AT=<seconds> logs the next PS2X_GS_PRIM_TRACE_COUNT (default 4000)
+    // primitives to gs_prims.txt.
+    static const double s_primTraceAt = []
+    {
+        const char *value = std::getenv("PS2X_GS_PRIM_TRACE_AT");
+        return value ? std::atof(value) : -1.0;
+    }();
+    if (s_primTraceAt >= 0.0)
+    {
+        static FILE *s_out = nullptr;
+        static uint32_t s_count = 0u;
+        static const uint32_t s_limit = []
+        {
+            const char *value = std::getenv("PS2X_GS_PRIM_TRACE_COUNT");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 4000u;
+        }();
+        if (s_count < s_limit &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - g_debugProcessStart).count() >= s_primTraceAt)
+        {
+            if (!s_out)
+                s_out = std::fopen("gs_prims.txt", "w");
+            if (s_out)
+            {
+                const auto &st = batch.state;
+                const auto &c = st.context;
+                std::fprintf(s_out, "type=%u tme=%u fst=%u abe=%u ctxt=%u fbp=%u fbw=%u fpsm=%x tbp=%u tbw=%u tpsm=%x tw=%u th=%u tfx=%u clamp=%llx |",
+                             st.prim.type, st.prim.tme, st.prim.fst, st.prim.abe, st.prim.ctxt, c.frame.fbp, c.frame.fbw, c.frame.psm,
+                             c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, c.tex0.tw, c.tex0.th, c.tex0.tfx,
+                             static_cast<unsigned long long>(c.clamp));
+                for (uint32_t i = 0; i < batch.vertexCount; ++i)
+                {
+                    const GSVertex &v = batch.vertices[i];
+                    std::fprintf(s_out, " (%.1f,%.1f z=%.0f uv=%u,%u st=%.4f,%.4f q=%.4f)", v.x, v.y, v.z, v.u, v.v, v.s, v.t, v.q);
+                }
+                std::fprintf(s_out, "\n");
+                if (++s_count == s_limit)
+                    std::fclose(s_out);
+                else
+                    std::fflush(s_out);
+            }
+        }
+    }
+    // Debug aid: PS2X_GS_NO_TEXTURE=1 draws points/lines/triangles untextured (geometry
+    // check); sprites keep textures because games use them to copy/post-process buffers.
+    static const bool s_noTexture = std::getenv("PS2X_GS_NO_TEXTURE") != nullptr;
+    if (s_noTexture && batch.state.prim.tme && batch.state.prim.type != 6u)
+    {
+        GSPrimitiveBatch untextured = batch;
+        untextured.state.prim.tme = 0;
+        DrawPrimitive(untextured);
+        return;
+    }
     DrawPrimitive(batch);
 }
 
@@ -873,6 +934,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     const u32 fpsm = ctx.frame.psm;
     const u32 zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
     const u32 zpsm = ctx.zbuf.psm;
+    // The GS saturates Z to the depth buffer's format before testing and writing.
+    const u32 zmax = (zpsm == GS_PSM_Z24) ? 0x00FFFFFFu
+                     : (zpsm == GS_PSM_Z16 || zpsm == GS_PSM_Z16S) ? 0x0000FFFFu
+                                                                   : 0xFFFFFFFFu;
+    z = static_cast<int>(std::min<u32>(static_cast<u32>(z), zmax));
 
     const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
     if (!writeMask.writesAnything())
@@ -1868,8 +1934,20 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
     const bool fieldMode = smode2.interlaced && !smode2.frameMode;
     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
-    const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
-    const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+    GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+    GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+    // Debug aid: PS2X_PRESENT_FRAME=<fbp>,<fbw>,<psm> scans out that buffer instead of DISPFB.
+    static const char *s_presentOverride = std::getenv("PS2X_PRESENT_FRAME");
+    if (s_presentOverride)
+    {
+        unsigned fbp = 0, fbw = 0, psm = 0;
+        if (std::sscanf(s_presentOverride, "%u,%u,%x", &fbp, &fbw, &psm) == 3)
+        {
+            displayFrame1.fbp = displayFrame2.fbp = fbp;
+            displayFrame1.fbw = displayFrame2.fbw = fbw;
+            displayFrame1.psm = displayFrame2.psm = static_cast<uint8_t>(psm);
+        }
+    }
     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
     const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;

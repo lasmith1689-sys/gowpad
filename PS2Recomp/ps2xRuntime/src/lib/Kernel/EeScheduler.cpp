@@ -296,6 +296,7 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            m_yieldUnwinding = false;
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
@@ -355,6 +356,16 @@ void EeScheduler::postEvent(EeEvent event)
 }
 
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+{
+    const bool due = checkpointDueUnmarked(cycles);
+    if (due)
+    {
+        m_yieldUnwinding = true;
+    }
+    return due;
+}
+
+bool EeScheduler::checkpointDueUnmarked(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
 

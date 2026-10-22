@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 namespace
 {
@@ -106,8 +107,58 @@ namespace
         returnS32(ctx, static_cast<int32_t>(sizeof(data)));
     }
 
+    // Debug aid (PS2X_GOW_TRACE_FNS=0xADDR,0xADDR,...): log sp/ra/a0-a3 around calls to
+    // those guest functions (up to 8), for the first PS2X_GOW_TRACE_LIMIT (default 200) calls each.
+    constexpr size_t kMaxTracedFns = 8;
+    uint32_t g_tracedAddrs[kMaxTracedFns] = {};
+    PS2Runtime::RecompiledFunction g_tracedOriginals[kMaxTracedFns] = {};
+    uint32_t g_tracedCalls[kMaxTracedFns] = {};
+
+    template <size_t I>
+    void tracedFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const uint32_t s_limit = []
+        {
+            const char *value = std::getenv("PS2X_GOW_TRACE_LIMIT");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 200u;
+        }();
+        const bool log = g_tracedCalls[I]++ < s_limit;
+        const uint32_t sp = getRegU32(ctx, 29);
+        if (log)
+            std::fprintf(stderr, "[gow fn] enter 0x%x sp=0x%x ra=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x\n",
+                         g_tracedAddrs[I], sp, getRegU32(ctx, 31), getRegU32(ctx, 4), getRegU32(ctx, 5),
+                         getRegU32(ctx, 6), getRegU32(ctx, 7));
+        g_tracedOriginals[I](rdram, ctx, runtime);
+        if (log)
+            std::fprintf(stderr, "[gow fn] leave 0x%x sp=0x%x (entry 0x%x) pc=0x%x v0=0x%x\n",
+                         g_tracedAddrs[I], getRegU32(ctx, 29), sp, ctx->pc, getRegU32(ctx, 2));
+    }
+
+    template <size_t... I>
+    void installFunctionTraces(PS2Runtime &runtime, std::index_sequence<I...>)
+    {
+        const char *list = std::getenv("PS2X_GOW_TRACE_FNS");
+        if (!list)
+            return;
+        constexpr PS2Runtime::RecompiledFunction wrappers[] = {tracedFunction<I>...};
+        size_t count = 0;
+        for (const char *p = list; *p && count < kMaxTracedFns;)
+        {
+            char *end = nullptr;
+            const uint32_t address = static_cast<uint32_t>(std::strtoul(p, &end, 0));
+            if (end == p)
+                break;
+            g_tracedAddrs[count] = address;
+            g_tracedOriginals[count] = runtime.lookupFunction(address);
+            runtime.registerFunction(address, wrappers[count]);
+            ++count;
+            p = (*end == ',') ? end + 1 : end;
+        }
+    }
+
     void applyGodOfWar(PS2Runtime &runtime)
     {
+        installFunctionTraces(runtime, std::make_index_sequence<kMaxTracedFns>{});
         runtime.registerFunction(kPad2Read, gowPad2Read);
         runtime.registerFunction(kPad2GetButtonProfile, gowPad2GetButtonProfile);
         runtime.registerFunction(kPad2GetState, gowPad2GetState);

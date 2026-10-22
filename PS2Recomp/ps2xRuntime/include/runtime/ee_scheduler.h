@@ -279,6 +279,9 @@ public:
     void requestStop();
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+    // True from a checkpoint that asked guest code to unwind until the scheduler next
+    // resumes guest code; ctx->pc then holds a resume point, not a call's completion.
+    [[nodiscard]] bool yieldUnwinding() const noexcept { return m_yieldUnwinding; }
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
@@ -429,6 +432,8 @@ private:
     uint32_t m_pendingEeTimerInterrupts = 0;
     // GS CSR SIGNAL/FINISH bits already delivered as INTC 0; a bit re-arms once the guest clears it
     uint32_t m_gsIrqLatched = 0;
+    bool m_yieldUnwinding = false;
+    [[nodiscard]] bool checkpointDueUnmarked(uint32_t cycles) noexcept;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
