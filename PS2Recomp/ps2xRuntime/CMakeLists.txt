@@ -647,6 +647,7 @@ if(PS2X_IS_IOS)
 endif()
 
 install(TARGETS ps2_runtime ps2EntryRunner
+    BUNDLE DESTINATION bin
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
