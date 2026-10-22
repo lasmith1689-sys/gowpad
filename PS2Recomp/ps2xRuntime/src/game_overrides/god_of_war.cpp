@@ -57,8 +57,61 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
+    // libpad2 over libdbc talks to dbcman.irx, which drives SIO2 hardware the IOP
+    // emulator does not have. Answer the game's libpad2 calls from the host pad instead:
+    // one DUALSHOCK 2 on socket 0 (18-byte reads: 2 active-low button bytes, rx ry lx ly,
+    // 12 pressures R L U D Tri Cir X Sq L1 R1 L2 R2).
+    constexpr uint32_t kPad2CreateSocket = 0x0027B890u;
+    constexpr uint32_t kPad2Read = 0x0027B9F0u;
+    constexpr uint32_t kPad2GetButtonProfile = 0x0027BAC8u;
+    constexpr uint32_t kPad2GetState = 0x0027BB98u;
+    constexpr uint32_t kPad2GetActuatorCount = 0x0027BF90u;
+    constexpr uint8_t kDualShock2Profile[5] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+
+    void returnS32(R5900Context *ctx, int32_t value)
+    {
+        setReturnS32(ctx, value);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void gowPad2CreateSocket(uint8_t *, R5900Context *ctx, PS2Runtime *) { returnS32(ctx, 0); }
+    void gowPad2GetState(uint8_t *, R5900Context *ctx, PS2Runtime *) { returnS32(ctx, 1); }
+    void gowPad2GetActuatorCount(uint8_t *, R5900Context *ctx, PS2Runtime *) { returnS32(ctx, 0); }
+
+    void gowPad2GetButtonProfile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t out = getRegU32(ctx, 5);
+        std::memcpy(rdram + (out & PS2_RAM_MASK), kDualShock2Profile, sizeof(kDualShock2Profile));
+        returnS32(ctx, static_cast<int32_t>(sizeof(kDualShock2Profile)));
+    }
+
+    void gowPad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        uint8_t raw[32] = {};
+        if (!runtime->padBackend().readState(0, 0, raw, sizeof(raw)))
+        {
+            raw[2] = raw[3] = 0xFFu;
+            raw[4] = raw[5] = raw[6] = raw[7] = 0x80u;
+        }
+        uint8_t data[18] = {};
+        std::memcpy(data, raw + 2, 6); // buttons, rx, ry, lx, ly
+        const uint16_t pressed = static_cast<uint16_t>(~(raw[2] | (raw[3] << 8)));
+        // pressure order -> libpad button bit (low byte: Select L3 R3 Start Up Right Down Left)
+        constexpr uint16_t kPressureBits[12] = {0x0020, 0x0080, 0x0010, 0x0040, 0x1000, 0x2000,
+                                                0x4000, 0x8000, 0x0400, 0x0800, 0x0100, 0x0200};
+        for (int i = 0; i < 12; ++i)
+            data[6 + i] = (pressed & kPressureBits[i]) ? 0xFFu : 0x00u;
+        const uint32_t out = getRegU32(ctx, 5);
+        std::memcpy(rdram + (out & PS2_RAM_MASK), data, sizeof(data));
+        returnS32(ctx, static_cast<int32_t>(sizeof(data)));
+    }
+
     void applyGodOfWar(PS2Runtime &runtime)
     {
+        runtime.registerFunction(kPad2Read, gowPad2Read);
+        runtime.registerFunction(kPad2GetButtonProfile, gowPad2GetButtonProfile);
+        runtime.registerFunction(kPad2GetState, gowPad2GetState);
+        runtime.registerFunction(kPad2GetActuatorCount, gowPad2GetActuatorCount);
         runtime.registerFunction(0x001738D8u, gowSetHandlerSlot);
         runtime.registerFunction(0x00131AB0u, gowReturn);
         runtime.pinGuestHeap(kRuntimeHeapBase, kRuntimeHeapLimit);
