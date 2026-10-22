@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace ps2x::iop::detail
 {
@@ -16,6 +17,23 @@ namespace ps2x::iop::detail
             const uint32_t mask = alignment - 1u;
             return (value + mask) & ~mask;
         }
+    }
+
+    std::vector<std::string> IopKernel::describeThreads() const
+    {
+        static const char *const kStates[] = {"dormant", "ready", "running", "sleep", "delay",
+                                              "sema", "eventflag", "suspended", "dead"};
+        std::vector<std::string> out;
+        for (const auto &[id, t] : m_threads)
+        {
+            char line[200];
+            std::snprintf(line, sizeof(line),
+                          "IOP thread %d %s pc=0x%x ra=0x%x entry=0x%x prio=%u wait=%d bits=0x%x",
+                          id, kStates[static_cast<int>(t.state)], t.cpu.pc, t.cpu.gpr[31], t.entry,
+                          t.priority, t.waitId, t.waitBits);
+            out.emplace_back(line);
+        }
+        return out;
     }
 
     IopKernel::IopKernel(IopMemory &memory) noexcept

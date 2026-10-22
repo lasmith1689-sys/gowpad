@@ -43,10 +43,6 @@ cp "$game"/SCUS_973.99 "$game"/SYSTEM.CNF "$game"/GODOFWAR.TOC "$game"/IOPRP300.
 for f in "$game"/*.IRX; do
   cp "$f" "$bundle/IOP_MOD/$(basename "$f" | tr '[:upper:]' '[:lower:]')"
 done
-# 989snd stays out: without the IRX the runtime's silent 989snd stand-in answers
-# (the real driver fails its start-up on the emulated IOP and never replies)
-rm -f "$bundle/IOP_MOD/989nomid.irx"
-
 echo "▶ iOS build ($jobs jobs)"
 cmake -S "$work/src" -B "$work/ios" -G Ninja \
   -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_OSX_ARCHITECTURES=arm64 \

@@ -2411,14 +2411,18 @@ void PS2Runtime::run()
     if (const char *dumpAtEnv = std::getenv("PS2X_DUMP_RAM_AT"))
     {
         const double dumpAtSeconds = std::atof(dumpAtEnv);
+        std::cerr << "[debug] guest RAM dump armed for " << dumpAtSeconds << " s" << std::endl;
         std::thread([this, dumpAtSeconds]()
                     {
                         std::this_thread::sleep_for(std::chrono::duration<double>(dumpAtSeconds));
+                        std::cerr << "[debug] writing guest RAM dump" << std::endl;
                         std::ofstream ram("ram.bin", std::ios::binary);
                         ram.write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
                         std::ofstream regs("ram.regs.txt");
                         regs << std::hex << "pc=0x" << m_debugPc.load() << " ra=0x" << m_debugRa.load()
                              << " sp=0x" << m_debugSp.load() << " gp=0x" << m_debugGp.load() << std::endl;
+                        for (const std::string &line : iopDebugSnapshot().diagnostics)
+                            std::cerr << "[debug] " << line << std::endl;
                         std::cout << "[debug] dumped guest RAM" << std::endl; })
             .detach();
     }

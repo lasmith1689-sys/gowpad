@@ -614,17 +614,46 @@ namespace ps2x::iop::detail
             module.entry = loaded.entry;
             module.gp = loaded.gp;
 
-            uint32_t args = 0u;
+            // start(int argc, char **argv), as loadcore calls it: argv[0] is the module
+            // path, then each NUL-separated argument from the load request, then NULL
+            std::vector<std::string> argStrings{module.path};
             if (arguments && argumentSize)
             {
-                args = allocate(argumentSize + 1u, 16u);
-                if (args)
+                const char *text = static_cast<const char *>(arguments);
+                std::string current;
+                for (uint32_t i = 0; i < argumentSize; ++i)
                 {
-                    writeRam(args, arguments, argumentSize);
-                    write8(args + argumentSize, 0u);
+                    if (text[i] != '\0')
+                    {
+                        current += text[i];
+                        continue;
+                    }
+                    if (!current.empty())
+                        argStrings.push_back(current);
+                    current.clear();
                 }
+                if (!current.empty())
+                    argStrings.push_back(current);
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            const uint32_t argc = static_cast<uint32_t>(argStrings.size());
+            uint32_t stringBytes = 0u;
+            for (const std::string &s : argStrings)
+                stringBytes += static_cast<uint32_t>(s.size()) + 1u;
+            const uint32_t pointerBytes = (argc + 1u) * 4u;
+            const uint32_t args = allocate(pointerBytes + stringBytes, 16u);
+            if (args)
+            {
+                uint32_t cursor = args + pointerBytes;
+                for (uint32_t i = 0; i < argc; ++i)
+                {
+                    const std::string &s = argStrings[i];
+                    writeRam(cursor, s.c_str(), static_cast<uint32_t>(s.size()) + 1u);
+                    write32(args + i * 4u, cursor);
+                    cursor += static_cast<uint32_t>(s.size()) + 1u;
+                }
+                write32(args + argc * 4u, 0u);
+            }
+            const uint32_t startResult = callFunction(module.entry, args ? argc : 0u, args, 0u, 0u, module.gp);
             if (args)
                 freeAllocation(args);
             module.resident = startResult == 0u || startResult == 2u;
@@ -820,6 +849,11 @@ namespace ps2x::iop::detail
     uint32_t IopEmulator::threadCount() const noexcept
     {
         return static_cast<uint32_t>(m_impl->kernel.threadCount());
+    }
+
+    std::vector<std::string> IopEmulator::describeThreads() const
+    {
+        return m_impl->kernel.describeThreads();
     }
 
     uint32_t IopEmulator::rpcServerCount() const noexcept

@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -67,6 +69,8 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        // one line per thread: id, state, pc, ra, entry, priority, what it waits on
+        [[nodiscard]] std::vector<std::string> describeThreads() const;
 
     private:
         struct Semaphore
