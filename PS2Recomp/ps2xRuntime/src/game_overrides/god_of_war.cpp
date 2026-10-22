@@ -14,8 +14,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -86,6 +90,62 @@ namespace
         returnS32(ctx, static_cast<int32_t>(sizeof(kDualShock2Profile)));
     }
 
+    // Debug aid: PS2X_GOW_INPUT="<sec>:<btn>+<btn>,<sec>:none,..." holds those buttons from
+    // <sec> after start until the next entry (names below), on top of the host pad.
+    const auto g_processStart = std::chrono::steady_clock::now();
+
+    uint16_t scriptedButtons()
+    {
+        struct Step
+        {
+            double at;
+            uint16_t mask;
+        };
+        static const std::vector<Step> steps = []
+        {
+            std::vector<Step> parsed;
+            const char *script = std::getenv("PS2X_GOW_INPUT");
+            if (!script)
+                return parsed;
+            static const std::pair<const char *, uint16_t> kNames[] = {
+                {"select", 0x0001}, {"l3", 0x0002}, {"r3", 0x0004}, {"start", 0x0008},
+                {"up", 0x0010}, {"right", 0x0020}, {"down", 0x0040}, {"left", 0x0080},
+                {"l2", 0x0100}, {"r2", 0x0200}, {"l1", 0x0400}, {"r1", 0x0800},
+                {"triangle", 0x1000}, {"circle", 0x2000}, {"cross", 0x4000}, {"square", 0x8000}};
+            std::string text(script);
+            size_t pos = 0;
+            while (pos < text.size())
+            {
+                const size_t end = std::min(text.find(',', pos), text.size());
+                const std::string item = text.substr(pos, end - pos);
+                const size_t colon = item.find(':');
+                if (colon != std::string::npos)
+                {
+                    Step step{std::atof(item.substr(0, colon).c_str()), 0};
+                    std::string buttons = item.substr(colon + 1) + "+";
+                    for (size_t b = 0; b < buttons.size();)
+                    {
+                        const size_t plus = buttons.find('+', b);
+                        const std::string name = buttons.substr(b, plus - b);
+                        for (const auto &[label, bit] : kNames)
+                            if (name == label)
+                                step.mask |= bit;
+                        b = plus + 1;
+                    }
+                    parsed.push_back(step);
+                }
+                pos = end + 1;
+            }
+            return parsed;
+        }();
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
+        uint16_t mask = 0;
+        for (const Step &step : steps)
+            if (now >= step.at)
+                mask = step.mask;
+        return mask;
+    }
+
     void gowPad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint8_t raw[32] = {};
@@ -94,6 +154,9 @@ namespace
             raw[2] = raw[3] = 0xFFu;
             raw[4] = raw[5] = raw[6] = raw[7] = 0x80u;
         }
+        const uint16_t scripted = scriptedButtons();
+        raw[2] &= static_cast<uint8_t>(~scripted);
+        raw[3] &= static_cast<uint8_t>(~(scripted >> 8));
         uint8_t data[18] = {};
         std::memcpy(data, raw + 2, 6); // buttons, rx, ry, lx, ly
         const uint16_t pressed = static_cast<uint16_t>(~(raw[2] | (raw[3] << 8)));

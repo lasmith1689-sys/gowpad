@@ -234,6 +234,8 @@ private:
     bool m_viBranchBackupValid = false;
     uint8_t *m_activeVuData = nullptr;
     uint32_t m_activeVuDataSize = 0;
+    const uint8_t *m_activeVuCode = nullptr;
+    uint32_t m_activeVuCodeSize = 0;
     GS *m_activeGs = nullptr;
     PS2Memory *m_activeMemory = nullptr;
     bool m_stopRequested = false;

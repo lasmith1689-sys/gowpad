@@ -879,17 +879,17 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
             else if (format == 1u)
                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-            else if (format == 2u)
+            else // FLG 2 (IMAGE) and FLG 3, which the GIF handles exactly like IMAGE
                 tagBytes += static_cast<uint64_t>(nloop) * 16u;
-            else
-            {
-                reportReservedInstruction(false, 0xFFFFFFF8u);
-                m_xgkick.active = false;
-                return;
-            }
 
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
             {
+                uint64_t tagHi = 0;
+                std::memcpy(&tagHi, m_xgkick.packet.data() + qwordOffset + 8u, sizeof(tagHi));
+                RUNTIME_ERROR("[VU1 xgkick] oversized GIFtag lo=0x" << std::hex << tagLo << " hi=0x" << tagHi
+                              << " nloop=0x" << nloop << " flg=" << format << " nreg=" << std::dec << nreg
+                              << " offset=" << qwordOffset << " source=0x" << std::hex << m_xgkick.sourceAddress
+                              << std::dec << '\n');
                 reportReservedInstruction(false, 0xFFFFFFFBu);
                 m_xgkick.active = false;
                 return;
@@ -1574,6 +1574,32 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
 
 void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
 {
+    // Debug aid: PS2X_DUMP_VU_ON_FAULT=1 saves micro/data memory and VI registers once.
+    static const bool s_dumpOnFault = std::getenv("PS2X_DUMP_VU_ON_FAULT") != nullptr;
+    static bool s_dumped = false;
+    if (s_dumpOnFault && !s_dumped)
+    {
+        s_dumped = true;
+        if (FILE *out = std::fopen("vu_fault_code.bin", "wb"))
+        {
+            if (m_activeVuCode)
+                std::fwrite(m_activeVuCode, 1, m_activeVuCodeSize, out);
+            std::fclose(out);
+        }
+        if (FILE *out = std::fopen("vu_fault_data.bin", "wb"))
+        {
+            if (m_activeVuData)
+                std::fwrite(m_activeVuData, 1, m_activeVuDataSize, out);
+            std::fclose(out);
+        }
+        if (FILE *out = std::fopen("vu_fault_regs.txt", "w"))
+        {
+            std::fprintf(out, "pc=0x%x top=0x%x itop=0x%x\n", m_state.pc, m_state.top, m_state.itop);
+            for (int r = 0; r < 16; ++r)
+                std::fprintf(out, "vi%d=0x%x\n", r, static_cast<unsigned>(m_state.vi[r]) & 0xFFFFu);
+            std::fclose(out);
+        }
+    }
     RUNTIME_ERROR(
         "[VU" << (m_unit == Unit::VU1 ? "1" : "0")
               << " reserved " << (upper ? "upper" : "lower")
@@ -1626,6 +1652,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 {
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
+    m_activeVuCode = vuCode;
+    m_activeVuCodeSize = codeSize;
     m_activeGs = &gs;
     m_activeMemory = memory;
 

@@ -585,9 +585,11 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
             {
                 const auto &st = batch.state;
                 const auto &c = st.context;
-                std::fprintf(s_out, "type=%u tme=%u fst=%u abe=%u ctxt=%u fbp=%u fbw=%u fpsm=%x tbp=%u tbw=%u tpsm=%x tw=%u th=%u tfx=%u clamp=%llx |",
+                std::fprintf(s_out, "type=%u tme=%u fst=%u abe=%u ctxt=%u fbp=%u fbw=%u fpsm=%x tbp=%u tbw=%u tpsm=%x tw=%u th=%u tfx=%u cbp=%u cpsm=%x csm=%u csa=%u tcc=%u alpha=%llx test=%llx clamp=%llx |",
                              st.prim.type, st.prim.tme, st.prim.fst, st.prim.abe, st.prim.ctxt, c.frame.fbp, c.frame.fbw, c.frame.psm,
                              c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, c.tex0.tw, c.tex0.th, c.tex0.tfx,
+                             c.tex0.cbp, c.tex0.cpsm, c.tex0.csm, c.tex0.csa, c.tex0.tcc,
+                             static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test),
                              static_cast<unsigned long long>(c.clamp));
                 for (uint32_t i = 0; i < batch.vertexCount; ++i)
                 {

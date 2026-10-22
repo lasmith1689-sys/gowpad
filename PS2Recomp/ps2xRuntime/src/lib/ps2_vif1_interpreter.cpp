@@ -1,5 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -403,6 +405,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
+            {
+                static const bool s_logVu1 = std::getenv("PS2X_LOG_VU1") != nullptr;
+                static uint32_t s_logged = 0u;
+                if (s_logVu1 && s_logged++ < 400u)
+                    std::fprintf(stderr, "[VU1 mscal] pc=0x%x\n", startPC);
+            }
 
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
@@ -469,6 +477,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             uint32_t destAddr = (uint32_t)imm * 8u;
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
+            {
+                // Debug aid: PS2X_LOG_VU1=1 logs VU1 microprogram uploads and starts.
+                static const bool s_logVu1 = std::getenv("PS2X_LOG_VU1") != nullptr;
+                static uint32_t s_logged = 0u;
+                if (s_logVu1 && s_logged++ < 400u)
+                    std::fprintf(stderr, "[VU1 mpg] dest=0x%x bytes=0x%x avail=0x%x\n", destAddr, mpgBytes, sizeBytes - pos);
+            }
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
             {
                 uint32_t copyBytes = mpgBytes;
