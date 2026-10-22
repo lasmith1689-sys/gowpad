@@ -15,6 +15,11 @@
 #include <algorithm>
 #include <cstdlib>
 
+#if defined(PS2X_IOS)
+#include <SDL.h>
+#include <SDL_main.h> // the app's main() becomes SDL_main, started by SDL's UIApplication
+#endif
+
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <unistd.h>
@@ -140,8 +145,34 @@ namespace
         return result;
     }
 
+#if defined(PS2X_IOS)
+    // Read-only game files (guest ELF, IRX modules, TOC) ship in the bundle's
+    // Resources/game; the disc image and saves live in the app's Documents.
+    std::filesystem::path iosBundleGameDir()
+    {
+        char *base = SDL_GetBasePath();
+        const std::filesystem::path root = base ? std::filesystem::path(base) : std::filesystem::path(".");
+        SDL_free(base);
+        // (iOS bundles are flat; CMake may still keep the Resources/ prefix)
+        if (std::filesystem::exists(root / "Resources" / "game"))
+            return root / "Resources" / "game";
+        return root / "game";
+    }
+
+    std::filesystem::path iosDocumentsDir()
+    {
+        const char *home = std::getenv("HOME");
+        return std::filesystem::path(home ? home : ".") / "Documents";
+    }
+#endif
+
     std::filesystem::path getExecutablePath(int argc, char *argv[])
     {
+#if defined(PS2X_IOS) && defined(PS2X_DEFAULT_BOOT_ELF)
+        (void)argc;
+        (void)argv;
+        return iosBundleGameDir() / PS2X_DEFAULT_BOOT_ELF;
+#endif
         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
         {
             std::cout << "Using argv boot path" << std::endl;
@@ -170,6 +201,9 @@ int main(int argc, char *argv[])
     redirectStdioToLogcat();
 #endif
     setupTerminateLogger();
+    // keep logs when output goes to a file and the process is stopped from outside
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::cout << std::unitbuf;
 
     try
     {
@@ -224,6 +258,38 @@ int main(int argc, char *argv[])
         {
             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
             return 1;
+        }
+        // Raw disc image for sector reads: games that read by LSN (God of War's TOC
+        // spans both DVD layers) need it. PS2X_CD_IMAGE, else disc.iso beside the ELF.
+        {
+            PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+            const char *image = std::getenv("PS2X_CD_IMAGE");
+            if (image && *image)
+                paths.cdImage = image;
+            else if (std::filesystem::exists(paths.elfDirectory / "disc.iso"))
+                paths.cdImage = paths.elfDirectory / "disc.iso";
+#if defined(PS2X_IOS)
+            const std::filesystem::path docs = iosDocumentsDir();
+            std::error_code ec;
+            for (const auto &entry : std::filesystem::directory_iterator(docs, ec))
+            {
+                std::string ext = entry.path().extension().string();
+                std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (entry.is_regular_file() && ext == ".iso")
+                {
+                    paths.cdImage = entry.path();
+                    break;
+                }
+            }
+            paths.hostRoot = docs;
+            paths.mcRoot = docs / "mc0";
+            std::filesystem::create_directories(paths.mcRoot, ec);
+            if (paths.cdImage.empty())
+                std::cerr << "No .iso in " << docs.string() << "; copy the disc image there with the Files app." << std::endl;
+#endif
+            if (!paths.cdImage.empty())
+                std::cout << "CD image: " << paths.cdImage.string() << std::endl;
+            PS2Runtime::setIoPaths(paths);
         }
 
         runtime.run();

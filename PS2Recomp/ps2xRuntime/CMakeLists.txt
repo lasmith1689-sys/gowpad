@@ -47,6 +47,18 @@ if(ANDROID)
     set(PS2X_IS_ANDROID ON)
 endif()
 
+# iOS: raylib on SDL2 with OpenGL ES 3 (raylib's GLFW backend has no iOS),
+# runner packaged as an app bundle.
+set(PS2X_IS_IOS OFF)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(PS2X_IS_IOS ON)
+    set(PS2X_ENABLE_DEBUG_UI OFF CACHE BOOL "" FORCE)
+    set(PS2X_IOS_BUNDLE_ID "com.example.ps2x" CACHE STRING "iOS bundle identifier")
+    set(PS2X_IOS_APP_NAME "PS2X" CACHE STRING "iOS app display name")
+    set(PS2X_IOS_RESOURCES "" CACHE STRING "Files copied into the app bundle (guest ELF and loose disc files)")
+endif()
+
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
 set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
 set(PS2X_VITA_TITLEID "RANJ00001" CACHE STRING "9-character Vita title id")
@@ -73,6 +85,25 @@ else()
 
     if(PS2X_IS_ANDROID)
         set(PLATFORM "Android" CACHE STRING "" FORCE)
+    endif()
+
+    if(PS2X_IS_IOS)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            SDL2
+            GIT_REPOSITORY "https://github.com/libsdl-org/SDL.git"
+            GIT_TAG "release-2.30.11"
+            GIT_SHALLOW TRUE
+            OVERRIDE_FIND_PACKAGE
+        )
+        FetchContent_MakeAvailable(SDL2)
+        if(NOT TARGET SDL2::SDL2)
+            add_library(SDL2::SDL2 ALIAS SDL2-static)
+        endif()
+        set(PLATFORM "SDL" CACHE STRING "" FORCE)
+        set(OPENGL_VERSION "ES 3.0" CACHE STRING "" FORCE)
     endif()
 
     FetchContent_Declare(
@@ -589,6 +620,29 @@ endif()
 
 if(PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
+endif()
+
+if(PS2X_IS_IOS)
+    target_link_libraries(ps2EntryRunner PRIVATE SDL2::SDL2main
+        "-framework UIKit" "-framework Foundation" "-framework OpenGLES" "-framework QuartzCore"
+        "-framework CoreGraphics" "-framework AVFoundation" "-framework AudioToolbox" "-framework CoreAudio"
+        "-framework CoreMotion" "-framework GameController" "-framework CoreHaptics" "-framework Metal")
+    target_compile_definitions(ps2EntryRunner PRIVATE PS2X_IOS=1)
+    set(PS2X_IOS_BUNDLE_FILES "")
+    foreach(PS2X_IOS_RESOURCE IN LISTS PS2X_IOS_RESOURCES)
+        target_sources(ps2EntryRunner PRIVATE "${PS2X_IOS_RESOURCE}")
+        set_source_files_properties("${PS2X_IOS_RESOURCE}" PROPERTIES
+            MACOSX_PACKAGE_LOCATION "Resources/game" HEADER_FILE_ONLY TRUE SKIP_UNITY_BUILD_INCLUSION TRUE)
+    endforeach()
+    set_target_properties(ps2EntryRunner PROPERTIES
+        MACOSX_BUNDLE TRUE
+        OUTPUT_NAME "${PS2X_IOS_APP_NAME}"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "${PS2X_IOS_BUNDLE_ID}"
+        MACOSX_BUNDLE_BUNDLE_NAME "${PS2X_IOS_APP_NAME}"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${PS2X_IOS_BUNDLE_ID}"
+        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+        XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO")
 endif()
 
 install(TARGETS ps2_runtime ps2EntryRunner

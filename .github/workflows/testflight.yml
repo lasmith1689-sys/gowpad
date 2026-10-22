@@ -1,0 +1,79 @@
+name: TestFlight
+
+# My personal GoWPad: God of War (USA) statically recompiled from my own disc's
+# executable with PS2Recomp, built on GitHub's Mac runner, signed with Apple's
+# cloud signing and uploaded to TestFlight for internal testing only. The game
+# input arrives encrypted (release asset `game-input`, key in the GAME_KEY
+# secret), is decrypted only inside the runner, and nothing derived from it is
+# cached or kept as an artifact. The disc image itself never leaves my devices:
+# it is copied into the app's Documents folder on the phone.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  testflight:
+    name: Recompile, build, sign and upload to TestFlight
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      GOWPAD_BUNDLE_ID: com.lasmith1689.gowpad
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Pick the newest Xcode and free disk space
+        run: |
+          xcode=$(for x in /Applications/Xcode_*.app; do [ -L "$x" ] || echo "$x"; done | sort -V | tail -n 1)
+          xcode=$(cd "$xcode" && pwd -P)
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          echo "Using $xcode"
+          for other in /Applications/Xcode*.app; do
+            [ -L "$other" ] && continue
+            [ "$(cd "$other" && pwd -P)" = "$xcode" ] || sudo rm -rf "$other" &
+          done
+          sudo rm -rf "${ANDROID_HOME:-/nonexistent}" "$HOME/.dotnet" /usr/local/share/dotnet &
+          wait
+          df -h /
+      - name: Install build tools
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          brew install cmake ninja
+      - name: Decrypt my game input inside the runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAME_KEY: ${{ secrets.GAME_KEY }}
+        run: |
+          [ -n "$GAME_KEY" ] || { echo "::error::Add the GAME_KEY secret first."; exit 1; }
+          mkdir -p "$RUNNER_TEMP/input"
+          gh release download game-input -R "$GITHUB_REPOSITORY" -p gow-input.tar.enc -D "$RUNNER_TEMP/input"
+          /opt/homebrew/opt/openssl@3/bin/openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 \
+            -pass env:GAME_KEY -in "$RUNNER_TEMP/input/gow-input.tar.enc" -out "$RUNNER_TEMP/input/gow-input.tar"
+          tar -xf "$RUNNER_TEMP/input/gow-input.tar" -C "$RUNNER_TEMP/input"
+          rm -f "$RUNNER_TEMP/input/gow-input.tar.enc" "$RUNNER_TEMP/input/gow-input.tar"
+          ls -la "$RUNNER_TEMP/input/game"
+      - name: Recompile and build the app
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: '3'
+        run: bash .github/scripts/build-ios.sh "$RUNNER_TEMP/input/game" "$RUNNER_TEMP/work"
+      - name: Sign and upload
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        # (the build number: run × 10 + attempt, growing with every upload and every re-run)
+        run: BUILD_NUMBER=$((GITHUB_RUN_NUMBER * 10 + GITHUB_RUN_ATTEMPT)) bash .github/scripts/testflight.sh "$RUNNER_TEMP/work/GoWPad.app"
+      - name: Remove the game input and everything built from it
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/input" "$RUNNER_TEMP/work" "$RUNNER_TEMP/testflight"
+          df -h /
