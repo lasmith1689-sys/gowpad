@@ -34,10 +34,14 @@ rm -f "$work/src/ps2xRuntime/src/runner/register_functions.cpp"
 find "$work/generated" -maxdepth 1 -name '*.cpp' -exec cp {} "$work/src/ps2xRuntime/src/runner/" +
 cp "$work/generated/"*.h "$work/src/ps2xRuntime/include/"
 
-# read-only game files that ship inside the app (the disc image itself goes in Documents)
-resources=""
-for f in "$game"/SCUS_973.99 "$game"/SYSTEM.CNF "$game"/GODOFWAR.TOC "$game"/IOPRP300.IMG "$game"/*.IRX; do
-  resources="$resources${resources:+;}$f"
+# read-only game files that ship inside the app (the disc image itself goes in Documents);
+# the game loads its IOP modules as IOP_MOD/<name>.irx
+bundle="$work/bundle-game"
+rm -rf "$bundle"
+mkdir -p "$bundle/IOP_MOD"
+cp "$game"/SCUS_973.99 "$game"/SYSTEM.CNF "$game"/GODOFWAR.TOC "$game"/IOPRP300.IMG "$game"/*.IRX "$bundle/"
+for f in "$game"/*.IRX; do
+  cp "$f" "$bundle/IOP_MOD/$(basename "$f" | tr '[:upper:]' '[:lower:]')"
 done
 
 echo "▶ iOS build ($jobs jobs)"
@@ -48,7 +52,7 @@ cmake -S "$work/src" -B "$work/ios" -G Ninja \
   -DPS2X_ENABLE_FFMPEG=OFF -DPS2X_ENABLE_SCCACHE=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF \
   -DPS2X_DEFAULT_BOOT_ELF=SCUS_973.99 \
   -DPS2X_IOS_BUNDLE_ID="${GOWPAD_BUNDLE_ID:-com.lasmith1689.gowpad}" -DPS2X_IOS_APP_NAME=GoWPad \
-  "-DPS2X_IOS_RESOURCES=$resources" > "$work/ios-configure.log" 2>&1 || { tail -60 "$work/ios-configure.log"; exit 1; }
+  "-DPS2X_IOS_GAME_DIR=$bundle" > "$work/ios-configure.log" 2>&1 || { tail -60 "$work/ios-configure.log"; exit 1; }
 start=$SECONDS
 cmake --build "$work/ios" --target ps2EntryRunner -j "$jobs" > "$work/ios-build.log" 2>&1 || {
   grep -E "error:|FAILED" "$work/ios-build.log" | head -40; tail -20 "$work/ios-build.log"; exit 1; }

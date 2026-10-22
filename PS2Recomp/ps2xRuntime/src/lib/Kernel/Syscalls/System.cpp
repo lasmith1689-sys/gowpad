@@ -557,6 +557,13 @@ namespace ps2_syscalls
             heapLimit = kDefaultGuestHeapEnd;
         }
 
+        if (runtime && runtime->guestHeapPinned())
+        {
+            // the runtime's allocations live elsewhere; the heap here is the game's
+            setReturnU32(ctx, heapBase);
+            return;
+        }
+
         if (runtime)
         {
             runtime->configureGuestHeap(heapBase, heapLimit);
@@ -586,7 +593,7 @@ namespace ps2_syscalls
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
 
         const uint32_t ret = runtime
-                                 ? runtime->guestHeapLimit()
+                                 ? (runtime->guestHeapPinned() ? runtime->guestHeapBase() : runtime->guestHeapLimit())
                                  : kDefaultGuestHeapEnd;
 
         setReturnU32(ctx, ret);

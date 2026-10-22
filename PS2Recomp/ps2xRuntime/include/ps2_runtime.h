@@ -376,6 +376,11 @@ public:
     void handleTLBP(uint8_t *rdram, R5900Context *ctx);
     void clearLLBit(R5900Context *ctx);
     void configureGuestHeap(uint32_t guestBase, uint32_t guestLimit = PS2_RAM_SIZE);
+    // Keep the runtime's own guest allocations in [guestBase, guestLimit) for good:
+    // SetupHeap no longer moves them and EndOfHeap reports guestBase, so games with
+    // their own sbrk-based allocator (God of War) never hand out the same memory.
+    void pinGuestHeap(uint32_t guestBase, uint32_t guestLimit);
+    bool guestHeapPinned() const;
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
@@ -513,6 +518,7 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
+    bool m_guestHeapPinned = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 

@@ -56,7 +56,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(PS2X_ENABLE_DEBUG_UI OFF CACHE BOOL "" FORCE)
     set(PS2X_IOS_BUNDLE_ID "com.example.ps2x" CACHE STRING "iOS bundle identifier")
     set(PS2X_IOS_APP_NAME "PS2X" CACHE STRING "iOS app display name")
-    set(PS2X_IOS_RESOURCES "" CACHE STRING "Files copied into the app bundle (guest ELF and loose disc files)")
+    set(PS2X_IOS_GAME_DIR "" CACHE PATH "Folder copied into the app bundle as game/ (guest ELF, loose disc files, IOP_MOD/)")
 endif()
 
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
@@ -470,6 +470,8 @@ target_sources(ps2_runtime PRIVATE
 
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+    # per-game fixes; in the runner so their static registrations are always linked
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/game_overrides/*.cpp"
 )
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
@@ -628,12 +630,11 @@ if(PS2X_IS_IOS)
         "-framework CoreGraphics" "-framework AVFoundation" "-framework AudioToolbox" "-framework CoreAudio"
         "-framework CoreMotion" "-framework GameController" "-framework CoreHaptics" "-framework Metal")
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_IOS=1)
-    set(PS2X_IOS_BUNDLE_FILES "")
-    foreach(PS2X_IOS_RESOURCE IN LISTS PS2X_IOS_RESOURCES)
-        target_sources(ps2EntryRunner PRIVATE "${PS2X_IOS_RESOURCE}")
-        set_source_files_properties("${PS2X_IOS_RESOURCE}" PROPERTIES
-            MACOSX_PACKAGE_LOCATION "Resources/game" HEADER_FILE_ONLY TRUE SKIP_UNITY_BUILD_INCLUSION TRUE)
-    endforeach()
+    if(PS2X_IOS_GAME_DIR)
+        add_custom_command(TARGET ps2EntryRunner POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_directory "${PS2X_IOS_GAME_DIR}" "$<TARGET_BUNDLE_CONTENT_DIR:ps2EntryRunner>/game"
+            VERBATIM)
+    endif()
     set_target_properties(ps2EntryRunner PROPERTIES
         MACOSX_BUNDLE TRUE
         OUTPUT_NAME "${PS2X_IOS_APP_NAME}"

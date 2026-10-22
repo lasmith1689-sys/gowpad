@@ -292,6 +292,7 @@
     X(sceCdDelayThread)                       \
     X(sceCdDiskReady)                         \
     X(sceCdGetDiskType)                       \
+    X(sceCdReadDvdDualInfo)                   \
     X(sceCdGetError)                          \
     X(sceCdGetReadPos)                        \
     X(sceCdGetToc)                            \

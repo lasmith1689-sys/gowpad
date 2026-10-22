@@ -22,7 +22,9 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // modules load from 0x10000; God of War's (989snd, smpd and friends,
+        // ~300 KB) need far less than 1 MB while its sound modules need more heap
+        static constexpr uint32_t HeapBase = 0x00080000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation

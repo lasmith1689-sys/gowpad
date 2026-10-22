@@ -1804,9 +1804,28 @@ void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
     coalesceGuestHeapLocked();
 }
 
+void PS2Runtime::pinGuestHeap(uint32_t guestBase, uint32_t guestLimit)
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    const uint32_t base = alignGuestHeapValue(guestBase, kGuestHeapDefaultAlignment);
+    m_guestHeapSuggestedBase = base;
+    resetGuestHeapLocked(base, guestLimit);
+    m_guestHeapPinned = true;
+}
+
+bool PS2Runtime::guestHeapPinned() const
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    return m_guestHeapPinned;
+}
+
 void PS2Runtime::configureGuestHeap(uint32_t guestBase, uint32_t guestLimit)
 {
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    if (m_guestHeapPinned)
+    {
+        return;
+    }
     uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
     if (normalizedBase == 0u)
     {
@@ -2386,6 +2405,23 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+    // Debug aid: PS2X_DUMP_RAM_AT=<seconds> writes guest RAM (ram.bin) and the
+    // EE pc/ra/sp/gp (ram.regs.txt) to the working directory once, that long after start.
+    // (a detached watchdog thread: the host loop can be blocked by a stuck guest)
+    if (const char *dumpAtEnv = std::getenv("PS2X_DUMP_RAM_AT"))
+    {
+        const double dumpAtSeconds = std::atof(dumpAtEnv);
+        std::thread([this, dumpAtSeconds]()
+                    {
+                        std::this_thread::sleep_for(std::chrono::duration<double>(dumpAtSeconds));
+                        std::ofstream ram("ram.bin", std::ios::binary);
+                        ram.write(reinterpret_cast<const char *>(m_memory.getRDRAM()), PS2_RAM_SIZE);
+                        std::ofstream regs("ram.regs.txt");
+                        regs << std::hex << "pc=0x" << m_debugPc.load() << " ra=0x" << m_debugRa.load()
+                             << " sp=0x" << m_debugSp.load() << " gp=0x" << m_debugGp.load() << std::endl;
+                        std::cout << "[debug] dumped guest RAM" << std::endl; })
+            .detach();
+    }
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({

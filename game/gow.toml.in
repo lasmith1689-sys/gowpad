@@ -15,6 +15,7 @@ patch_syscalls = false
 patch_cop0 = true
 patch_cache = true
 stubs = [
+  "sceCdReadDvdDualInfo@0x0027AB00",
   "SetGsCrt@0x00293820",
   "AddIntcHandler@0x00293900",
   "AddIntcHandler@0x00293910",
