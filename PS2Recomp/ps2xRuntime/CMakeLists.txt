@@ -119,7 +119,7 @@ else()
         # the other), and miniaudio needs Objective-C for its Apple backends
         target_include_directories(raylib PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ios/gles")
         target_compile_options(raylib PRIVATE $<$<COMPILE_LANGUAGE:C>:-xobjective-c>)
-        target_link_libraries(raylib PUBLIC "-framework OpenGLES" "-framework AVFoundation"
+        target_link_libraries(raylib "-framework OpenGLES" "-framework AVFoundation"
             "-framework AudioToolbox" "-framework CoreAudio" "-framework Foundation")
     endif()
 

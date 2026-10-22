@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -300,6 +302,18 @@ namespace ps2x::iop::detail
                                                                server.gp);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
+        static const bool s_logReplies = std::getenv("PS2X_LOG_RPC") != nullptr;
+        if (s_logReplies)
+        {
+            const uint32_t physical = IopMemory::physicalAddress(returnPointer);
+            uint32_t words[4] = {};
+            for (uint32_t i = 0; i < 4u && physical + i * 4u + 4u <= IopMemory::RamSize; ++i)
+                words[i] = m_memory.read32(physical + i * 4u);
+            char line[160];
+            std::snprintf(line, sizeof(line), "[IOP rpc] sid=0x%x fn=0x%x reply@0x%x = %08x %08x %08x %08x",
+                          request.sid, request.function, returnPointer, words[0], words[1], words[2], words[3]);
+            m_host.log(LogLevel::Info, line);
+        }
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
         {
             const uint32_t physical = IopMemory::physicalAddress(returnPointer);

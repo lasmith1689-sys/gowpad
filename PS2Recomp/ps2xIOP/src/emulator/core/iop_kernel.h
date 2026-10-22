@@ -69,6 +69,14 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        // Synchronous calls (RPC handlers, module start, callbacks) run outside any thread:
+        // a blocking import there must not suspend whichever thread happened to run last.
+        IopThread *swapCurrentThread(IopThread *thread) noexcept
+        {
+            IopThread *previous = m_currentThread;
+            m_currentThread = thread;
+            return previous;
+        }
         // one line per thread: id, state, pc, ra, entry, priority, what it waits on
         [[nodiscard]] std::vector<std::string> describeThreads() const;
 

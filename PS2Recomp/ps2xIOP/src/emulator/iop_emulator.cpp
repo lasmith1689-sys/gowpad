@@ -244,6 +244,22 @@ namespace ps2x::iop::detail
             {
                 cpu.gpr[2] = value;
             };
+            // PS2X_LOG_IOP_IMPORTS=lib1,lib2 logs those libraries' calls (args a0..a3, caller ra)
+            static const std::string s_traceLibs = []()
+            {
+                const char *env = std::getenv("PS2X_LOG_IOP_IMPORTS");
+                return env ? "," + std::string(env) + "," : std::string();
+            }();
+            if (!s_traceLibs.empty() && s_traceLibs.find("," + std::string(call.library) + ",") != std::string::npos)
+            {
+                std::ostringstream out;
+                out << "[IOP import] " << call.library << ":" << call.ordinal << std::hex
+                    << " a0=0x" << cpu.gpr[4] << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6]
+                    << " a3=0x" << cpu.gpr[7] << " ra=0x" << cpu.gpr[31];
+                if (iequals(call.library, "ioman") && (call.ordinal == 4u || call.ordinal == 0x14u))
+                    out << " path=\"" << memory.readString(cpu.gpr[4], 128u) << "\"";
+                log(LogLevel::Info, out.str());
+            }
 
             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
@@ -455,7 +471,20 @@ namespace ps2x::iop::detail
                 cpu.gpr[29] = kCallStackBase - 32u;
             }
             cpu.gpr[31] = kCallReturnSentinel;
+            IopThread *const suspendedThread = kernel.swapCurrentThread(nullptr);
+            const uint64_t startInstructions = totalInstructions;
             runCpu(cpu, budget);
+            (void)kernel.swapCurrentThread(suspendedThread);
+            static const bool s_logCalls = std::getenv("PS2X_LOG_RPC") != nullptr;
+            if (s_logCalls && cpu.pc != kCallReturnSentinel)
+            {
+                std::ostringstream out;
+                out << "[IOP call] 0x" << std::hex << address << " ended early at pc=0x" << cpu.pc
+                    << " ra=0x" << cpu.gpr[31] << (cpu.stopped ? " stopped" : "")
+                    << (cpu.yielded ? " yielded" : "") << std::dec << " after "
+                    << (totalInstructions - startInstructions) << " instructions (budget " << budget << ")";
+                log(LogLevel::Warning, out.str());
+            }
             return cpu.gpr[2];
         }
 

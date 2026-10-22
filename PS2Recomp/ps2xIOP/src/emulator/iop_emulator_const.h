@@ -10,6 +10,8 @@ constexpr uint64_t kIopClockHz = 36'864'000ull;
 constexpr uint64_t kVblankPeriodCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
 constexpr uint64_t kVblankEndPhaseCycles = kVblankPeriodCycles / 16ull;
 constexpr uint32_t kDefaultSlice = 256u;
-constexpr uint32_t kMaxCallInstructions = 2'000'000u;
+// Cap for synchronous calls (RPC handlers, module start). God of War's SMPD init parses
+// GODOFWAR.TOC inside its RPC handler: tens of millions of instructions.
+constexpr uint32_t kMaxCallInstructions = 400'000'000u;
 constexpr uint32_t kModuleLoadBase = 0x00010000u;
 constexpr uint32_t kStackGuardBytes = 64u;
