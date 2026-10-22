@@ -28,6 +28,7 @@ add_library(ps2_iop STATIC
     src/modules/dbcman.cpp
     src/modules/libsd.cpp
     src/modules/mcserv.cpp
+    src/modules/snd989.cpp
 )
 
 target_compile_features(ps2_iop PUBLIC cxx_std_20)

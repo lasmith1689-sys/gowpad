@@ -409,6 +409,16 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 
+    // int sceChk01(u32 *result): Sony's disc check uploads a small module to the
+    // IOP and stores its verdict in *result; games hang unless the module loaded
+    // (return >= 0) and the verdict is 0. There is no disc drive to check here.
+    void sceChk01(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (uint8_t *p = getMemPtr(rdram, getRegU32(ctx, 4)))
+            std::memset(p, 0, sizeof(uint32_t));
+        setReturnS32(ctx, 1);
+    }
+
     void sceCdGetReadPos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnU32(ctx, g_cdStreamingLbn);

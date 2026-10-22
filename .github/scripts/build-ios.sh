@@ -31,7 +31,7 @@ echo "▶ Staging the generated code into a copy of the runtime"
 rm -rf "$work/src"
 cp -R "$root/PS2Recomp" "$work/src"
 rm -f "$work/src/ps2xRuntime/src/runner/register_functions.cpp"
-find "$work/generated" -maxdepth 1 -name '*.cpp' -exec cp {} "$work/src/ps2xRuntime/src/runner/" +
+rsync -a --include='*.cpp' --exclude='*' "$work/generated/" "$work/src/ps2xRuntime/src/runner/"
 cp "$work/generated/"*.h "$work/src/ps2xRuntime/include/"
 
 # read-only game files that ship inside the app (the disc image itself goes in Documents);
@@ -43,6 +43,9 @@ cp "$game"/SCUS_973.99 "$game"/SYSTEM.CNF "$game"/GODOFWAR.TOC "$game"/IOPRP300.
 for f in "$game"/*.IRX; do
   cp "$f" "$bundle/IOP_MOD/$(basename "$f" | tr '[:upper:]' '[:lower:]')"
 done
+# 989snd stays out: without the IRX the runtime's silent 989snd stand-in answers
+# (the real driver fails its start-up on the emulated IOP and never replies)
+rm -f "$bundle/IOP_MOD/989nomid.irx"
 
 echo "▶ iOS build ($jobs jobs)"
 cmake -S "$work/src" -B "$work/ios" -G Ninja \

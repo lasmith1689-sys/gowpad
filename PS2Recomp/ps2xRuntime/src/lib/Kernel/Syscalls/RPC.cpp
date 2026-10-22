@@ -18,6 +18,16 @@ namespace ps2_syscalls
 
         void pushSifRpcDebugEventLocked(SifRpcDebugEvent event)
         {
+            // PS2X_LOG_RPC=1 also writes each event to stderr (the history is panel-only otherwise)
+            static const bool s_logRpc = std::getenv("PS2X_LOG_RPC") != nullptr;
+            if (s_logRpc)
+            {
+                std::cerr << std::hex << "[rpc] " << (event.op ? event.op : "?")
+                          << " sid=0x" << event.sid << " fn=0x" << event.rpcNum << " mode=0x" << event.mode
+                          << " client=0x" << event.clientPtr << " send=" << std::dec << event.sendSize
+                          << " recv=" << event.recvSize << std::hex << " flags=0x" << event.flags
+                          << " ra=0x" << event.ra << " thread=" << std::dec << event.threadId << std::endl;
+            }
             event.seq = ++g_sif_rpc_debug_next_seq;
             g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
         }

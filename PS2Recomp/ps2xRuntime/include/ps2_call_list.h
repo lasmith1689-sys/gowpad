@@ -293,6 +293,7 @@
     X(sceCdDiskReady)                         \
     X(sceCdGetDiskType)                       \
     X(sceCdReadDvdDualInfo)                   \
+    X(sceChk01)                               \
     X(sceCdGetError)                          \
     X(sceCdGetReadPos)                        \
     X(sceCdGetToc)                            \
