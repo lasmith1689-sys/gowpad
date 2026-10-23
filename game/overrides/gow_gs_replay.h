@@ -18,7 +18,11 @@
 #include <fstream>
 #include <mutex>
 #include <type_traits>
+#if defined(USE_SSE2NEON)
+#include "sse2neon.h" // GOW-Port: ARM (Switch)
+#else
 #include <xmmintrin.h>
+#endif
 
 namespace gow_gs_replay
 {
