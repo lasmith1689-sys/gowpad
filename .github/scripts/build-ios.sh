@@ -1,60 +1,54 @@
 #!/bin/bash
-# Recompiles God of War's EE code from my decrypted game input and builds the
-# unsigned iPhone/iPad app around PS2Recomp's runtime (iOS port: raylib on
-# SDL2 + OpenGL ES 3, see PS2Recomp/ps2xRuntime/CMakeLists.txt).
+# Builds GoWPad: God of War (USA) as native iPhone/iPad code, on Waffle565's God of War runtime (a PS2Recomp fork,
+# vendored in PS2Recomp/ with its OpenGL ES port) plus my decrypted game input. The input holds the game's own files and
+# the code generated from them on my PC: the recompiled EE functions, the VU1 microprograms compiled to C++ and the IOP
+# modules compiled to C++. Nothing is recompiled here; this only stages and compiles.
 #
-# Usage: build-ios.sh GAME_DIR WORK_DIR
-#   GAME_DIR  SCUS_973.99, the loose disc files and gow_functions.csv (Ghidra map)
-#   WORK_DIR  scratch space; the app ends up at WORK_DIR/GoWPad.app
+# Usage: build-ios.sh INPUT_DIR WORK_DIR [device|simulator]
+#   INPUT_DIR  game/ (SCUS_973.99, IRX modules, IOP_MOD/, TOC, blank.ps2) and generated/ (ee/, vu1/, iop/)
+#   WORK_DIR   scratch space; the app ends up at WORK_DIR/GoWPad.app
 # Environment: GOWPAD_BUNDLE_ID
 set -euo pipefail
 
-game=$(cd "$1" && pwd)
+input=$(cd "$1" && pwd)
 mkdir -p "$2"
 work=$(cd "$2" && pwd)
+target=${3:-device}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 jobs=${CMAKE_BUILD_PARALLEL_LEVEL:-$(sysctl -n hw.ncpu)}
+case "$target" in
+  device) sysroot=iphoneos; platform=iPhoneOS ;;
+  simulator) sysroot=iphonesimulator; platform=iPhoneSimulator ;;
+  *) echo "::error::target must be device or simulator"; exit 1 ;;
+esac
 
-echo "▶ Recompiler (host build)"
-cmake -S "$root/PS2Recomp" -B "$work/recomp" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF > "$work/recomp-configure.log"
-cmake --build "$work/recomp" --target ps2_recomp -j "$jobs" > "$work/recomp-build.log" || { tail -40 "$work/recomp-build.log"; exit 1; }
-
-echo "▶ Recompiling the game's EE code"
-sed -e "s|@GAME_DIR@|$game|g" -e "s|@OUT_DIR@|$work/generated|g" "$root/game/gow.toml.in" > "$work/gow.toml"
-"$work/recomp/ps2xRecomp/ps2_recomp" "$work/gow.toml" > "$work/recomp.log" 2>&1 || { tail -40 "$work/recomp.log"; exit 1; }
-tail -n 2 "$work/recomp.log"
-echo "  $(find "$work/generated" -name '*.cpp' | wc -l | tr -d ' ') generated sources"
-
-echo "▶ Staging the generated code into a copy of the runtime"
+echo "▶ Staging the runtime with the generated code ($target)"
 rm -rf "$work/src"
 cp -R "$root/PS2Recomp" "$work/src"
-rm -f "$work/src/ps2xRuntime/src/runner/register_functions.cpp"
-rsync -a --include='*.cpp' --exclude='*' "$work/generated/" "$work/src/ps2xRuntime/src/runner/"
-cp "$work/generated/"*.h "$work/src/ps2xRuntime/include/"
+runner="$work/src/ps2xRuntime/src/runner"
+rm -f "$runner"/*.cpp
+rsync -a --include='*.cpp' --exclude='*' "$input/generated/ee/" "$runner/"
+cp "$input/generated/ee/"*.h "$work/src/ps2xRuntime/include/"
+cp "$root/game/overrides/gow_overrides.cpp" "$root/game/overrides/"*.h "$runner/"
+cp "$input/generated/iop/"*.cpp "$work/src/ps2xIOP/src/native/"
+echo "  $(find "$runner" -name '*.cpp' | wc -l | tr -d ' ') EE sources, $(ls "$input/generated/iop" | wc -l | tr -d ' ') IOP files," \
+  "$(find "$input/generated/vu1" -name '*.cpp' | wc -l | tr -d ' ') VU1 files"
 
-# read-only game files that ship inside the app (the disc image itself goes in Documents);
-# the game loads its IOP modules as IOP_MOD/<name>.irx
-bundle="$work/bundle-game"
-rm -rf "$bundle"
-mkdir -p "$bundle/IOP_MOD"
-cp "$game"/SCUS_973.99 "$game"/SYSTEM.CNF "$game"/GODOFWAR.TOC "$game"/IOPRP300.IMG "$game"/*.IRX "$bundle/"
-for f in "$game"/*.IRX; do
-  cp "$f" "$bundle/IOP_MOD/$(basename "$f" | tr '[:upper:]' '[:lower:]')"
-done
 echo "▶ iOS build ($jobs jobs)"
 cmake -S "$work/src" -B "$work/ios" -G Ninja \
-  -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=$sysroot -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DCMAKE_BUILD_TYPE=Release \
   -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF \
-  -DPS2X_ENABLE_FFMPEG=OFF -DPS2X_ENABLE_SCCACHE=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF \
-  -DPS2X_DEFAULT_BOOT_ELF=SCUS_973.99 \
+  -DPS2X_ENABLE_FFMPEG=OFF -DPS2X_ENABLE_SCCACHE=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_RUNTIME_LOGS=OFF \
+  -DPS2X_ENABLE_IOP_RPC_TRACE=OFF -DPS2X_VU1_PREGENERATED_DIR="$input/generated/vu1" \
   -DPS2X_IOS_BUNDLE_ID="${GOWPAD_BUNDLE_ID:-com.lasmith1689.gowpad}" -DPS2X_IOS_APP_NAME=GoWPad \
-  "-DPS2X_IOS_GAME_DIR=$bundle" > "$work/ios-configure.log" 2>&1 || { tail -60 "$work/ios-configure.log"; exit 1; }
+  -DPS2X_IOS_GAME_DIR="$input/game" -DPS2X_IOS_PLATFORM_NAME=$platform \
+  > "$work/ios-configure.log" 2>&1 || { tail -80 "$work/ios-configure.log"; exit 1; }
+grep -E "VU1 compilada|ARM|sse2neon" "$work/ios-configure.log" || true
 start=$SECONDS
 cmake --build "$work/ios" --target ps2EntryRunner -j "$jobs" > "$work/ios-build.log" 2>&1 || {
-  grep -E "error:|FAILED" "$work/ios-build.log" | head -40; tail -20 "$work/ios-build.log"; exit 1; }
+  grep -E "error:|FAILED" "$work/ios-build.log" | head -60; tail -30 "$work/ios-build.log"; exit 1; }
 echo "  compiled in $(( (SECONDS - start) / 60 )) min"
 
 app=$(find "$work/ios" -maxdepth 3 -name 'GoWPad.app' -type d | head -n 1)
@@ -72,7 +66,7 @@ cat > "$icons/Contents.json" <<'EOF'
   "info": { "author": "xcode", "version": 1 } }
 EOF
 printf '{ "info": { "author": "xcode", "version": 1 } }\n' > "$work/Assets.xcassets/Contents.json"
-xcrun actool "$work/Assets.xcassets" --compile "$app" --platform iphoneos --minimum-deployment-target 16.0 \
+xcrun actool "$work/Assets.xcassets" --compile "$app" --platform $sysroot --minimum-deployment-target 16.0 \
   --app-icon AppIcon --target-device iphone --target-device ipad \
   --output-partial-info-plist "$work/icon-info.plist" > "$work/actool.log"
 /usr/libexec/PlistBuddy -c "Merge $work/icon-info.plist" "$app/Info.plist"

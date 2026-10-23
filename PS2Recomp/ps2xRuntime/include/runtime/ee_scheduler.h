@@ -279,10 +279,20 @@ public:
     void requestStop();
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
-    // True from a checkpoint that asked guest code to unwind until the scheduler next
-    // resumes guest code; ctx->pc then holds a resume point, not a call's completion.
-    [[nodiscard]] bool yieldUnwinding() const noexcept { return m_yieldUnwinding; }
+    // The generated code reaches this through PS2Runtime::eeCheckpointDue after EeCheckpointClock::advanceQuiet
+    // (the fast path that defers the timer and IOP cycles while nothing can be due).
+    // Hands the deferred cycles to the EE timers and the IOP (below their next step by construction); limitsChanged
+    // also makes the next checkpoint a full one (an EE timer write can bring its next event closer).
+    void syncDeferredCycles(bool limitsChanged) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
+    // GOW-Port: for a guest busy-wait that never blocks (the movie player): when guest time has fallen behind the
+    // host clock (a scheduled event's host deadline has passed but its guest cycle is not reached), account the
+    // missing cycles (at most maxCycles) so guest time, EE timers and the IOP keep real time. Returns cycles added.
+    uint64_t catchUpToHost(uint64_t maxCycles) noexcept;
+    // GOW-Port: for guest countdown loops run natively (gow_overrides vid wait loops): takes up to maxCount
+    // checkpoints of `cycles` each at once, as many as EeCheckpointClock::advanceQuiet would let through one by one
+    // (all below quietCycles, no flag set). Same clock, timer and IOP state as that many fast-path checkpoints.
+    uint64_t advanceQuietRepeated(uint32_t cycles, uint64_t maxCount) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
@@ -318,6 +328,8 @@ public:
 
     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
     int cancelAlarm(int id);
+    // Blocks the current thread for `cycles` EE cycles of guest time, then resumes it with KE_OK (native DelayThread).
+    [[noreturn]] void delayCurrent(uint64_t cycles);
     void queueInvocation(GuestInvocation invocation);
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
@@ -386,8 +398,8 @@ private:
     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
     void applyPendingPreemption();
     void processPendingEvents();
-    // CSR SIGNAL/FINISH bits that became set and are not masked by IMR since the last call
-    uint32_t risingGsInterrupts();
+    // GOW-Port: interrupcion INTC 0 (GS) en el flanco de subida de CSR.SIGNAL/FINISH no enmascarados en IMR.
+    void pollGsInterrupt();
     void processDueDeadlines();
     void processEvent(const EeEvent &event);
     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
@@ -402,6 +414,8 @@ private:
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);
     void publishIdleDebugContext();
+    void loadSharedVu0Random(R5900Context &context);
+    void saveSharedVu0Random(const R5900Context &context);
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;
@@ -427,20 +441,17 @@ private:
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
     int m_currentThreadId = 0;
     bool m_rescheduleRequested = false;
+    bool m_sharedVu0RandomValid = false;
+    __m128 m_sharedVu0Random{};
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
-    // GS CSR SIGNAL/FINISH bits already delivered as INTC 0; a bit re-arms once the guest clears it
-    uint32_t m_gsIrqLatched = 0;
-    bool m_yieldUnwinding = false;
-    [[nodiscard]] bool checkpointDueUnmarked(uint32_t cycles) noexcept;
-    uint64_t m_eeCycle = 0;
+    EeCheckpointClock &m_clock; // PS2Runtime::m_eeClock: guest cycle, checkpoint fast path and its flags
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};
-    std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
 
     mutable std::mutex m_eventMutex;
@@ -458,6 +469,8 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    bool checkpointDueFull(uint32_t cycles) noexcept;
+    uint64_t quietCycles() const noexcept;
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

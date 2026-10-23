@@ -22,7 +22,7 @@
 	<string>1</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
-		<string>iPhoneOS</string>
+		<string>${PS2X_IOS_PLATFORM_NAME}</string>
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>

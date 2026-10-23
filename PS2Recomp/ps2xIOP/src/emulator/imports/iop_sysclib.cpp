@@ -125,22 +125,27 @@ namespace ps2x::iop::detail
         case 18: // prnt
             setV0(0);
             return true;
-        case 19: // sprintf(dst, fmt, ...): arguments in a2, a3, then the o32 stack slots
-        case 42: // vsprintf(dst, fmt, va_list): arguments are words at a2
+        case 19: // sprintf(buf, fmt, ...): argumentos en a2, a3 y despues en la pila desde sp+16 (o32)
+        case 42: // vsprintf(buf, fmt, va_list)
         {
-            const std::string format = m_memory.readString(a1, 4096u);
             uint32_t argIndex = 0u;
-            const auto nextArg = [&]() -> uint32_t
+            uint32_t vaPointer = a2;
+            const std::function<uint32_t()> nextArg = [&]() -> uint32_t
             {
-                const uint32_t i = argIndex++;
                 if (ordinal == 42u)
-                    return m_memory.read32(cpu.gpr[6] + i * 4u);
-                if (i < 2u)
-                    return cpu.gpr[6u + i];
-                return m_memory.read32(cpu.gpr[29] + 16u + (i - 2u) * 4u);
+                {
+                    const uint32_t value = m_memory.read32(vaPointer);
+                    vaPointer += 4u;
+                    return value;
+                }
+                const uint32_t index = argIndex++;
+                if (index == 0u)
+                    return cpu.gpr[6];
+                if (index == 1u)
+                    return cpu.gpr[7];
+                return m_memory.read32(cpu.gpr[29] + 16u + (index - 2u) * 4u);
             };
-            const std::string text = formatIopString(format, nextArg,
-                                                     [&](uint32_t address) { return m_memory.readString(address, 512u); });
+            const std::string text = formatGuestString(m_memory, a1, nextArg);
             for (size_t i = 0; i <= text.size(); ++i)
                 m_memory.write8(a0 + static_cast<uint32_t>(i), i < text.size() ? static_cast<uint8_t>(text[i]) : 0u);
             setV0(static_cast<uint32_t>(text.size()));

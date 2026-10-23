@@ -25,9 +25,12 @@
 
 #include "ps2_log.h"
 #include "runtime/ps2_address.h"
+#include "runtime/ee_checkpoint_clock.h"
+#include "runtime/ps2_inline.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_frontend.h"
+class GSHostPresentation; // GOW-Port: el header público no depende de raylib.
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
@@ -376,14 +379,6 @@ public:
     void handleTLBP(uint8_t *rdram, R5900Context *ctx);
     void clearLLBit(R5900Context *ctx);
     void configureGuestHeap(uint32_t guestBase, uint32_t guestLimit = PS2_RAM_SIZE);
-    // Keep the runtime's own guest allocations in [guestBase, guestLimit) for good:
-    // SetupHeap no longer moves them and EndOfHeap reports guestBase, so games with
-    // their own sbrk-based allocator (God of War) never hand out the same memory.
-    void pinGuestHeap(uint32_t guestBase, uint32_t guestLimit);
-    bool guestHeapPinned() const;
-    // Move the stacks the scheduler runs interrupt handlers/callbacks on (default: the top
-    // 1 MB of RAM, which is where most games keep their main thread stack).
-    void pinAsyncCallbackStacks(uint32_t guestFloor, uint32_t guestTop);
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
@@ -391,7 +386,13 @@ public:
     uint32_t guestHeapBase() const;
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
-    uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+    uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment);
+    // GOW-Port: las pilas de interrupciones/callbacks se reservan desde lo alto de la RAM hacia abajo; este
+    // limite las mantiene por debajo de la pila del hilo principal (que SetupThread coloca tambien arriba).
+    void limitAsyncCallbackStackTop(uint32_t top);
+    // GOW-Port: rango fijo para el heap interno del runtime (guestMalloc), separado del que el juego
+    // configura con SetupHeap. Sin llamarlo, el runtime usa el heap de SetupHeap como en PS2Recomp.
+    void setPrivateGuestHeap(uint32_t base, uint32_t limit);
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
@@ -401,7 +402,11 @@ public:
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
     void postEeEvent(EeEvent event);
-    bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
+    // GOW-Port: the generated code's checkpoint: the quiet-cycle fast path inline, the full checkpoint out of line.
+    bool eeCheckpointDue(uint32_t cycles = 32u) noexcept
+    {
+        return !m_eeClock.advanceQuiet(cycles) && eeCheckpointDueFull(cycles);
+    }
     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
 
     struct EeExitHandlerRegistration
@@ -434,9 +439,10 @@ public:
                                  uint32_t tadr,
                                  uint32_t chcr);
 
-    static inline bool isSpecialAddress(uint32_t addr)
+    static PS2_FORCEINLINE bool isSpecialAddress(uint32_t addr)
     {
-        return Ps2IsSpecialAddress(addr);
+        // main RAM (almost every access) inline, the rest of the check out of line
+        return addr >= PS2_RAM_SIZE && Ps2IsSpecialAddress(addr);
     }
 
 public:
@@ -490,7 +496,9 @@ private:
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
+    [[nodiscard]] uint64_t iopEeCyclesUntilBatch() const noexcept;
     void resetIop();
+    void shutdownHostGraphics(); // GOW-Port: destruir GS antes de cerrar el contexto raylib.
 
     friend class PS2IopTransport;
     friend class EeScheduler;
@@ -499,6 +507,8 @@ private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     GS m_gs;
+    std::unique_ptr<GSHostPresentation> m_hostPresentation;
+    bool m_hostWindowOwned = false;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     PS2AudioBackend m_audioBackend;
@@ -521,7 +531,8 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
-    bool m_guestHeapPinned = false;
+    uint32_t m_privateGuestHeapBase = 0u;
+    uint32_t m_privateGuestHeapLimit = 0u;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 
@@ -552,6 +563,10 @@ private:
     std::vector<LoadedModule> m_loadedModules;
     uint8_t *m_boundRdram = nullptr;
     uint8_t *m_boundGSVram = nullptr;
+    // Incremented on the EE executor when generated code yields at a checkpoint.
+    uint64_t m_eeCheckpointSerial = 0u;
+    EeCheckpointClock m_eeClock; // driven by m_eeScheduler (EeScheduler::m_clock)
+    bool eeCheckpointDueFull(uint32_t cycles) noexcept;
 };
 
 // Generated by ps2xRecomp in ps2xRuntime/src/runner/register_functions.cpp.

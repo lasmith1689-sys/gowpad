@@ -38,7 +38,9 @@ enum GSGifFormat : uint8_t
     GIF_FMT_PACKED = 0,
     GIF_FMT_REGLIST = 1,
     GIF_FMT_IMAGE = 2,
-    GIF_FMT_DISABLED = 3,
+    // GOW-Port: compatibilidad IMAGE2, como GSState::Transfer de PCSX2 (32ac6e2).
+    GIF_FMT_IMAGE2 = 3,
+    GIF_FMT_DISABLED = GIF_FMT_IMAGE2, // conservar el nombre publico anterior
 };
 
 enum GSRegId : uint8_t
@@ -123,6 +125,7 @@ struct GSFrameReg
     uint32_t fbw = 0;
     uint8_t psm = 0;
     uint32_t fbmsk = 0;
+    bool operator==(const GSFrameReg &) const = default;
 };
 
 struct GSZbufReg
@@ -130,6 +133,7 @@ struct GSZbufReg
     uint32_t zbp = 0;
     uint8_t psm = 0;
     bool zmask = false;
+    bool operator==(const GSZbufReg &) const = default;
 };
 
 struct GSScissorReg
@@ -138,6 +142,7 @@ struct GSScissorReg
     uint16_t x1 = 0;
     uint16_t y0 = 0;
     uint16_t y1 = 0;
+    bool operator==(const GSScissorReg &) const = default;
 };
 
 struct GSTex0Reg
@@ -154,12 +159,14 @@ struct GSTex0Reg
     uint8_t csm = 0;
     uint8_t csa = 0;
     uint8_t cld = 0;
+    bool operator==(const GSTex0Reg &) const = default;
 };
 
 struct GSXYOffsetReg
 {
     uint16_t ofx = 0;
     uint16_t ofy = 0;
+    bool operator==(const GSXYOffsetReg &) const = default;
 };
 
 struct GSTexaReg
@@ -167,6 +174,7 @@ struct GSTexaReg
     uint8_t ta0 = 0;
     bool aem = false;
     uint8_t ta1 = 0;
+    bool operator==(const GSTexaReg &) const = default;
 };
 
 struct GSTexClutReg
@@ -174,6 +182,7 @@ struct GSTexClutReg
     uint8_t cbw = 0;
     uint8_t cou = 0;
     uint16_t cov = 0;
+    bool operator==(const GSTexClutReg &) const = default;
 };
 
 struct GSContext
@@ -190,6 +199,7 @@ struct GSContext
     uint64_t alpha = 0;
     uint64_t test = 0;
     uint64_t fba = 0;
+    bool operator==(const GSContext &) const = default;
 };
 
 struct GSPrimReg
@@ -203,6 +213,7 @@ struct GSPrimReg
     bool fst = false;
     bool ctxt = false;
     bool fix = false;
+    bool operator==(const GSPrimReg &) const = default;
 };
 
 struct GSBitBltBuf
@@ -247,12 +258,23 @@ struct GSDrawState
     uint16_t textureWidth = 1;
     uint16_t textureHeight = 1;
     bool linearFilter = false;
+    // GOW-Port: member-wise (the structs have padding bytes, which a memcmp would compare; their values depend on how
+    // each copy was made, so equal states could compare unequal and split GL batches)
+    bool operator==(const GSDrawState &) const = default;
 };
 
-struct GSPrimitiveBatch
+// GOW-Port: the per-primitive part of a draw; a run of them shares one GSDrawState (GSRasterBackend::SubmitRun).
+struct GSPrimitiveVerts
 {
     std::array<GSVertex, 3> vertices{};
     uint8_t vertexCount = 0;
+    // GS::m_stateSerial when the draw state was built (0: unknown). Equal non-zero serials mean the same state, so the
+    // queue and the backend skip comparing the whole state for every triangle.
+    uint64_t stateSerial = 0;
+};
+
+struct GSPrimitiveBatch : GSPrimitiveVerts
+{
     GSDrawState state{};
 };
 
@@ -288,6 +310,12 @@ struct GSPresentationRequest
     GSFrameReg preferredSource{};
     uint32_t preferredDestFbp = 0;
     bool hasPreferredSource = false;
+    // GOW-Port: solo las capturas explicitas descargan pixeles en modo compartido.
+    bool forceReadback = false;
+    // GOW-Port: RAM frames read back asynchronously (pixel pack buffer + fence): Present returns the newest earlier
+    // frame whose copy has finished, or an empty frame when none has. Set by the threaded backend, which keeps the
+    // last frame for the frontend (GSThreadedBackend::Present).
+    bool asyncReadback = false;
 };
 
 struct PresentationFrame

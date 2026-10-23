@@ -52,8 +52,6 @@ namespace ps2_stubs
     void sceCdDelayThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdDiskReady(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdGetDiskType(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-    void sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-    void sceChk01(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdGetReadPos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdGetToc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

@@ -27,6 +27,12 @@ namespace ps2x::iop
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        // runEeCycles split in two so the caller can time only the real IOP work: accrue returns true when a batch
+        // is due, then runPendingEeCycles runs it (same result as runEeCycles).
+        [[nodiscard]] bool accrueEeCycles(uint64_t eeCycles) noexcept;
+        // EE cycles that can still accrue before accrueEeCycles reports a batch (0: the next call does).
+        [[nodiscard]] uint64_t eeCyclesUntilBatch() const noexcept;
+        void runPendingEeCycles() noexcept;
 
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
@@ -42,6 +48,10 @@ namespace ps2x::iop
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
 
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
+
+        // GOW-Port: salida del SPU2 emulado, estereo intercalado a 48 kHz. Puede llamarse desde el hilo de audio del
+        // host. Si hay mas de maxLatencyFrames acumulados, se descartan los mas antiguos.
+        size_t drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames = SIZE_MAX);
 
     private:
         class Impl;

@@ -1,70 +1,125 @@
 #pragma once
 
+// GOW-Port: formateo estilo printf para sysclib sprintf/vsprintf y stdio printf del IOP.
+// Antes, sprintf copiaba el formato literal: SMPD_IOP.IRX de God of War hace sprintf(buf, "%s.wad", nombre)
+// para buscar sus recursos y acababa buscando "%S.WAD".
+
+#include "../core/iop_memory.h"
+
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
+#include <functional>
 #include <string>
 
 namespace ps2x::iop::detail
 {
-    // printf-style formatting for IOP guests: %d %i %u %x %X %o %c %p %s %% with
-    // flags/width/precision; nextArg yields successive 32-bit arguments and
-    // readString reads a guest C string.
-    template <typename NextArg, typename ReadString>
-    std::string formatIopString(const std::string &format, NextArg nextArg, ReadString readString)
+    // nextArg devuelve la siguiente palabra de 32 bits de la lista de argumentos variables
+    // (o32: a1..a3 o a2..a3 y despues la pila desde sp+16; en vsprintf, la memoria apuntada por va_list).
+    inline std::string formatGuestString(const IopMemory &memory, uint32_t formatAddress,
+                                         const std::function<uint32_t()> &nextArg, size_t limit = 4096u)
     {
+        const std::string format = memory.readString(formatAddress, limit);
         std::string out;
+        out.reserve(format.size() + 32u);
         for (size_t i = 0; i < format.size(); ++i)
         {
-            if (format[i] != '%' || i + 1 >= format.size())
+            const char c = format[i];
+            if (c != '%')
             {
-                out += format[i];
+                out += c;
                 continue;
             }
-            size_t j = i + 1;
-            std::string spec = "%";
-            while (j < format.size() && std::strchr("-+ #0123456789.", format[j]))
-                spec += format[j++];
-            while (j < format.size() && (format[j] == 'l' || format[j] == 'h'))
-                ++j;
-            if (j >= format.size())
+            const size_t start = i++;
+            if (i >= format.size())
+            {
+                out += '%';
                 break;
-            const char conv = format[j];
-            char buf[256];
-            switch (conv)
+            }
+            if (format[i] == '%')
+            {
+                out += '%';
+                continue;
+            }
+
+            std::string spec = "%";
+            while (i < format.size() && (format[i] == '-' || format[i] == '+' || format[i] == ' ' ||
+                                         format[i] == '#' || format[i] == '0'))
+                spec += format[i++];
+            if (i < format.size() && format[i] == '*')
+            {
+                spec += std::to_string(static_cast<int32_t>(nextArg()));
+                ++i;
+            }
+            while (i < format.size() && format[i] >= '0' && format[i] <= '9')
+                spec += format[i++];
+            if (i < format.size() && format[i] == '.')
+            {
+                spec += format[i++];
+                if (i < format.size() && format[i] == '*')
+                {
+                    spec += std::to_string(static_cast<int32_t>(nextArg()));
+                    ++i;
+                }
+                while (i < format.size() && format[i] >= '0' && format[i] <= '9')
+                    spec += format[i++];
+            }
+            int longCount = 0;
+            while (i < format.size() && (format[i] == 'l' || format[i] == 'h' || format[i] == 'q' || format[i] == 'L'))
+            {
+                if (format[i] == 'l' || format[i] == 'q' || format[i] == 'L')
+                    ++longCount;
+                ++i;
+            }
+            if (i >= format.size())
+            {
+                out += format.substr(start);
+                break;
+            }
+
+            const char conversion = format[i];
+            char buffer[512];
+            buffer[0] = '\0';
+            switch (conversion)
             {
             case 'd':
             case 'i':
-                std::snprintf(buf, sizeof(buf), (spec + "d").c_str(), static_cast<int32_t>(nextArg()));
-                out += buf;
+            {
+                long long value = static_cast<int32_t>(nextArg());
+                if (longCount >= 2)
+                    value = static_cast<long long>((static_cast<uint64_t>(nextArg()) << 32) | static_cast<uint32_t>(value));
+                std::snprintf(buffer, sizeof(buffer), (spec + "lld").c_str(), value);
                 break;
+            }
             case 'u':
             case 'x':
             case 'X':
             case 'o':
-            case 'c':
-                std::snprintf(buf, sizeof(buf), (spec + conv).c_str(), nextArg());
-                out += buf;
+            {
+                unsigned long long value = nextArg();
+                if (longCount >= 2)
+                    value |= static_cast<unsigned long long>(nextArg()) << 32;
+                std::snprintf(buffer, sizeof(buffer), (spec + "ll" + conversion).c_str(), value);
                 break;
+            }
             case 'p':
-                std::snprintf(buf, sizeof(buf), "0x%08x", nextArg());
-                out += buf;
+                std::snprintf(buffer, sizeof(buffer), "0x%08x", nextArg());
+                break;
+            case 'c':
+                std::snprintf(buffer, sizeof(buffer), (spec + "c").c_str(), static_cast<int>(nextArg() & 0xFFu));
                 break;
             case 's':
             {
-                const std::string s = readString(nextArg());
-                std::snprintf(buf, sizeof(buf), (spec + "s").c_str(), s.c_str());
-                out += buf;
+                const uint32_t address = nextArg();
+                const std::string text = address ? memory.readString(address, limit) : std::string("(null)");
+                std::snprintf(buffer, sizeof(buffer), (spec + "s").c_str(), text.c_str());
                 break;
             }
-            case '%':
-                out += '%';
-                break;
             default:
-                out += spec + conv;
-                break;
+                // Conversion desconocida: se deja tal cual.
+                out += format.substr(start, i - start + 1u);
+                continue;
             }
-            i = j;
+            out += buffer;
         }
         return out;
     }

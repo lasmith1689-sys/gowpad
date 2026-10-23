@@ -14,6 +14,17 @@ public:
     virtual void Reset() = 0;
 
     virtual void Submit(const GSPrimitiveBatch &batch) = 0;
+    // GOW-Port: primitives that share one draw state, in order (the GS frontend collects the triangles of its strips).
+    virtual void SubmitRun(const GSDrawState &state, const GSPrimitiveVerts *prims, uint32_t count)
+    {
+        GSPrimitiveBatch batch;
+        batch.state = state;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            static_cast<GSPrimitiveVerts &>(batch) = prims[i];
+            Submit(batch);
+        }
+    }
     virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
 
     virtual void BeginTransfer(const GSTransferCommand &command) = 0;
@@ -23,6 +34,12 @@ public:
     virtual void TextureFlush() = 0;
     virtual void Sync(GSSyncReason reason) = 0;
     virtual PresentationFrame Present(const GSPresentationRequest &request) = 0;
+
+    // GOW-Port: capacidad efectiva por instancia; consultar no necesita un contexto GL.
+    virtual bool UsesSharedPresentation() const { return false; }
+    // GOW-Port: Present only queues the frame behind the earlier commands (shared textures, or the threaded backend's
+    // asynchronous RAM frames), so the frontend adds no Flush/Sync barrier in front of it.
+    virtual bool QueuesPresentation() const { return UsesSharedPresentation(); }
 
     virtual bool ClearFramebuffer(const GSContext &context, uint32_t rgba) = 0;
     virtual uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) = 0;

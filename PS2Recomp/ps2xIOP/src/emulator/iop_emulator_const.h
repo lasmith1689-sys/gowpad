@@ -10,10 +10,9 @@ constexpr uint64_t kIopClockHz = 36'864'000ull;
 constexpr uint64_t kVblankPeriodCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
 constexpr uint64_t kVblankEndPhaseCycles = kVblankPeriodCycles / 16ull;
 constexpr uint32_t kDefaultSlice = 256u;
-// Cap for synchronous calls (RPC handlers, module start). God of War's SMPD init parses
-// GODOFWAR.TOC inside its RPC handler: tens of millions of instructions.
+constexpr uint64_t kIopCycleBatch = 512u; // IOP cycles accumulated from EE accounting before the IOP runs
+// GOW-Port: era 2'000'000. La inicializacion del plugin smpd de God of War (llamada desde el servidor RPC
+// de 989snd) recorre todo GODOFWAR.TOC y necesita bastante mas; al agotarse, la llamada se cortaba en silencio.
 constexpr uint32_t kMaxCallInstructions = 400'000'000u;
-// After each RPC, threads the handler woke run until they block, up to this many IOP cycles.
-constexpr uint64_t kPostRpcCycleBudget = 2'000'000ull;
 constexpr uint32_t kModuleLoadBase = 0x00010000u;
 constexpr uint32_t kStackGuardBytes = 64u;

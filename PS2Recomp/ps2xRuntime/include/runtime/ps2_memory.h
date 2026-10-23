@@ -10,6 +10,9 @@
 #include <atomic>
 #include <iostream>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -310,6 +313,44 @@ public:
     // EE timers advance from the scheduler's emulated EE-cycle clock. The
     // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
     uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
+    // EE cycles advanceEeTimers can still take without stepping the timers (0: the next call steps them).
+    uint64_t eeTimerQuietCycles() const noexcept
+    {
+        return m_eeTimerPendingCycles < m_eeTimerBudget ? m_eeTimerBudget - m_eeTimerPendingCycles : 0u;
+    }
+    // Called before every EE timer register access (EeScheduler::syncDeferredCycles): the scheduler's checkpoint
+    // fast path defers the timer cycles; limitsChanged = a write that can move the next timer event.
+    void setEeCycleSync(void (*sync)(void *, bool), void *context) noexcept
+    {
+        m_eeCycleSync = sync;
+        m_eeCycleSyncContext = context;
+    }
+    // GOW-Port: native EE clock. A timer without compare/overflow events (no CMPE/OVFE/ZRET, e.g. the game's
+    // T0 = BUSCLK/256 and T1 = H-BLNK counters) is not stepped: its count is computed when read, from the guest
+    // EE cycle count since its epoch (the last COUNT write or clock change). Timers with events keep the stepping
+    // model below. The recompiler emits constant-address timer loads/stores as direct calls to these (no
+    // hardware-register path); readIORegister/writeIORegister use the same functions.
+    // `address` may be physical or a KSEG0/KSEG1 alias; isEeTimerRegister tells whether it names a timer register.
+    static bool isEeTimerRegister(uint32_t address) noexcept;
+    uint32_t eeTimerLoad(uint32_t address) noexcept;
+    bool eeTimerStore(uint32_t address, uint32_t value) noexcept;
+    // GOW-Port: native DMA request service. The game's own stores to DMA channel registers (0x10008000-0x1000EFFF:
+    // its scratchpad copies on channels 8/9, the boot VIF0 chain, D_STAT/D_PCR) are requests for a copy: a CHCR store
+    // with STR runs the transfer at once (scratchpad copy or VIF/GIF packet) and queues its DMA-end handler; no DMA
+    // controller state is kept; the IPU channels have nothing to move (the native MPEG decoder takes the movie data
+    // from the demuxed PSS). D_ENABLEW/D_ENABLER (0x1000F590/0x1000F520) belong to it too: DMA is never suspended.
+    // The recompiler emits constant-address 32-bit accesses to these registers as direct calls (no hardware-register
+    // path; run-time checked where the address is computed); readIORegister/writeIORegister use the same functions.
+    static bool isEeDmaRegister(uint32_t address) noexcept;
+    uint32_t eeDmaLoad(uint32_t address) noexcept;
+    bool eeDmaStore(uint32_t address, uint32_t value);
+    // GOW-Port: native display service entry for game code (runtime/gs/gs_display.h). The recompiler emits 64-bit
+    // stores to the GS display registers (PMODE, SMODE2, DISPFB1/2, DISPLAY1/2, BGCOLOR) as gsDisplayStore and 64-bit
+    // CSR loads as gsStatusLoad (no hardware-register path). `address` may be physical or a KSEG0/KSEG1 alias.
+    static bool isGsDisplayRegister(uint32_t address) noexcept;
+    static bool isGsStatusRegister(uint32_t address) noexcept;
+    void gsDisplayStore(uint32_t address, uint64_t value);
+    uint64_t gsStatusLoad();
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
 
@@ -335,18 +376,38 @@ public:
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
+    // PS2X_GS_WORKER_TRACE=<s>: one "[gsw-trace] <host us> <what> <value>" line (kick/job-start/job-done/gs-irq)
+    static void gsWorkerTrace(const char *what, size_t value);
     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
-    bool tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr);
-    bool tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr);
     void processVIF0Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
-    void processPendingTransfers();
+    // GOW-Port: native DMA data path (docs/native-port.md, step 2). There is no DMA controller model: a send hands the
+    // game's packets straight to their consumer (VIF0 / VIF1 packets to the VIF decoder -> VU0 / VU1, GIF packets to
+    // the GIF paths -> GS), either a flat buffer or the game's DMA tag list walked in place, and is complete when it
+    // returns (with the GS worker the bytes are copied now and consumed on the worker, in order). The caller signals
+    // completion (DMA-end handlers): sceDmaSend dispatches them itself, game code that starts a channel through its
+    // CHCR gets them after the store (consumeCompletedDmacCauses).
+    enum class DmaPath : uint8_t { Vif0, Vif1, Gif };
+    void sendDma(DmaPath path, uint32_t address, uint32_t qwc);
+    void sendDmaChain(DmaPath path, uint32_t tagAddress);
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
-    int pollDmaRegisters();
+    // GOW-Port: PS2X_GS_WORKER=1 runs VIF1/GIF DMA processing (VIF1 -> VU1 -> PATH1/2/3 -> GS) on a worker
+    // thread, like PCSX2's MTVU. DMA completion is still signalled at the kick, as without the worker.
+    // Invariant: VIF1/VU1/GIF/GS-frontend state is touched by the worker while it has jobs, and by any other
+    // thread only after syncGsWorker(); every such entry point below calls it.
+    void syncGsWorker(const char *site = "stub");
+    void stopGsWorker();
+    bool onGsWorkerThread() const { return m_gsWorkerEnabled && std::this_thread::get_id() == m_gsWorkerId; }
+    // VU0 FBRST as the EE had it when the running worker job was queued (MSCAL D/T-bit enables).
+    uint32_t gsWorkerJobFbrst() const { return m_gsWorkerJobFbrst; }
+    void setFbrstProvider(std::function<uint32_t()> provider) { m_fbrstProvider = std::move(provider); }
+    // Called on the worker after a job that left GS CSR SIGNAL/FINISH set, so an idle EE scheduler wakes
+    // up and delivers the GS interrupt now instead of at its next timer/VBlank deadline.
+    void setGsWorkerWake(std::function<void()> wake) { m_gsWorkerWake = std::move(wake); }
 
     // Track code modifications for self-modifying code
     void registerCodeRegion(uint32_t start, uint32_t end);
@@ -407,20 +468,44 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
-    uint32_t m_vif1PendingPath2ImageQwc = 0u;
-    bool m_vif1PendingPath2DirectHl = false;
+    // GOW-Port: DIRECT fragmentado es distinto de una IMAGE entre comandos DIRECT completos.
+    uint32_t m_vif1DirectBytesRemaining = 0u;
+    bool m_vif1DirectHl = false;
+    std::vector<uint8_t> m_vif1DirectPayload; // como máximo 65536 QW (1 MiB)
+    void submitVif1DirectPayload(const uint8_t *data, uint32_t sizeBytes, bool directHl);
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
-    struct PendingTransfer
+    struct GsWorkerItem
     {
-        bool fromScratchpad = false;
-        uint32_t srcAddr = 0;
-        uint32_t qwc = 0;
-        std::vector<uint8_t> chainData;
+        bool vif1 = false; // false: GIF PATH3
+        std::vector<uint8_t> data;
     };
-    std::vector<PendingTransfer> m_pendingGifTransfers;
-    std::vector<PendingTransfer> m_pendingVif0Transfers;
-    std::vector<PendingTransfer> m_pendingVif1Transfers;
+    struct GsWorkerJob
+    {
+        std::vector<GsWorkerItem> items;
+        uint32_t fbrst = 0;
+    };
+    bool needsGsWorkerSync(uint32_t address) const;
+    void syncGsWorkerFor(uint32_t address);
+    void syncGsWorkerIfOtherThread(const char *site);
+    void waitGsWorkerIdle(const char *site, uint32_t address);
+    void appendGuestBytes(uint32_t address, uint32_t bytes, std::vector<uint8_t> &out);
+    void deliverDma(DmaPath path, std::vector<uint8_t> &&bytes);
+    void runGsWorkerJob(GsWorkerJob &job);
+    void gsWorkerLoop();
+    bool m_gsWorkerEnabled = false;
+    std::thread m_gsWorker;
+    std::thread::id m_gsWorkerId;
+    std::mutex m_gsWorkerMutex;
+    std::condition_variable m_gsWorkerCv;
+    std::condition_variable m_gsWorkerIdleCv;
+    std::deque<GsWorkerJob> m_gsWorkerJobs;
+    bool m_gsWorkerBusy = false;
+    bool m_gsWorkerStop = false;
+    uint32_t m_gsWorkerJobFbrst = 0;
+    std::function<uint32_t()> m_fbrstProvider;
+    std::function<void()> m_gsWorkerWake;
+
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 
@@ -446,11 +531,27 @@ public:
         uint32_t compare = 0;
         uint32_t hold = 0;
         uint64_t clockRemainder = 0;
+        uint64_t epoch = 0; // clock-only timers: guest EE cycle at which `count` was exact (zero remainder)
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    // EE cycles accounted since the timers were last advanced. advanceEeTimers runs at every EE checkpoint;
+    // it only does the per-timer math once the pending cycles reach m_eeTimerBudget (the cycles until the
+    // next timer interrupt), and timer register accesses flush first, so the guest sees exactly the same
+    // counts and interrupts as with per-call advancing (the tick math carries its remainder exactly).
+    uint64_t m_eeTimerPendingCycles = 0;
+    uint64_t m_eeTimerBudget = 0;
+    void (*m_eeCycleSync)(void *, bool) = nullptr;
+    void *m_eeCycleSyncContext = nullptr;
+    uint64_t m_eeCycleTotal = 0; // guest EE cycles seen by advanceEeTimers (the scheduler's EE cycle count)
+    uint32_t eeTimerCount(const EeTimer &timer) const noexcept;
+    uint32_t stepEeTimers(uint64_t eeCycles) noexcept;
+    void flushEeTimers() noexcept;
+    // GOW-Port: GIF_STAT en m_ioRegisters (los elementos de unordered_map no se mueven; solo clear() lo
+    // invalida). advanceEeTimers lo usa ~1,5 millones de veces por segundo.
+    uint32_t *m_gifStatSlot = nullptr;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
-    void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+    bool processScratchpadChain(uint32_t channelBase, uint32_t chcr); // GOW-Port
     void queueCompletedDmacCause(uint32_t cause);
 };
 

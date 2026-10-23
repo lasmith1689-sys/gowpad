@@ -52,6 +52,9 @@ static inline constexpr bool Ps2IsPhysicalSpecialAddress(uint32_t physAddr)
 
 static inline constexpr bool Ps2IsSpecialAddress(uint32_t addr)
 {
+    // main RAM (the first 32 MB, where almost every access goes) lies below every special region: one compare
+    if (addr < PS2_RAM_SIZE)
+        return false;
     if (Ps2IsKseg23Address(addr))
         return true;
 

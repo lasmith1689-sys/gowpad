@@ -47,17 +47,41 @@ if(ANDROID)
     set(PS2X_IS_ANDROID ON)
 endif()
 
-# iOS: raylib on SDL2 with OpenGL ES 3 (raylib's GLFW backend has no iOS),
-# runner packaged as an app bundle.
+# Nintendo Switch homebrew (devkitPro Switch.cmake toolchain sets NINTENDO_SWITCH).
+set(PS2X_IS_SWITCH OFF)
+
+if(NINTENDO_SWITCH)
+    set(PS2X_IS_SWITCH ON)
+    set(PS2X_ENABLE_DEBUG_UI OFF CACHE BOOL "" FORCE)
+    set(PS2X_ENABLE_SCCACHE OFF CACHE BOOL "" FORCE)
+    # plain char is signed on x86 (the PC build) and unsigned on ARM: keep the PC behaviour
+    add_compile_options(-fsigned-char)
+    # sse2neon: x86 results for min/max with NaN inputs (PS2 code uses NaN bit patterns such as 0x7FFFFFFF as large
+    # values), division, square root and dot products, instead of NEON's faster approximations
+    add_compile_definitions(SSE2NEON_PRECISE_MINMAX=1 SSE2NEON_PRECISE_DIV=1 SSE2NEON_PRECISE_SQRT=1 SSE2NEON_PRECISE_DP=1)
+endif()
+
+# GOW-Port: iOS / iPadOS (CMAKE_SYSTEM_NAME iOS; device or simulator): raylib on SDL2 with OpenGL ES 3.0 (raylib's GLFW
+# backend has no iOS), the GS renderer on its own EAGL context (gs_gl_ios.mm), the runner packaged as an app bundle.
 set(PS2X_IS_IOS OFF)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(PS2X_IS_IOS ON)
+    enable_language(OBJCXX)
     set(PS2X_ENABLE_DEBUG_UI OFF CACHE BOOL "" FORCE)
+    set(PS2X_ENABLE_SCCACHE OFF CACHE BOOL "" FORCE)
+    add_compile_options(-fsigned-char)
+    add_compile_definitions(PS2X_IOS=1
+        SSE2NEON_PRECISE_MINMAX=1 SSE2NEON_PRECISE_DIV=1 SSE2NEON_PRECISE_SQRT=1 SSE2NEON_PRECISE_DP=1)
     set(PS2X_IOS_BUNDLE_ID "com.example.ps2x" CACHE STRING "iOS bundle identifier")
     set(PS2X_IOS_APP_NAME "PS2X" CACHE STRING "iOS app display name")
     set(PS2X_IOS_GAME_DIR "" CACHE PATH "Folder copied into the app bundle as game/ (guest ELF, loose disc files, IOP_MOD/)")
+    set(PS2X_IOS_PLATFORM_NAME "iPhoneOS" CACHE STRING "CFBundleSupportedPlatforms entry (iPhoneSimulator for simulator builds)")
 endif()
+
+set(PS2X_SWITCH_APP_NAME "God of War" CACHE STRING "Title shown in the Switch homebrew menu")
+set(PS2X_SWITCH_APP_AUTHOR "Waffle565" CACHE STRING "Author shown in the Switch homebrew menu")
+set(PS2X_SWITCH_APP_VERSION "0.1.0" CACHE STRING "Version shown in the Switch homebrew menu")
 
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
 set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
@@ -85,9 +109,14 @@ else()
 
     if(PS2X_IS_ANDROID)
         set(PLATFORM "Android" CACHE STRING "" FORCE)
-    endif()
-
-    if(PS2X_IS_IOS)
+    elseif(PS2X_IS_SWITCH)
+        # raylib's SDL platform on top of devkitPro's switch-sdl2 (OpenGL via switch-mesa).
+        # miniaudio has no Switch backend (and needs dlopen/sched APIs newlib lacks): build raylib
+        # without raudio; the runtime plays its sound through SDL2 audio (ps2_runtime.cpp).
+        set(PLATFORM "SDL" CACHE STRING "" FORCE)
+        set(CUSTOMIZE_BUILD ON CACHE BOOL "" FORCE)
+        set(SUPPORT_MODULE_RAUDIO OFF CACHE BOOL "" FORCE)
+    elseif(PS2X_IS_IOS)
         set(SDL_SHARED OFF CACHE BOOL "" FORCE)
         set(SDL_STATIC ON CACHE BOOL "" FORCE)
         set(SDL_TEST OFF CACHE BOOL "" FORCE)
@@ -115,8 +144,8 @@ else()
     FetchContent_MakeAvailable(raylib)
 
     if(PS2X_IS_IOS)
-        # rlgl includes <GLES3/gl3.h>; iOS has <OpenGLES/ES3/gl.h> (ios/gles maps one to
-        # the other), and miniaudio needs Objective-C for its Apple backends
+        # rlgl includes <GLES3/gl3.h>; iOS has <OpenGLES/ES3/gl.h> (ios/gles maps one to the other), and miniaudio needs
+        # Objective-C for its Apple backends
         target_include_directories(raylib PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ios/gles")
         target_compile_options(raylib PRIVATE $<$<COMPILE_LANGUAGE:C>:-xobjective-c>)
         target_link_libraries(raylib "-framework OpenGLES" "-framework AVFoundation"
@@ -279,19 +308,37 @@ else()
 
     if(PS2X_IS_ANDROID)
         target_link_libraries(ps2_host_backend INTERFACE log android)
+    elseif(PS2X_IS_SWITCH)
+        # SDL2 for the sound output (raylib's raudio is off on Switch); raylib already links it for video/input
+        find_package(SDL2 REQUIRED)
+        target_compile_definitions(ps2_host_backend INTERFACE PLATFORM_SWITCH)
+        # the GS renderer's own GL context: EGL + desktop GL through glapi (switch-mesa, nouveau; egl.pc)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(PS2X_SWITCH_EGL REQUIRED IMPORTED_TARGET egl)
+        target_link_libraries(ps2_host_backend INTERFACE SDL2::SDL2 PkgConfig::PS2X_SWITCH_EGL)
     endif()
 endif()
 
-if(PS2X_IS_ANDROID)
-    set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
-else()
-    set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
+# GOW-Port: MPEG video (FMV) is decoded by the vendored libmpeg2 (third_party/libmpeg2, portable C, also builds for
+# the Switch). FFmpeg stays available as an opt-in alternative backend.
+add_library(libmpeg2 STATIC
+    third_party/libmpeg2/alloc.c
+    third_party/libmpeg2/cpu_accel.c
+    third_party/libmpeg2/cpu_state.c
+    third_party/libmpeg2/decode.c
+    third_party/libmpeg2/header.c
+    third_party/libmpeg2/idct.c
+    third_party/libmpeg2/motion_comp.c
+    third_party/libmpeg2/slice.c
+)
+target_include_directories(libmpeg2 PUBLIC third_party/libmpeg2)
+if(MSVC)
+    target_compile_options(libmpeg2 PRIVATE /W0)
 endif()
 
-option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
+option(PS2X_ENABLE_FFMPEG "Decode MPEG video with FFmpeg instead of libmpeg2" OFF)
 
 if(NOT PS2X_ENABLE_FFMPEG)
-    message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
     add_library(ffmpeg INTERFACE)
 elseif(WIN32)
     include(ExternalProject)
@@ -422,15 +469,39 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_audio_vag.cpp
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
-    src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_stage.cpp # GOW-Port: GS frontend stage pipelined behind VU1.
+    src/lib/gs/gs_display.cpp # GOW-Port: native display state + GS FINISH handshake (no-emulation step 5).
+    src/lib/gs/gs_host_present.cpp # GOW-Port: mismo consumidor de textura en juego y controles.
+        # GOW-Port: backend OpenGL y cola del fork SotC ac9efa0 (GPL-3.0).
+    src/lib/gs/gs_threaded_backend.cpp
+    src/lib/gs/gs_swizzle.cpp
+    src/lib/gs/gpu/gs_gl.cpp
+    src/lib/gs/gpu/gs_hw_backend.cpp
+
+src/lib/gs/gpu/gs_texture_store.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_audio_device.cpp # GOW-Port: sound output on a chosen device
+    src/lib/ps2_pad_rumble_win.cpp # GOW-Port: Windows gamepad rumble (XInput, DualShock 4 / DualSense)
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
+    # GOW-Port: EE differential tester (PS2X_EE_DIFF) with PCSX2's EE interpreter and VU0 ops (GPL-3.0+).
+    src/lib/ee_ref/ee_diff.cpp
+    src/lib/ee_watch.cpp
+    src/lib/ee_ref/eeref.cpp
+    src/lib/ee_ref/R5900OpcodeImpl.cpp
+    src/lib/ee_ref/R5900OpcodeTables.cpp
+    src/lib/ee_ref/MMI.cpp
+    src/lib/ee_ref/FPU.cpp
+    src/lib/vu_pcsx2/pcsx2_vu0_cop2.cpp
+    src/lib/vu_pcsx2/pcsx2_vu1_bridge.cpp
+    src/lib/vu_pcsx2/VUops.cpp
+    src/lib/vu_pcsx2/VUflags.cpp
+    src/lib/vu_pcsx2/VU1microInterp.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
@@ -479,8 +550,6 @@ target_sources(ps2_runtime PRIVATE
 
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-    # per-game fixes; in the runner so their static registrations are always linked
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/game_overrides/*.cpp"
 )
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
@@ -547,12 +616,103 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
+# GOW-Port: the PCSX2 reference sources include "common/..." relative to their own folder (MSVC finds it through the
+# include stack, GCC does not)
+target_include_directories(ps2_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/ee_ref
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu_pcsx2
+)
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg libmpeg2 ps2_iop)
+if(WIN32)
+    # GOW-Port: WGL propio del hilo GS.
+    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+# GOW-Port: microcódigo de VU1 compilado. PS2X_VU1_MICROCODE_DIR es una carpeta local con micromemorias de
+# 16 KB capturadas con GOW_VU1_CAPTURA; PS2X_VU1_GENERATOR_SOURCE es tools/vu1/generar_vu1.cpp. El C++
+# generado se enlaza en el ejecutable y el despachador lo usa en lugar del intérprete para los pares que
+# coinciden. Son datos del juego: se generan en la carpeta de compilación y no se publican.
+set(PS2X_VU1_MICROCODE_DIR "" CACHE PATH "Micromemorias de VU1 capturadas (vacío: solo intérprete)")
+set(PS2X_VU1_GENERATOR_SOURCE "" CACHE FILEPATH "Generador de C++ para VU1 (tools/vu1/generar_vu1.cpp)")
+# GOW-Port: cross builds (Switch) cannot run the generator they would compile for the target: they take the C++ a host
+# build already generated (its ps2xRuntime build folder, holding vu1_generado/ and vu1n_generado/).
+set(PS2X_VU1_PREGENERATED_DIR "" CACHE PATH "Host build folder with vu1_generado/ and vu1n_generado/ (cross builds)")
+if(PS2X_VU1_PREGENERATED_DIR)
+    file(GLOB PS2X_VU1_PREGENERATED_PARTS
+        "${PS2X_VU1_PREGENERATED_DIR}/vu1_generado/programa*.cpp"
+        "${PS2X_VU1_PREGENERATED_DIR}/vu1n_generado/vu1n_part*.cpp")
+    target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1_PREGENERATED_PARTS})
+    set_source_files_properties(${PS2X_VU1_PREGENERATED_PARTS} PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION ON
+        SKIP_PRECOMPILE_HEADERS ON)
+    target_include_directories(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
+    list(LENGTH PS2X_VU1_PREGENERATED_PARTS PS2X_VU1_PREGENERATED_COUNT)
+    message(STATUS "VU1 compilada (pregenerated): ${PS2X_VU1_PREGENERATED_COUNT} files from ${PS2X_VU1_PREGENERATED_DIR}")
+elseif(PS2X_VU1_MICROCODE_DIR AND PS2X_VU1_GENERATOR_SOURCE AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
+    file(GLOB PS2X_VU1_IMAGES CONFIGURE_DEPENDS "${PS2X_VU1_MICROCODE_DIR}/*.bin")
+    if(PS2X_VU1_IMAGES)
+        add_executable(ps2x_vu1_generator "${PS2X_VU1_GENERATOR_SOURCE}")
+        target_link_libraries(ps2x_vu1_generator PRIVATE ps2_runtime)
+        set(PS2X_VU1_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/vu1_generado")
+        set(PS2X_VU1_GENERATED_PARTS)
+        foreach(part RANGE 0 12)
+            list(APPEND PS2X_VU1_GENERATED_PARTS "${PS2X_VU1_GENERATED_DIR}/programa${part}.cpp")
+        endforeach()
+        add_custom_command(OUTPUT ${PS2X_VU1_GENERATED_PARTS}
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${PS2X_VU1_GENERATED_DIR}"
+            # GOW-Port: la carpeta, no cada archivo: miles de rutas superan la línea de órdenes de Windows.
+            COMMAND "$<TARGET_FILE:ps2x_vu1_generator>" "${PS2X_VU1_GENERATED_DIR}" "${PS2X_VU1_MICROCODE_DIR}"
+            DEPENDS ps2x_vu1_generator ${PS2X_VU1_IMAGES}
+            VERBATIM)
+        target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1_GENERATED_PARTS})
+        set_source_files_properties(${PS2X_VU1_GENERATED_PARTS} PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION ON
+            SKIP_PRECOMPILE_HEADERS ON)
+        target_include_directories(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
+        if(MSVC)
+            set_source_files_properties(${PS2X_VU1_GENERATED_PARTS} PROPERTIES COMPILE_OPTIONS "/bigobj")
+        endif()
+        # GOW-Port: native lean backend (tools/vu1/vu1n_gen.py): straight-line blocks with immediate semantics.
+        find_package(Python3 COMPONENTS Interpreter)
+        set(PS2X_VU1N_GEN_OVERRIDE "" CACHE FILEPATH "Alternative vu1n_gen.py (empty: tools/vu1/vu1n_gen.py of the root repo)")
+        if(PS2X_VU1N_GEN_OVERRIDE)
+            set(PS2X_VU1N_GEN "${PS2X_VU1N_GEN_OVERRIDE}")
+        else()
+            get_filename_component(PS2X_VU1N_GEN "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vu1/vu1n_gen.py" ABSOLUTE)
+        endif()
+        if(Python3_FOUND AND EXISTS "${PS2X_VU1N_GEN}")
+            set(PS2X_VU1N_DIR "${CMAKE_CURRENT_BINARY_DIR}/vu1n_generado")
+            set(PS2X_VU1N_PARTS)
+            foreach(part RANGE 0 5)
+                list(APPEND PS2X_VU1N_PARTS "${PS2X_VU1N_DIR}/vu1n_part${part}.cpp")
+            endforeach()
+            set(PS2X_VU1N_HEADS "${PS2X_VU1_MICROCODE_DIR}/../vu1n_heads.txt")
+            get_filename_component(PS2X_VU1N_HEADS "${PS2X_VU1N_HEADS}" ABSOLUTE)
+            set(PS2X_VU1N_HEADS_DEP)
+            if(EXISTS "${PS2X_VU1N_HEADS}")
+                set(PS2X_VU1N_HEADS_DEP "${PS2X_VU1N_HEADS}")
+            endif()
+            add_custom_command(OUTPUT ${PS2X_VU1N_PARTS}
+                COMMAND "${Python3_EXECUTABLE}" -I "${PS2X_VU1N_GEN}" "${PS2X_VU1N_DIR}" "${PS2X_VU1_MICROCODE_DIR}" --heads "${PS2X_VU1N_HEADS}" --parts 6
+                DEPENDS "${PS2X_VU1N_GEN}" ${PS2X_VU1_IMAGES} ${PS2X_VU1N_HEADS_DEP}
+                VERBATIM)
+            target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1N_PARTS})
+            set_source_files_properties(${PS2X_VU1N_PARTS} PROPERTIES
+                SKIP_UNITY_BUILD_INCLUSION ON
+                SKIP_PRECOMPILE_HEADERS ON)
+            if(MSVC)
+                set_source_files_properties(${PS2X_VU1N_PARTS} PROPERTIES COMPILE_OPTIONS "/bigobj")
+            endif()
+        endif()
+        list(LENGTH PS2X_VU1_IMAGES PS2X_VU1_IMAGE_COUNT)
+        message(STATUS "VU1 compilada: ${PS2X_VU1_IMAGE_COUNT} micromemorias en ${PS2X_VU1_MICROCODE_DIR}")
+    endif()
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
@@ -633,12 +793,30 @@ if(PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
 endif()
 
+if(PS2X_IS_SWITCH)
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_switch_runtime.cpp)
+    set_source_files_properties(src/lib/ps2_switch_runtime.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
+    # host threads get 1 MiB stacks like on Windows (libnx default 128 KiB): ps2_switch_runtime.cpp __wrap_pthread_create
+    target_link_options(ps2EntryRunner PRIVATE -Wl,--wrap=pthread_create)
+    nx_generate_nacp(ps2EntryRunner.nacp
+        NAME "${PS2X_SWITCH_APP_NAME}"
+        AUTHOR "${PS2X_SWITCH_APP_AUTHOR}"
+        VERSION "${PS2X_SWITCH_APP_VERSION}"
+    )
+    nx_create_nro(ps2EntryRunner NACP ps2EntryRunner.nacp)
+endif()
+
 if(PS2X_IS_IOS)
+    # the GS renderer's EAGL context (Objective-C++, ARC)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gpu/gs_gl_ios.mm)
+    set_source_files_properties(src/lib/gs/gpu/gs_gl_ios.mm PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc" SKIP_UNITY_BUILD_INCLUSION TRUE SKIP_PRECOMPILE_HEADERS TRUE)
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_ios_runtime.cpp)
+    set_source_files_properties(src/lib/ps2_ios_runtime.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
     target_link_libraries(ps2EntryRunner PRIVATE SDL2::SDL2main
         "-framework UIKit" "-framework Foundation" "-framework OpenGLES" "-framework QuartzCore"
         "-framework CoreGraphics" "-framework AVFoundation" "-framework AudioToolbox" "-framework CoreAudio"
         "-framework CoreMotion" "-framework GameController" "-framework CoreHaptics" "-framework Metal")
-    target_compile_definitions(ps2EntryRunner PRIVATE PS2X_IOS=1)
     if(PS2X_IOS_GAME_DIR)
         add_custom_command(TARGET ps2EntryRunner POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E copy_directory "${PS2X_IOS_GAME_DIR}" "$<TARGET_BUNDLE_CONTENT_DIR:ps2EntryRunner>/game"
@@ -673,3 +851,6 @@ endif()
 install(DIRECTORY include/
     DESTINATION include
 )
+
+# GOW-Port include
+target_include_directories(ps2EntryRunner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runner)

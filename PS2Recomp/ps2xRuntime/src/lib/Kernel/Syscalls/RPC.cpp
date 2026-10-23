@@ -18,16 +18,6 @@ namespace ps2_syscalls
 
         void pushSifRpcDebugEventLocked(SifRpcDebugEvent event)
         {
-            // PS2X_LOG_RPC=1 also writes each event to stderr (the history is panel-only otherwise)
-            static const bool s_logRpc = std::getenv("PS2X_LOG_RPC") != nullptr;
-            if (s_logRpc)
-            {
-                std::cerr << std::hex << "[rpc] " << (event.op ? event.op : "?")
-                          << " sid=0x" << event.sid << " fn=0x" << event.rpcNum << " mode=0x" << event.mode
-                          << " client=0x" << event.clientPtr << " send=" << std::dec << event.sendSize
-                          << " recv=" << event.recvSize << std::hex << " flags=0x" << event.flags
-                          << " ra=0x" << event.ra << " thread=" << std::dec << event.threadId << std::endl;
-            }
             event.seq = ++g_sif_rpc_debug_next_seq;
             g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
         }
@@ -554,6 +544,19 @@ namespace ps2_syscalls
             request.endParameter = endParameter;
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            // GOW_FRAMECLOCK_TRACE=1 (debug): every RPC call with the VBlank count and T0 (docs/performance.md, menu clock)
+            static const bool frameClockTrace = std::getenv("GOW_FRAMECLOCK_TRACE") != nullptr;
+            if (frameClockTrace)
+            {
+                uint32_t command = 0u;
+                if (sendBuf != 0u && sendSize >= 8u)
+                    std::memcpy(&command, getMemPtr(rdram, sendBuf + 4u), sizeof(command));
+                std::fprintf(stderr, "[fclk] rpc sid=%x vs=%llu t0=%u cmd=%u mode=%u done=%d/%d end=%x sema=%u thread=%d ra=%x\n",
+                             sid, static_cast<unsigned long long>(runtime->memory().gs().vsyncTick.load(std::memory_order_acquire)),
+                             runtime->memory().eeTimerLoad(0x10000000u), command, mode,
+                             iopResult.signalNowaitCompletion ? 1 : 0, iopResult.signalCompletion ? 1 : 0, endFunction,
+                             completionSemaphore, runtime->eeScheduler().currentThreadId(), getRegU32(ctx, 31));
+            }
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)

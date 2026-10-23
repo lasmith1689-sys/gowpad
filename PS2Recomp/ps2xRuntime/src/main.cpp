@@ -1,4 +1,8 @@
 #include "ps2_runtime.h"
+
+void ps2InstallEeDiff(PS2Runtime &runtime); // src/lib/ee_ref/ee_diff.cpp
+void ps2InstallEeWatch(PS2Runtime &runtime);
+void ps2InstallEePageWatch(PS2Runtime &runtime);
 #include "games_database.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
@@ -15,17 +19,18 @@
 #include <algorithm>
 #include <cstdlib>
 
-#if defined(PS2X_IOS)
-#include <SDL.h>
-#include <SDL_main.h> // the app's main() becomes SDL_main, started by SDL's UIApplication
-#endif
-
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <unistd.h>
 #include <thread>
 #include <cstdio>
 #include <cstring>
+#endif
+
+#if defined(PS2X_IOS)
+#include <SDL.h>
+#include <SDL_main.h> // main() becomes SDL_main, started by SDL's UIApplication
+std::filesystem::path ps2xIosPrepare(); // ps2_ios_runtime.cpp: logs, settings, disc image; returns the guest ELF
 #endif
 
 namespace
@@ -145,33 +150,12 @@ namespace
         return result;
     }
 
-#if defined(PS2X_IOS)
-    // Read-only game files (guest ELF, IRX modules, TOC) ship in the bundle's
-    // Resources/game; the disc image and saves live in the app's Documents.
-    std::filesystem::path iosBundleGameDir()
-    {
-        char *base = SDL_GetBasePath();
-        const std::filesystem::path root = base ? std::filesystem::path(base) : std::filesystem::path(".");
-        SDL_free(base);
-        // (iOS bundles are flat; CMake may still keep the Resources/ prefix)
-        if (std::filesystem::exists(root / "Resources" / "game"))
-            return root / "Resources" / "game";
-        return root / "game";
-    }
-
-    std::filesystem::path iosDocumentsDir()
-    {
-        const char *home = std::getenv("HOME");
-        return std::filesystem::path(home ? home : ".") / "Documents";
-    }
-#endif
-
     std::filesystem::path getExecutablePath(int argc, char *argv[])
     {
-#if defined(PS2X_IOS) && defined(PS2X_DEFAULT_BOOT_ELF)
+#if defined(PS2X_IOS)
         (void)argc;
         (void)argv;
-        return iosBundleGameDir() / PS2X_DEFAULT_BOOT_ELF;
+        return ps2xIosPrepare();
 #endif
         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
         {
@@ -181,8 +165,17 @@ namespace
 #if defined(PS2X_DEFAULT_BOOT_ELF)
         std::cout << "Using default boot file" << std::endl;
         const std::filesystem::path configuredPath = std::filesystem::path(PS2X_DEFAULT_BOOT_ELF);
-#if defined(PLATFORM_VITA)
-        return configuredPath;
+#if defined(__SWITCH__)
+        // GOW-Port: an installed title (NSP) carries the disc in its RomFS; the NRO reads it from the SD card
+        {
+            const std::filesystem::path romfsPath = std::filesystem::path("romfs:/disc-usa") / configuredPath.filename();
+            std::error_code error;
+            if (std::filesystem::exists(romfsPath, error))
+                return romfsPath;
+        }
+#endif
+#if defined(PLATFORM_VITA) || defined(__SWITCH__)
+        return configuredPath; // device-prefixed path (ux0:/, sdmc:/)
 #endif
         if (configuredPath.is_absolute())
         {
@@ -201,9 +194,6 @@ int main(int argc, char *argv[])
     redirectStdioToLogcat();
 #endif
     setupTerminateLogger();
-    // keep logs when output goes to a file and the process is stopped from outside
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::cout << std::unitbuf;
 
     try
     {
@@ -259,39 +249,10 @@ int main(int argc, char *argv[])
             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
             return 1;
         }
-        // Raw disc image for sector reads: games that read by LSN (God of War's TOC
-        // spans both DVD layers) need it. PS2X_CD_IMAGE, else disc.iso beside the ELF.
-        {
-            PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
-            const char *image = std::getenv("PS2X_CD_IMAGE");
-            if (image && *image)
-                paths.cdImage = image;
-            else if (std::filesystem::exists(paths.elfDirectory / "disc.iso"))
-                paths.cdImage = paths.elfDirectory / "disc.iso";
-#if defined(PS2X_IOS)
-            const std::filesystem::path docs = iosDocumentsDir();
-            std::error_code ec;
-            for (const auto &entry : std::filesystem::directory_iterator(docs, ec))
-            {
-                std::string ext = entry.path().extension().string();
-                std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (entry.is_regular_file() && ext == ".iso")
-                {
-                    paths.cdImage = entry.path();
-                    break;
-                }
-            }
-            paths.hostRoot = docs;
-            paths.mcRoot = docs / "mc0";
-            std::filesystem::create_directories(paths.mcRoot, ec);
-            if (paths.cdImage.empty())
-                std::cerr << "No .iso in " << docs.string() << "; copy the disc image there with the Files app." << std::endl;
-#endif
-            if (!paths.cdImage.empty())
-                std::cout << "CD image: " << paths.cdImage.string() << std::endl;
-            PS2Runtime::setIoPaths(paths);
-        }
 
+        ps2InstallEeDiff(runtime);
+        ps2InstallEeWatch(runtime);
+        ps2InstallEePageWatch(runtime);
         runtime.run();
 
 #ifdef _DEBUG

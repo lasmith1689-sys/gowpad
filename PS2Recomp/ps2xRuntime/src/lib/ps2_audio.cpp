@@ -228,7 +228,7 @@ void PS2AudioBackend::play(uint32_t sampleAddr, float pitch, float volume, uint3
 
 void PS2AudioBackend::pruneFinishedSounds()
 {
-#if defined(PLATFORM_VITA)
+#if defined(PLATFORM_VITA) || defined(PLATFORM_SWITCH)
     return;
 #else
     auto &sounds = m_impl->activeSounds;
@@ -251,7 +251,7 @@ void PS2AudioBackend::pruneFinishedSounds()
 void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sample, float pitch, float volume,
                                         bool isBgm)
 {
-#if defined(PLATFORM_VITA)
+#if defined(PLATFORM_VITA) || defined(PLATFORM_SWITCH)
     (void)sampleKey;
     (void)sample;
     (void)pitch;
@@ -315,7 +315,7 @@ void PS2AudioBackend::stop(uint32_t voiceId)
 void PS2AudioBackend::stopAll()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-#if defined(PLATFORM_VITA)
+#if defined(PLATFORM_VITA) || defined(PLATFORM_SWITCH)
     return;
 #else
     for (auto &t : m_impl->activeSounds)

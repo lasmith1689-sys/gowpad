@@ -6,9 +6,6 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
-if(BUILD_TESTING)
-    add_subdirectory(gs_cache)
-endif()
 
 # Static library with test logic (no main), used by ps2xStudio
 add_library(ps2_test_function_table OBJECT
@@ -32,12 +29,17 @@ add_library(ps2_test_lib STATIC
     src/ps2_vu1_tests.cpp
     src/ps2_vu_tests.cpp
     src/ps2_gs_tests.cpp
+    src/ps2_gpu_profile_tests.cpp # GOW-Port: ventanas y lecturas de timestamps sin espera.
+    src/ps2_gpu_upload_ring_tests.cpp # GOW-Port: datos pendientes y fallback de uploads.
+    src/ps2_gs_shared_queue_tests.cpp # GOW-Port: FIFO y capturas bajo demanda.
     src/ps2_iop_tests.cpp
     src/ps2_sif_rpc_tests.cpp
     src/ps2_sif_dma_tests.cpp
     src/ps2_recompiler_tests.cpp
     src/ps2_runtime_expansion_tests.cpp
-    src/ps2_float_semantics_tests.cpp
+    src/ps2_spu2_tests.cpp
+    src/ps2_sio2_tests.cpp
+    src/ps2_mmi_tests.cpp
 )
 
 target_include_directories(ps2_test_lib PRIVATE

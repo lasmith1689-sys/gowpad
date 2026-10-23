@@ -379,46 +379,6 @@ namespace ps2_stubs
         setReturnS32(ctx, 0x14);
     }
 
-    // int sceCdReadDvdDualInfo(int *on_dual, u32 *layer1_start)
-    // A flat dump of a dual-layer DVD holds layer 1 right after layer 0, whose
-    // size is the volume space size in the ISO9660 primary descriptor (LSN 16).
-    void sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        const uint32_t onDualAddr = getRegU32(ctx, 4);
-        const uint32_t layer1Addr = getRegU32(ctx, 5);
-        uint32_t onDual = 0u;
-        uint32_t layer1Start = 0u;
-        uint8_t pvd[kCdSectorSize] = {};
-        uint64_t totalSectors = 0u;
-        if (readCdSectors(16u, 1u, pvd, sizeof(pvd)) && std::memcmp(pvd + 1, "CD001", 5) == 0 &&
-            tryGetCdImageTotalSectors(totalSectors))
-        {
-            uint32_t layer0Sectors = 0u;
-            std::memcpy(&layer0Sectors, pvd + 80, sizeof(layer0Sectors));
-            if (layer0Sectors != 0u && totalSectors > layer0Sectors)
-            {
-                onDual = 1u;
-                layer1Start = layer0Sectors;
-            }
-        }
-        if (uint8_t *p = getMemPtr(rdram, onDualAddr))
-            std::memcpy(p, &onDual, sizeof(onDual));
-        if (uint8_t *p = getMemPtr(rdram, layer1Addr))
-            std::memcpy(p, &layer1Start, sizeof(layer1Start));
-        RUNTIME_LOG("[sceCdReadDvdDualInfo] on_dual=" << onDual << " layer1_start=" << layer1Start);
-        setReturnS32(ctx, 1);
-    }
-
-    // int sceChk01(u32 *result): Sony's disc check uploads a small module to the
-    // IOP and stores its verdict in *result; games hang unless the module loaded
-    // (return >= 0) and the verdict is 0. There is no disc drive to check here.
-    void sceChk01(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        if (uint8_t *p = getMemPtr(rdram, getRegU32(ctx, 4)))
-            std::memset(p, 0, sizeof(uint32_t));
-        setReturnS32(ctx, 1);
-    }
-
     void sceCdGetReadPos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnU32(ctx, g_cdStreamingLbn);

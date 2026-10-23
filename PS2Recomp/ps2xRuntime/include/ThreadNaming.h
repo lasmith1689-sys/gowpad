@@ -24,6 +24,11 @@ extern "C"
 }
 #elif defined(__APPLE__) || defined(__linux__)
 #include <pthread.h>
+#elif defined(__SWITCH__)
+// GOW-Port: ps2_switch_runtime.cpp. libnx starts every thread on the process's default core and Horizon does not
+// time-slice threads of one priority, so the runtime's busy threads are spread over the three application cores.
+// priorityBoost: steps above the default thread priority (Horizon preempts lower-priority threads on the same core).
+extern "C" void ps2xSwitchPinCurrentThread(int core, int priorityBoost);
 #endif
 
 namespace ThreadNaming
@@ -48,6 +53,19 @@ namespace ThreadNaming
 
 #elif defined(__linux__)
         pthread_setname_np(pthread_self(), name.data());
+#elif defined(__SWITCH__)
+        // EE + IOP and the GS frontend on core 1, VIF1/VU1 on core 2; the presentation thread and the GL backend on
+        // core 0. The EE spends most of a frame spinning in vid::WaitForDMAComplete (profile 2026-10-16: ~85 % of its
+        // samples), so the GS frontend shares its core one priority step above it: it runs whenever it has work and
+        // the spin only gets what is left. On core 0 it starved behind the GL backend and the presentation.
+        if (name == "GameThread")
+            ps2xSwitchPinCurrentThread(1, 0);
+        else if (name == "GSStage")
+            ps2xSwitchPinCurrentThread(1, 1);
+        else if (name == "GSWorker")
+            ps2xSwitchPinCurrentThread(2, 0);
+        else
+            ps2xSwitchPinCurrentThread(0, 0);
 #endif
     }
 }

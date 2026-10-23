@@ -4,6 +4,7 @@
 #include "runtime/ps2_rom_device.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
@@ -143,6 +144,38 @@ namespace
                 return false;
         }
         return true;
+    }
+
+    // The PS2 disc file system (ISO9660) ignores case, and the game asks for e.g. "IOP_MOD/sio2man.irx" while the
+    // extracted file is "IOP_MOD/SIO2MAN.IRX". Windows and the Switch SD card (FAT) ignore case too, but the Switch
+    // RomFS of the installed NSP does not: on a miss, match every component of the path without case.
+    std::filesystem::path matchPathWithoutCase(const std::filesystem::path &base, const std::filesystem::path &relative)
+    {
+        const auto lower = [](std::string text)
+        {
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return text;
+        };
+        std::error_code error;
+        std::filesystem::path current = base;
+        for (const auto &part : relative)
+        {
+            std::filesystem::path next = current / part;
+            if (!std::filesystem::exists(next, error))
+            {
+                const std::string wanted = lower(part.string());
+                for (std::filesystem::directory_iterator it(current, error), end; !error && it != end; it.increment(error))
+                {
+                    if (lower(it->path().filename().string()) == wanted)
+                    {
+                        next = it->path();
+                        break;
+                    }
+                }
+            }
+            current = std::move(next);
+        }
+        return current;
     }
 
     std::time_t toTimeT(std::filesystem::file_time_type value)
@@ -298,6 +331,9 @@ bool PS2Vfs::resolveHostPath(std::string_view path, const PS2VfsMounts &mounts, 
     if (base.empty() || !safeRelativePath(parsed.path, relative))
         return false;
     result = (base / relative).lexically_normal();
+    std::error_code error;
+    if (parsed.device == ps2x::iop::Ps2PathDevice::Cdrom && !std::filesystem::exists(result, error))
+        result = matchPathWithoutCase(base, relative).lexically_normal();
     return true;
 }
 

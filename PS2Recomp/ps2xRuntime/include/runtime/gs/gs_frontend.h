@@ -9,6 +9,9 @@
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
+#include "runtime/gs/ps2_gif_arbiter.h" // GOW-Port: conservar el origen de cada flujo GIF.
+
+namespace GSSharedPresent { struct Frame; }
 
 struct GSDebugSnapshot
 {
@@ -106,14 +109,16 @@ public:
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
-    bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path = GifPathId::Path1);
+    bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path = GifPathId::Path1);
+    bool hasPendingGIFPacket(GifPathId path) const; // GOW-Port: los atajos DMA no pueden saltarse un flujo pendiente.
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
                            uint64_t trxreg,
                            uint64_t trxdir,
                            const uint8_t *data,
-                           uint32_t sizeBytes);
+                           uint32_t sizeBytes,
+                           uint64_t setupGifTag = 0u); // GOW-Port: efectos del setup validado por DMA.
     void writeRegister(uint8_t regAddr, uint64_t value);
 
     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);
@@ -130,6 +135,9 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // GOW-Port: el host registra la textura adquirida, nunca el request posterior.
+    bool usesSharedPresentation() const;
+    void recordAcquiredSharedFrame(const GSSharedPresent::Frame &frame);
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -160,18 +168,27 @@ private:
                                    uint32_t sizeBytes);
     void vertexKick(bool drawing);
 
-    void recordDebugEventUnlocked(GSDebugHistoryEntry entry);
+    void recordDebugEventUnlocked(GSDebugHistoryEntry entry, uint64_t tickOverride = UINT64_MAX);
     GSDebugHistoryEntry makeDebugEventUnlocked(GSDebugEventKind kind) const;
     void recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint8_t flg, uint32_t nreg);
     void recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value);
     void recordDrawDebugEventUnlocked(int vertexCount);
     void recordTransferDebugEventUnlocked();
-    void recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred);
+    void recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred, uint64_t tickOverride = UINT64_MAX);
 
     void processImageData(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
-    GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
-    void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
+    const GSDrawState &drawState();
+    void updatePreferredDisplaySourceForDraw(const GSDrawState &state, const GSPrimitiveVerts &prim);
+    // GOW-Port: hands the collected triangles to the backend in one SubmitRun. The run is empty whenever m_stateMutex
+    // is released (FlushRunAtExit in every entry point that can draw) and is flushed before anything that can change
+    // the draw state or reach the backend otherwise (register writes other than vertex data, image data).
+    void flushRun();
+    struct FlushRunAtExit
+    {
+        GS &gs;
+        ~FlushRunAtExit() { gs.flushRun(); }
+    };
     GSPresentationRequest buildPresentationRequestUnlocked() const;
 
 
@@ -184,6 +201,18 @@ private:
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;
 
+    // GOW-Port: cursor acotado por PATH, sin almacenar paquetes ni payloads completos.
+    struct GifInputState
+    {
+        std::array<uint8_t, 16> partial{};
+        std::array<uint8_t, 16> regs{};
+        uint32_t partialBytes = 0u, registersLeft = 0u, imageBytes = 0u, paddingBytes = 0u;
+        uint32_t nreg = 0u, regIndex = 0u;
+        uint8_t format = 0u;
+        bool pending() const { return partialBytes || registersLeft || imageBytes || paddingBytes; }
+    };
+    std::array<GifInputState, 4> m_gifInput{};
+
     GSContext m_ctx[2];
     GSPrimReg m_prim{};
     GSPrimReg m_primRegister{};
@@ -191,10 +220,19 @@ private:
 
     uint8_t m_curR = 0x80, m_curG = 0x80, m_curB = 0x80, m_curA = 0x80;
     float m_curQ = 1.0f;
+    float m_packedStQ = 1.0f; // Q of the last PACKED ST write: becomes RGBAQ.Q only at the next PACKED RGBAQ write (GS rule)
     float m_curS = 0.0f, m_curT = 0.0f;
     uint16_t m_curU = 0, m_curV = 0;
     uint8_t m_curFog = 0;
     uint8_t m_fogR = 0, m_fogG = 0, m_fogB = 0;
+    // GOW-Port: all draw state comes from register writes other than vertex data (RGBAQ, ST, UV, FOG, XYZ*), which bump
+    // m_stateSerial; drawState() rebuilds m_builtState only when it changed (a strip keeps one state for every triangle).
+    uint64_t m_stateSerial = 1;
+    uint64_t m_builtStateSerial = 0;
+    GSDrawState m_builtState{};
+    // triangles drawn since the last flushRun, all with m_runState (= the state at m_runState's serial)
+    std::vector<GSPrimitiveVerts> m_run;
+    GSDrawState m_runState{};
 
     bool m_prmodecont = true;
     bool m_pabe = false;
@@ -229,6 +267,14 @@ private:
     uint32_t m_hostPresentationSourceFbp = 0;
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
+    // GOW-Port: la captura explicita conserva el CRTC del ultimo latch; GL sigue en el worker.
+    GSPresentationRequest m_hostPresentationRequest{};
+    bool m_hasHostPresentationRequest = false;
+    bool m_hostPresentationRequestIsShared = false;
+    uint64_t m_hostPresentationGeneration = 0u;
+    uint64_t m_hostSharedSequence = 0u;
+    mutable PresentationFrame m_hostDiagnosticFrame;
+    mutable uint64_t m_hostDiagnosticGeneration = UINT64_MAX;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
 

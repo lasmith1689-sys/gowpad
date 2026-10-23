@@ -1,14 +1,23 @@
 name: TestFlight
 
-# My personal GoWPad: God of War (USA) statically recompiled from my own disc's
-# executable with PS2Recomp, built on GitHub's Mac runner, signed with Apple's
-# cloud signing and uploaded to TestFlight for internal testing only. The game
-# input arrives encrypted (release asset `game-input`, key in the GAME_KEY
-# secret), is decrypted only inside the runner, and nothing derived from it is
-# cached or kept as an artifact. The disc image itself never leaves my devices:
-# it is copied into the app's Documents folder on the phone.
+# My personal GoWPad: God of War (USA) as native iPhone code: Waffle565's God of War runtime (PS2Recomp fork, ported to
+# OpenGL ES) with the game's EE functions, VU1 microprograms and IOP modules compiled to C++ from my own disc on my PC.
+# Built on GitHub's Mac runner, signed with Apple's cloud signing and uploaded to TestFlight for internal testing only.
+# The game input arrives encrypted (release asset `game-input` / gow-native-input.tar.enc, key in the GAME_KEY secret),
+# is decrypted only inside the runner, and nothing derived from it is cached; the only thing kept is the simulator
+# check's screenshots, for one day. The disc image itself never leaves my devices: it is copied into the app's Documents
+# folder on the phone.
+#
+# mode: simulator  builds for the iOS Simulator and runs the app there (no disc: start-up, GL ES, shaders, boot)
+#       testflight builds for the device and uploads it
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: simulator or testflight
+        type: choice
+        options: [simulator, testflight]
+        default: simulator
 
 concurrency:
   group: testflight
@@ -17,14 +26,15 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  GOWPAD_BUNDLE_ID: com.lasmith1689.gowpad
+
 jobs:
-  testflight:
-    name: Recompile, build, sign and upload to TestFlight
+  build:
+    name: Build (${{ inputs.mode }})
     runs-on: macos-15
     timeout-minutes: 300
-    env:
-      HOMEBREW_NO_AUTO_UPDATE: '1'
-      GOWPAD_BUNDLE_ID: com.lasmith1689.gowpad
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -54,17 +64,33 @@ jobs:
         run: |
           [ -n "$GAME_KEY" ] || { echo "::error::Add the GAME_KEY secret first."; exit 1; }
           mkdir -p "$RUNNER_TEMP/input"
-          gh release download game-input -R "$GITHUB_REPOSITORY" -p gow-input.tar.enc -D "$RUNNER_TEMP/input"
+          gh release download game-input -R "$GITHUB_REPOSITORY" -p gow-native-input.tar.enc -D "$RUNNER_TEMP/input"
           /opt/homebrew/opt/openssl@3/bin/openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 \
-            -pass env:GAME_KEY -in "$RUNNER_TEMP/input/gow-input.tar.enc" -out "$RUNNER_TEMP/input/gow-input.tar"
-          tar -xf "$RUNNER_TEMP/input/gow-input.tar" -C "$RUNNER_TEMP/input"
-          rm -f "$RUNNER_TEMP/input/gow-input.tar.enc" "$RUNNER_TEMP/input/gow-input.tar"
+            -pass env:GAME_KEY -in "$RUNNER_TEMP/input/gow-native-input.tar.enc" -out "$RUNNER_TEMP/input/input.tar"
+          tar -xf "$RUNNER_TEMP/input/input.tar" -C "$RUNNER_TEMP/input"
+          rm -f "$RUNNER_TEMP/input/gow-native-input.tar.enc" "$RUNNER_TEMP/input/input.tar"
           ls -la "$RUNNER_TEMP/input/game"
-      - name: Recompile and build the app
+          du -sh "$RUNNER_TEMP/input/generated"/*
+      - name: Build the app
         env:
           CMAKE_BUILD_PARALLEL_LEVEL: '3'
-        run: bash .github/scripts/build-ios.sh "$RUNNER_TEMP/input/game" "$RUNNER_TEMP/work"
+        run: |
+          target=device
+          [ "${{ inputs.mode }}" = simulator ] && target=simulator
+          bash .github/scripts/build-ios.sh "$RUNNER_TEMP/input" "$RUNNER_TEMP/work" "$target"
+      - name: Run it in the iOS Simulator
+        if: inputs.mode == 'simulator'
+        run: bash .github/scripts/simulator-check.sh "$RUNNER_TEMP/work/GoWPad.app" "$RUNNER_TEMP/simcheck"
+      - name: Keep the simulator screenshots (one day)
+        if: inputs.mode == 'simulator' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: simulator-screenshots
+          path: ${{ runner.temp }}/simcheck/*.png
+          retention-days: 1
+          if-no-files-found: ignore
       - name: Sign and upload
+        if: inputs.mode == 'testflight'
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -75,5 +101,5 @@ jobs:
       - name: Remove the game input and everything built from it
         if: always()
         run: |
-          rm -rf "$RUNNER_TEMP/input" "$RUNNER_TEMP/work" "$RUNNER_TEMP/testflight"
+          rm -rf "$RUNNER_TEMP/input" "$RUNNER_TEMP/work" "$RUNNER_TEMP/testflight" "$RUNNER_TEMP/simcheck"
           df -h /

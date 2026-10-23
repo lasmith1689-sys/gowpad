@@ -6,6 +6,7 @@
 #include "module_factories.h"
 #include "ps2x/iop/ps2_path.h"
 
+#include <cstdlib>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,7 +24,7 @@ namespace ps2x::iop
             coreServices.emplace_back(detail::createMcservService(host));
             coreServices.emplace_back(detail::createDbcmanService(host));
             coreServices.emplace_back(detail::createLibSdService(host));
-            coreServices.emplace_back(detail::createSnd989Service(host));
+            coreServices.emplace_back(detail::createGow989SndService(host));
             refreshServiceModuleKeys();
             rebuildRoutes();
         }
@@ -170,6 +171,21 @@ namespace ps2x::iop
         m_impl->emulator.runEeCycles(eeCycles);
     }
 
+    bool IopSubsystem::accrueEeCycles(uint64_t eeCycles) noexcept
+    {
+        return m_impl->emulator.accrueEeCycles(eeCycles);
+    }
+
+    uint64_t IopSubsystem::eeCyclesUntilBatch() const noexcept
+    {
+        return m_impl->emulator.eeCyclesUntilBatch();
+    }
+
+    void IopSubsystem::runPendingEeCycles() noexcept
+    {
+        m_impl->emulator.runPendingEeCycles();
+    }
+
     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
     {
         for (const auto &service : m_impl->coreServices)
@@ -197,10 +213,51 @@ namespace ps2x::iop
 
     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
     {
+        // GOW-Port: PS2X_TRACE_RPC=<sid prefix hex, e.g. 800013> logs every call to the matching servers (protocol
+        // capture for the native pad / memory-card service); empty value = all servers.
+        static const char *traceRpc = std::getenv("PS2X_TRACE_RPC");
+        if (traceRpc)
+        {
+            std::ostringstream id;
+            id << std::hex << request.sid;
+            if (id.str().rfind(traceRpc, 0) == 0)
+            {
+                std::ostringstream out;
+                out << "[rpc] sid=0x" << std::hex << request.sid << " fn=0x" << request.function << " mode=" << request.mode
+                    << " send=0x" << request.send.address << "+0x" << request.send.size << " recv=0x" << request.receive.address
+                    << "+0x" << request.receive.size;
+                uint32_t words[8]{};
+                if (request.send.address && request.send.size >= sizeof(words) &&
+                    m_impl->host.readGuest(request.send.address, words, sizeof(words)))
+                {
+                    out << " |";
+                    for (uint32_t w : words)
+                        out << ' ' << w;
+                }
+                m_impl->host.log(LogLevel::Info, out.str());
+            }
+        }
         const auto route = m_impl->routes.find(request.sid);
         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
 
         RpcResult emulated = m_impl->emulator.handleRpc(request);
+        if (traceRpc && emulated.handled && request.receive.address && request.receive.size >= 48u)
+        {
+            std::ostringstream id;
+            id << std::hex << request.sid;
+            if (id.str().rfind(traceRpc, 0) == 0)
+            {
+                uint32_t words[12]{};
+                if (m_impl->host.readGuest(request.receive.address, words, sizeof(words)))
+                {
+                    std::ostringstream out;
+                    out << "[rpc-reply] sid=0x" << std::hex << request.sid << " |";
+                    for (uint32_t w : words)
+                        out << ' ' << w;
+                    m_impl->host.log(LogLevel::Info, out.str());
+                }
+            }
+        }
         if (emulated.handled || !hle)
         {
             return emulated;
@@ -250,6 +307,11 @@ namespace ps2x::iop
         return m_impl->emulator.isMemoryRange(address, size);
     }
 
+    size_t IopSubsystem::drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames)
+    {
+        return m_impl->emulator.drainAudio(stereo, maxFrames, maxLatencyFrames);
+    }
+
     DebugSnapshot IopSubsystem::debugSnapshot() const
     {
         DebugSnapshot snapshot;
@@ -259,8 +321,6 @@ namespace ps2x::iop
         snapshot.emulatorThreads = m_impl->emulator.threadCount();
         snapshot.emulatorRpcServers = m_impl->emulator.rpcServerCount();
         snapshot.diagnostics = m_impl->loadOutcomes;
-        for (std::string &line : m_impl->emulator.describeThreads())
-            snapshot.diagnostics.push_back(std::move(line));
         if (!m_impl->lastError.empty())
         {
             snapshot.diagnostics.push_back(m_impl->lastError);
