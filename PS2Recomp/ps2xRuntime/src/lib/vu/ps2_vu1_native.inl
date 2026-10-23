@@ -698,7 +698,7 @@ void VU1NativeAccess::codeChanged(VU1Interpreter::NativeState &ns, const uint8_t
 {
     using NS = VU1Interpreter::NativeState;
     constexpr uint32_t kPairs = sizeof(ns.code) / 8u;
-    static_assert(kPairs == std::size(ns.slots));
+    static_assert(kPairs == sizeof(ns.slots) / sizeof(ns.slots[0]));
     ++ns.codeChanges;
     if (!ns.codeValid)
     {

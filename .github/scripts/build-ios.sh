@@ -47,8 +47,8 @@ cmake -S "$work/src" -B "$work/ios" -G Ninja \
   > "$work/ios-configure.log" 2>&1 || { tail -80 "$work/ios-configure.log"; exit 1; }
 grep -E "VU1 compilada|ARM|sse2neon" "$work/ios-configure.log" || true
 start=$SECONDS
-cmake --build "$work/ios" --target ps2EntryRunner -j "$jobs" > "$work/ios-build.log" 2>&1 || {
-  grep -E "error:|FAILED" "$work/ios-build.log" | head -60; tail -30 "$work/ios-build.log"; exit 1; }
+cmake --build "$work/ios" --target ps2EntryRunner -j "$jobs" -- -k 0 > "$work/ios-build.log" 2>&1 || {
+  grep -E "error:|FAILED" "$work/ios-build.log" | sort -u | head -150; tail -30 "$work/ios-build.log"; exit 1; }
 echo "  compiled in $(( (SECONDS - start) / 60 )) min"
 
 app=$(find "$work/ios" -maxdepth 3 -name 'GoWPad.app' -type d | head -n 1)
