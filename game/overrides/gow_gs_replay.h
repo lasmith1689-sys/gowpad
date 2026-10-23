@@ -35,10 +35,11 @@ namespace gow_gs_replay
         CaptureOptions candidate; error=nullptr;
         const auto number=[](const char *text,double minimum,double maximum,double &value) {
             if(!text) return true;
-            double parsed=0;
+            // (strtod, not std::from_chars: Apple's libc++ has floating-point from_chars only from iOS 26)
             const char *end=text+std::strlen(text);
-            const auto result=std::from_chars(text,end,parsed);
-            if(result.ec!=std::errc{} || result.ptr!=end || !std::isfinite(parsed) ||
+            char *parsedEnd=nullptr;
+            const double parsed=std::strtod(text,&parsedEnd);
+            if(parsedEnd!=end || end==text || !std::isfinite(parsed) ||
                parsed<minimum || parsed>maximum) return false;
             value=parsed; return true;
         };
