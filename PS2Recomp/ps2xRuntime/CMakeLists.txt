@@ -67,7 +67,7 @@ set(PS2X_IS_IOS OFF)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(PS2X_IS_IOS ON)
-    enable_language(OBJCXX)
+    enable_language(OBJC OBJCXX)
     set(PS2X_ENABLE_DEBUG_UI OFF CACHE BOOL "" FORCE)
     set(PS2X_ENABLE_SCCACHE OFF CACHE BOOL "" FORCE)
     add_compile_options(-fsigned-char)
