@@ -108,6 +108,36 @@ namespace
         return true;
     }
 }
+#elif defined(PS2X_IOS)
+#include <dlfcn.h>
+extern "C" void *ps2xEaglCreate(void *share);
+extern "C" void *ps2xEaglCurrent();
+extern "C" bool ps2xEaglMakeCurrent(void *context);
+extern "C" void ps2xEaglDestroy(void *context);
+
+namespace
+{
+    // GOW-Port: the host window's EAGL context (SDL, main thread), captured so the GS renderer's context is created in
+    // its sharegroup and the presented frame's texture is drawn by the window without a readback (gs_gl_ios.mm)
+    void *s_hostEagl = nullptr;
+
+    void forgetHostContext()
+    {
+        s_hostEagl = nullptr;
+    }
+
+    template <typename T>
+    bool load(T &target, const char *name, std::string &missing)
+    {
+        target = reinterpret_cast<T>(dlsym(RTLD_DEFAULT, name));
+        if (!target)
+        {
+            missing += missing.empty() ? name : std::string(", ") + name;
+            return false;
+        }
+        return true;
+    }
+}
 #endif
 
 #if defined(_WIN32) || defined(__SWITCH__)
@@ -164,6 +194,7 @@ namespace
     load(a.Flush, "glFlush", missing);
     load(a.GetError, "glGetError", missing);
     load(a.GetString, "glGetString", missing);
+    load(a.GetIntegerv, "glGetIntegerv", missing);
     load(a.GenTextures, "glGenTextures", missing);
     load(a.DeleteTextures, "glDeleteTextures", missing);
     load(a.BindTexture, "glBindTexture", missing);
@@ -227,11 +258,11 @@ namespace
 }
 #endif
 
-#if defined(_WIN32) || defined(__SWITCH__)
-// GOW-Port: shared-texture presentation, the same on both platforms: the GS renderer's context shares objects with the
+#if defined(_WIN32) || defined(__SWITCH__) || defined(PS2X_IOS)
+// GOW-Port: shared-texture presentation, the same on every platform: the GS renderer's context shares objects with the
 // host window's context; Present copies the composed frame into one of these slots (a texture of the shared namespace)
 // and fences it, the host takes the newest finished slot and draws it, then fences its use before the slot is reused.
-// The contexts' platform part (WGL / EGL) is below.
+// The contexts' platform part (WGL / EGL / EAGL) is below.
 namespace
 {
     struct SharedSlot
@@ -538,7 +569,8 @@ namespace GSGL
                               uint32_t displayFbp, uint32_t sourceFbp, uint64_t vsyncTick)
     {
         std::lock_guard<std::mutex> lock(s_sharedMutex);
-        if (!s_sharedActive.load(std::memory_order_relaxed) || !gl.CopyImageSubData)
+        // (OpenGL ES 3.0 has no glCopyImageSubData: the copy is a framebuffer blit there, below)
+        if (!s_sharedActive.load(std::memory_order_relaxed) || (!gl.CopyImageSubData && !gl.BlitFramebuffer))
             return false;
         SharedSlot *available = nullptr;
         for (SharedSlot &slot : s_sharedSlots)
@@ -574,8 +606,32 @@ namespace GSGL
                 slot.frame.width = width;
                 slot.frame.height = height;
             }
-            gl.CopyImageSubData(source, kTexture2D, 0, 0, 0, 0, slot.frame.texture, kTexture2D, 0, 0, 0, 0,
-                                static_cast<GLsizei>(width), static_cast<GLsizei>(height), 1);
+            // PS2X_GS_SHARED_BLIT=1: the blit even where glCopyImageSubData exists (tests the iOS copy on the PC)
+            static const bool forceBlit = [] { const char *v = std::getenv("PS2X_GS_SHARED_BLIT"); return v && *v == '1'; }();
+            if (gl.CopyImageSubData && !(forceBlit && gl.BlitFramebuffer))
+                gl.CopyImageSubData(source, kTexture2D, 0, 0, 0, 0, slot.frame.texture, kTexture2D, 0, 0, 0, 0,
+                                    static_cast<GLsizei>(width), static_cast<GLsizei>(height), 1);
+            else
+            {
+                // two framebuffers of this context (not shared) around the source and the slot texture
+                constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9, kReadFramebufferBinding = 0x8CAA;
+                constexpr GLenum kColorAttachment0 = 0x8CE0;
+                constexpr GLbitfield kColorBufferBit = 0x4000;
+                static GLuint blit[2] = {0u, 0u};
+                if (!blit[0])
+                    gl.GenFramebuffers(2, blit);
+                GLint previousRead = 0, previousDraw = 0;
+                gl.GetIntegerv(kReadFramebufferBinding, &previousRead);
+                gl.GetIntegerv(kFramebufferBinding, &previousDraw);
+                gl.BindFramebuffer(kReadFramebuffer, blit[0]);
+                gl.FramebufferTexture2D(kReadFramebuffer, kColorAttachment0, kTexture2D, source, 0);
+                gl.BindFramebuffer(kDrawFramebuffer, blit[1]);
+                gl.FramebufferTexture2D(kDrawFramebuffer, kColorAttachment0, kTexture2D, slot.frame.texture, 0);
+                gl.BlitFramebuffer(0, 0, static_cast<GLint>(width), static_cast<GLint>(height), 0, 0, static_cast<GLint>(width),
+                                   static_cast<GLint>(height), kColorBufferBit, static_cast<GLenum>(kNearest));
+                gl.BindFramebuffer(kReadFramebuffer, static_cast<GLuint>(previousRead));
+                gl.BindFramebuffer(kDrawFramebuffer, static_cast<GLuint>(previousDraw));
+            }
         }
         if (s_sharedSequence == 0u)
             s_firstPublish = std::chrono::steady_clock::now();
@@ -1003,29 +1059,14 @@ namespace GSGL
     }
 }
 #elif defined(PS2X_IOS)
-// GOW-Port: iOS: the GS renderer's own OpenGL ES 3.0 context (EAGL, gs_gl_ios.mm) on its thread. No object sharing with the
-// host window: frames go through the RAM path (readback + upload to raylib's texture). Entry points come straight from the
-// OpenGLES framework; the ES Api has no dual-source blend, texture barrier, image copy, compute or timer queries, and
-// destination reads use framebuffer fetch (every iOS GPU has GL_EXT_shader_framebuffer_fetch).
-#include <dlfcn.h>
-extern "C" void *ps2xEaglCreate(void *share);
-extern "C" bool ps2xEaglMakeCurrent(void *context);
-extern "C" void ps2xEaglDestroy(void *context);
-
+// GOW-Port: iOS: the GS renderer's own OpenGL ES 3.0 context (EAGL, gs_gl_ios.mm) on its thread, in the host window's
+// sharegroup: frames are shared textures (above; the slot copy is a framebuffer blit). The RAM path (asynchronous
+// readback + upload to raylib's texture) is left for PS2X_GS_DIRECT_PRESENT=0: on the iPhone it stuttered (readback
+// and upload every frame on top of the renderer's work). Entry points come straight from the OpenGLES framework; the
+// ES Api has no dual-source blend, texture barrier, image copy, compute or timer queries, and destination reads use
+// framebuffer fetch (every iOS GPU has GL_EXT_shader_framebuffer_fetch).
 namespace
 {
-    template <typename T>
-    bool load(T &target, const char *name, std::string &missing)
-    {
-        target = reinterpret_cast<T>(dlsym(RTLD_DEFAULT, name));
-        if (!target)
-        {
-            missing += missing.empty() ? name : std::string(", ") + name;
-            return false;
-        }
-        return true;
-    }
-
     void loadEsApi(GSGL::Api &a, std::string &missing)
     {
         load(a.GenBuffers, "glGenBuffers", missing);
@@ -1126,14 +1167,48 @@ namespace
     }
 }
 
+namespace GSSharedPresent
+{
+    void CaptureHostContext()
+    {
+        // GOW-Port: on by default; PS2X_GS_DIRECT_PRESENT=0 keeps the RAM (readback + upload) presentation. An EAGL
+        // context joins the sharegroup of one that is current on another thread, so the host context stays current.
+        const char *value = std::getenv("PS2X_GS_DIRECT_PRESENT");
+        if (value && *value == '0')
+            return;
+        void *context = ps2xEaglCurrent();
+        if (!context)
+        {
+            std::fprintf(stderr, "[gs-present] no current EAGL context on the host thread; RAM presentation\n");
+            return;
+        }
+        std::string missing;
+        GSGL::Api api;
+        load(api.FenceSync, "glFenceSync", missing);
+        load(api.ClientWaitSync, "glClientWaitSync", missing);
+        load(api.DeleteSync, "glDeleteSync", missing);
+        load(api.Flush, "glFlush", missing);
+        if (!missing.empty())
+        {
+            std::fprintf(stderr, "[gs-present] shared presentation unavailable: %s\n", missing.c_str());
+            return;
+        }
+        loadHostProbeApi();
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        s_hostApi = api;
+        s_hostEagl = context;
+    }
+
+    void RestoreHostContext()
+    {
+        // (EAGL's current context is per thread: this only matters if the GS context was made current on this one)
+        if (s_hostEagl)
+            ps2xEaglMakeCurrent(s_hostEagl);
+    }
+}
+
 namespace GSGL
 {
-    bool PublishShared(const Api &, GLuint, uint32_t, uint32_t, uint64_t,
-                       uint32_t, uint32_t, bool, bool, uint64_t, GLuint, GLint) { return false; }
-    bool SharedAvailable(const Api &) { return false; }
-    bool PublishSharedTexture(const Api &, GLuint, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint64_t) { return false; }
-    void DestroyShared(const Api &) {}
-
     Context::~Context()
     {
         Destroy();
@@ -1142,7 +1217,8 @@ namespace GSGL
     bool Context::Create(std::string &error)
     {
         Destroy();
-        m_context = ps2xEaglCreate(nullptr);
+        m_context = ps2xEaglCreate(s_hostEagl); // the host window's sharegroup when it was captured
+        m_shared = m_context && s_hostEagl;
         if (!m_context || !ps2xEaglMakeCurrent(m_context))
         {
             error = "OpenGL ES 3.0 context unavailable";
@@ -1162,9 +1238,15 @@ namespace GSGL
         m_api.graphics = true;
         // destination reads use framebuffer fetch, or copies of the target without it (gs_hw_backend destCopyMode)
         m_api.hwRaster = true;
-        std::fprintf(stderr, "[gs-gl] OpenGL ES context: %s, %s, framebuffer fetch %s\n",
+        std::fprintf(stderr, "[gs-gl] OpenGL ES context: %s, %s, framebuffer fetch %s%s\n",
                      reinterpret_cast<const char *>(m_api.GetString(kRenderer)), reinterpret_cast<const char *>(m_api.GetString(kVersion)),
-                     m_api.fbFetch ? "yes" : "no");
+                     m_api.fbFetch ? "yes" : "no", m_shared ? ", shared with the host window" : "");
+        if (m_shared)
+        {
+            createProbe(m_api); // (no glCopyImageSubData in ES: no probe; the 3 s no-frame check still applies)
+            s_sharedActive.store(true, std::memory_order_release);
+            std::fprintf(stderr, "[gs-present] shared GPU textures active\n");
+        }
         return true;
     }
 
@@ -1190,15 +1272,6 @@ namespace GSGL
         m_api = {};
         m_shared = false;
     }
-}
-namespace GSSharedPresent
-{
-    void CaptureHostContext() {}
-    void RestoreHostContext() {}
-    bool Active() { return false; }
-    uint64_t LatestSequence() { return 0u; }
-    bool Acquire(Frame &) { return false; }
-    void ShutdownHost() {}
 }
 #else
 namespace GSGL

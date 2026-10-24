@@ -1048,7 +1048,29 @@ void main()
             at = 0;
             ++stats.orphans;
         }
-        g.BufferSubData(kArrayBuffer, at, length, data);
+        // GOW-Port: OpenGL ES (iOS): Apple's driver may wait for the GPU to finish the buffer's earlier draws before a
+        // BufferSubData into it (hundreds of times per frame). The range written here is never one a pending draw reads
+        // (append only, orphaned when full), so it is written through an unsynchronised mapping instead (Apple's own
+        // advice for streamed vertices). PS2X_GS_STREAM_MAP=0/1 overrides; off by default elsewhere: NVIDIA's desktop
+        // driver takes ~0.5 ms per mapping (4.3 s per 5 s in the PC ES test) against 13 ms for the BufferSubData calls.
+        static const bool mapped = [] {
+            const char *v = std::getenv("PS2X_GS_STREAM_MAP");
+#if defined(PS2X_IOS)
+            return !(v && *v == '0');
+#else
+            return v && *v == '1';
+#endif
+        }();
+        void *target = nullptr;
+        if (g.es && mapped && g.MapBufferRange && g.UnmapBuffer)
+            target = g.MapBufferRange(kArrayBuffer, at, length, 0x0002 /* WRITE */ | 0x0004 /* INVALIDATE_RANGE */ | 0x0020 /* UNSYNCHRONIZED */);
+        if (target)
+        {
+            std::memcpy(target, data, bytes);
+            g.UnmapBuffer(kArrayBuffer);
+        }
+        else
+            g.BufferSubData(kArrayBuffer, at, length, data);
         sb.used = at + length;
         stats.uploadBytes += bytes;
         return static_cast<GLint>(at / step);
@@ -1155,7 +1177,9 @@ void main()
         const Api &g = gl();
         {
             const char *copy = std::getenv("PS2X_GS_DEST_COPY");
-            destCopyMode = !g.fbFetch && ((copy && *copy == '1') || g.es);
+            // (PS2X_GS_DEST_COPY=0 with PS2X_GS_ES=1 on the PC: texture barriers instead, the cost of framebuffer
+            // fetch on iOS for performance comparisons; the picture has the barrier artefacts)
+            destCopyMode = !g.fbFetch && ((copy && *copy == '1') || (g.es && !(copy && *copy == '0')));
             if (destCopyMode)
                 std::fprintf(stderr, "[gs-hw] destination reads from a copy of the target (no framebuffer fetch)\n");
         }
