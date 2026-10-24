@@ -16,7 +16,7 @@ on:
       mode:
         description: simulator or testflight
         type: choice
-        options: [simulator, testflight]
+        options: [simulator, testflight, probe]
         default: simulator
 
 concurrency:
@@ -31,8 +31,37 @@ env:
   GOWPAD_BUNDLE_ID: com.lasmith1689.gowpad
 
 jobs:
+  probe:
+    # what this Xcode offers for Apple-hosted Background Assets (templates, interfaces, ba-package)
+    name: Probe Xcode
+    if: inputs.mode == 'probe'
+    runs-on: macos-15
+    steps:
+      - name: Background Assets templates, interfaces and tools
+        run: |
+          xcode=$(for x in /Applications/Xcode_*.app; do [ -L "$x" ] || echo "$x"; done | sort -V | tail -n 1)
+          export DEVELOPER_DIR="$xcode/Contents/Developer"
+          echo "== $xcode"
+          grep -rl -i "background-asset\|BackgroundAssets\|StoreDownloaderExtension" "$xcode/Contents" --include='*.plist' --include='*.swift' --include='TemplateInfo.plist' 2>/dev/null | grep -i template | head -40
+          for d in $(grep -rl -i "StoreDownloaderExtension\|background-asset" "$xcode/Contents" --include='TemplateInfo.plist' 2>/dev/null | xargs -n1 dirname | sort -u | head -6); do
+            echo "==== $d"; ls -la "$d"
+            for f in "$d"/*; do [ -f "$f" ] && { echo "---- $f"; plutil -convert xml1 -o - "$f" 2>/dev/null || cat "$f"; }; done
+          done
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          fw="$sdk/System/Library/Frameworks/BackgroundAssets.framework"
+          ls "$fw" "$fw/Headers" 2>/dev/null
+          for h in "$fw"/Headers/BAAssetPack*.h "$fw"/Headers/BAManaged*.h; do echo "---- $h"; grep -v "^//\|^ *$" "$h"; done
+          si=$(find "$fw" -name '*.swiftinterface' | grep arm64-apple-ios | head -1)
+          echo "---- $si"; grep -n -i "func \|class AssetPackManager\|struct AssetPack\|protocol StoreDownloaderExtension\|availability\|descriptor\|url(" "$si" | head -120
+          sk=$(find "$sdk/System/Library/Frameworks/StoreKit.framework" -name '*.swiftinterface' | grep arm64-apple-ios | head -1)
+          grep -n -B2 -A12 "protocol StoreDownloaderExtension" "$sk" | head -60
+          xcrun ba-package --help 2>&1 | head -60
+          mkdir -p /tmp/ba && cd /tmp/ba && xcrun ba-package template -o Manifest.json 2>&1 | head; cat Manifest.json 2>/dev/null | head -80
+          xcrun altool --help 2>&1 | grep -i -A2 "asset\|background" | head -30
+
   build:
     name: Build (${{ inputs.mode }})
+    if: inputs.mode != 'probe'
     runs-on: macos-15
     timeout-minutes: 300
     steps:
