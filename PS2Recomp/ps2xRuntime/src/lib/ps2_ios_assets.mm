@@ -31,8 +31,7 @@ bool ps2xIosAssetPackFile(const char *packId, const char *file, std::string &pat
 {
 #if TARGET_OS_SIMULATOR
     // (Background Assets traps in unsigned simulator builds: "The process lacks a team ID")
-    std::fprintf(stderr, "[ios-assets] no asset packs in the simulator
-");
+    std::fprintf(stderr, "[ios-assets] no asset packs in the simulator\n");
     (void)packId; (void)file; (void)path;
     return false;
 #endif
