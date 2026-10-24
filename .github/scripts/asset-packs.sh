@@ -58,7 +58,16 @@ EOF
   rm -f "disc/$file"
   echo "  packaged in $((SECONDS - start)) s: $(stat -f %z "$pack.aar") bytes"
   xcrun altool --upload-asset-pack "$pack.aar" --apple-id "$apple_id" \
-    --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --wait --output-format normal
+    --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --output-format normal
   rm -f "$pack.aar"
+  # processing ends in READY_FOR_TESTING (success) or FAILED (altool --wait only stops on READY/FAILED: never here)
+  for attempt in $(seq 1 120); do
+    versions=$(xcrun altool --list-asset-pack-versions --apple-id "$apple_id" --asset-pack-identifier "$pack" \
+      --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" --output-format normal 2>&1 || true)
+    if grep -q "FAILED" <<<"$versions"; then echo "$versions"; echo "::error::$pack processing failed"; exit 1; fi
+    if grep -q "READY_FOR_TESTING\|READY_FOR_INTERNAL_TESTING" <<<"$versions"; then echo "$versions" | tail -n 8; break; fi
+    [ "$attempt" = 120 ] && { echo "$versions"; echo "::warning::$pack still processing after an hour"; }
+    sleep 30
+  done
 done
 xcrun altool --list-asset-packs --apple-id "$apple_id" --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" || true
