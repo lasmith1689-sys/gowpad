@@ -39,13 +39,14 @@ jobs:
     steps:
       - name: Background Assets templates, interfaces and tools
         run: |
+          set +e
           xcode=$(for x in /Applications/Xcode_*.app; do [ -L "$x" ] || echo "$x"; done | sort -V | tail -n 1)
           export DEVELOPER_DIR="$xcode/Contents/Developer"
           echo "== $xcode"
-          grep -rl -i "background-asset\|BackgroundAssets\|StoreDownloaderExtension" "$xcode/Contents" --include='*.plist' --include='*.swift' --include='TemplateInfo.plist' 2>/dev/null | grep -i template | head -40
-          for d in $(grep -rl -i "StoreDownloaderExtension\|background-asset" "$xcode/Contents" --include='TemplateInfo.plist' 2>/dev/null | xargs -n1 dirname | sort -u | head -6); do
-            echo "==== $d"; ls -la "$d"
-            for f in "$d"/*; do [ -f "$f" ] && { echo "---- $f"; plutil -convert xml1 -o - "$f" 2>/dev/null || cat "$f"; }; done
+          t="$xcode/Contents/Developer/Platforms/iPhoneOS.platform/Developer/Library/Xcode/Templates/Project Templates/iOS/Application Extension/Background Download Extension.xctemplate"
+          find "$t" -type f | while IFS= read -r f; do
+            echo "---- ${f#$t/}"
+            case "$f" in *.png|*.pdf) ;; *) plutil -convert xml1 -o - "$f" 2>/dev/null || cat "$f" ;; esac
           done
           sdk=$(xcrun --sdk iphoneos --show-sdk-path)
           fw="$sdk/System/Library/Frameworks/BackgroundAssets.framework"
