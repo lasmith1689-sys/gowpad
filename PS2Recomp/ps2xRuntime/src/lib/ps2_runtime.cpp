@@ -917,6 +917,9 @@ bool PS2Runtime::initialize(const char *title)
             // start (landscape); resizing afterwards leaves raylib's viewport at the old size. The picture is fitted
             // at 16:9 inside it (gs_host_present.cpp).
             {
+                // SDL on iOS lists the accelerometer as joystick 0 by default; it has no gamepad mapping, so raylib's
+                // gamepad 0 failed to open ("Couldn't find mapping for device (0)") and a real controller came second
+                SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
                 SDL_InitSubSystem(SDL_INIT_VIDEO);
                 SDL_DisplayMode mode{};
                 if (SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0)

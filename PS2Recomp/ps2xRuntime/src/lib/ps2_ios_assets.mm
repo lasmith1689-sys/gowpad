@@ -5,7 +5,9 @@
 #import <Foundation/Foundation.h>
 #include <TargetConditionals.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace
@@ -82,15 +84,39 @@ bool ps2xIosAssetPackFile(const char *packId, const char *file, std::string &pat
             std::fprintf(stderr, "[ios-assets] %s: %s\n", packId, availability.localizedDescription.UTF8String);
             return false;
         }
+        NSString *name = [NSString stringWithUTF8String:file];
         NSError *urlError = nil;
-        NSURL *url = [manager URLForPath:[NSString stringWithUTF8String:file] error:&urlError];
-        if (!url || !url.fileURL)
+        NSURL *url = [manager URLForPath:name error:&urlError];
+        if (url && url.fileURL)
         {
-            std::fprintf(stderr, "[ios-assets] %s in %s: %s\n", file, packId,
-                         urlError ? urlError.localizedDescription.UTF8String : "no file URL");
+            // the packs live in the Background Assets daemon's container: the path may not be open to the app
+            if (std::FILE *probe = std::fopen(url.path.UTF8String, "rb"))
+            {
+                std::fclose(probe);
+                path = url.path.UTF8String;
+                std::fprintf(stderr, "[ios-assets] %s readable at %s\n", file, path.c_str());
+                return true;
+            }
+            std::fprintf(stderr, "[ios-assets] %s not readable by path (%s): %s\n", file, std::strerror(errno), url.path.UTF8String);
+        }
+        else
+            std::fprintf(stderr, "[ios-assets] %s in %s: no URL (%s)\n", file, packId,
+                         urlError ? urlError.localizedDescription.UTF8String : "none");
+        // the descriptor the system opens for the app; /dev/fd/<n> reopens it for the runtime's file streams
+        NSError *fdError = nil;
+        const int fd = [manager fileDescriptorForPath:name searchingInAssetPackWithIdentifier:identifier error:&fdError];
+        if (fd < 0)
+        {
+            std::fprintf(stderr, "[ios-assets] %s: no descriptor (%s)\n", file,
+                         fdError ? fdError.localizedDescription.UTF8String : "none");
             return false;
         }
-        path = url.path.UTF8String;
+        path = "/dev/fd/" + std::to_string(fd);
+        std::FILE *probe = std::fopen(path.c_str(), "rb");
+        std::fprintf(stderr, "[ios-assets] %s through descriptor %d: %s\n", file, fd, probe ? "readable" : std::strerror(errno));
+        if (!probe)
+            return false;
+        std::fclose(probe);
         return true;
     }
     std::fprintf(stderr, "[ios-assets] asset packs need iOS 26\n");
