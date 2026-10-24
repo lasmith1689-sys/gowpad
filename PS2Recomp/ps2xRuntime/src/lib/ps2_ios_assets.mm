@@ -3,16 +3,25 @@
 // runtime can open. Compiled with ARC.
 #import <BackgroundAssets/BackgroundAssets.h>
 #import <Foundation/Foundation.h>
+#include <TargetConditionals.h>
 
 #include <cstdio>
 #include <string>
 
 namespace
 {
-    // waits for a completion handler without blocking forever (the main thread at start-up)
+    // waits for a completion handler without blocking forever. This runs on the main thread at start-up: the main run
+    // loop keeps turning meanwhile, so handlers the system delivers on the main queue still arrive.
     bool waitFor(dispatch_semaphore_t done, double seconds)
     {
-        return dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(seconds * NSEC_PER_SEC))) == 0;
+        const CFAbsoluteTime until = CFAbsoluteTimeGetCurrent() + seconds;
+        while (dispatch_semaphore_wait(done, DISPATCH_TIME_NOW) != 0)
+        {
+            if (CFAbsoluteTimeGetCurrent() >= until)
+                return false;
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, true);
+        }
+        return true;
     }
 }
 
@@ -20,6 +29,13 @@ namespace
 // missing (essential packs normally arrive with the app) and returns false meanwhile.
 bool ps2xIosAssetPackFile(const char *packId, const char *file, std::string &path)
 {
+#if TARGET_OS_SIMULATOR
+    // (Background Assets traps in unsigned simulator builds: "The process lacks a team ID")
+    std::fprintf(stderr, "[ios-assets] no asset packs in the simulator
+");
+    (void)packId; (void)file; (void)path;
+    return false;
+#endif
     if (@available(iOS 26.0, *))
     {
         BAAssetPackManager *manager = [BAAssetPackManager sharedManager];
