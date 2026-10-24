@@ -142,12 +142,14 @@ jobs:
       - name: Run it in the iOS Simulator
         if: inputs.mode == 'simulator'
         run: bash .github/scripts/simulator-check.sh "$RUNNER_TEMP/work/GoWPad.app" "$RUNNER_TEMP/simcheck"
-      - name: Keep the simulator screenshots (one day)
+      - name: Keep the simulator screenshots, log and sample (one day)
         if: inputs.mode == 'simulator' && always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: simulator-screenshots
-          path: ${{ runner.temp }}/simcheck/*.png
+          path: |
+            ${{ runner.temp }}/simcheck/*.png
+            ${{ runner.temp }}/simcheck/*.txt
           retention-days: 1
           if-no-files-found: ignore
       - name: Sign and upload

@@ -2797,6 +2797,32 @@ void PS2Runtime::run()
                 }
             }
         });
+        // GOW-Port: GOW_HEARTBEAT=<s>: every <s> seconds one line of EE progress (cycle, debug pc/ra, DMA/GIF/GS/VIF
+        // counts) plus each guest thread's state, so a stalled boot shows where it waits or spins (the iOS log has no
+        // debugger; ps2_ios_runtime.cpp turns it on there).
+        {
+            static const double beatSeconds = [] { const char *v = std::getenv("GOW_HEARTBEAT"); return v ? std::atof(v) : 0.0; }();
+            static auto nextBeat = std::chrono::steady_clock::now();
+            static int beats = 0;
+            if (beatSeconds > 0.0 && std::chrono::steady_clock::now() >= nextBeat)
+            {
+                nextBeat = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                                std::chrono::duration<double>(beatSeconds));
+                const auto snapshot = m_eeScheduler->snapshot();
+                std::fprintf(stderr, "[beat] %d seq=%llu cycle=%llu vsync=%llu pc=%08x ra=%08x run=%d dma=%llu gif=%llu gsw=%llu vif=%llu\n",
+                             beats, static_cast<unsigned long long>(snapshot.sequence), static_cast<unsigned long long>(snapshot.eeCycle),
+                             static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()), m_debugPc.load(std::memory_order_relaxed),
+                             m_debugRa.load(std::memory_order_relaxed), snapshot.runningThreadId,
+                             static_cast<unsigned long long>(m_memory.dmaStartCount()), static_cast<unsigned long long>(m_memory.gifCopyCount()),
+                             static_cast<unsigned long long>(m_memory.gsWriteCount()), static_cast<unsigned long long>(m_memory.vifWriteCount()));
+                if (beats < 12 || beats % 6 == 0)
+                    for (const auto &thread : snapshot.threads)
+                        std::fprintf(stderr, "[beat]  th%d st%d wait%d/%d prio%d pc=%08x ra=%08x entry=%08x\n", thread.id,
+                                     static_cast<int>(thread.status), static_cast<int>(thread.waitReason), thread.waitId,
+                                     thread.currentPriority, thread.pc, thread.ra, thread.entry);
+                ++beats;
+            }
+        }
         // GOW-Port: el helper real termina el batch antes del próximo Acquire.
         const bool presented = m_hostPresentation->renderFrame(m_gs, m_eeScheduler->currentVSyncTick(), [this]
         {

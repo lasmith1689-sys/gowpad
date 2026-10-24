@@ -133,6 +133,7 @@ fs::path ps2xIosPrepare()
     setenv("PS2X_GS_WORKER", "1", 0);
     setenv("GOW_GS_FINISH_ASINCRONO", "1", 0);
     setenv("GOW_AUDIO_DEVICE", "default", 0);
+    setenv("GOW_HEARTBEAT", "5", 0); // EE progress in the log every 5 s (ps2_runtime.cpp)
 
     const fs::path game = bundleGameDir();
 

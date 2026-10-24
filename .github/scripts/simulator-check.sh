@@ -41,9 +41,19 @@ for wait in 15 30 60 75; do
     break
   fi
 done
+# where every thread is (a stalled boot shows the game thread's recompiled function); kept with the screenshots
+pid=$(pgrep -f "GoWPad.app/GoWPad" | head -1 || true)
+if [ -n "$pid" ]; then
+  sample "$pid" 5 -file "$out/sample.txt" > /dev/null 2>&1 || true
+  echo "▶ sample of the running app (pid $pid), first 400 lines"
+  head -n 400 "$out/sample.txt" 2>/dev/null || true
+fi
 log="$data/Documents/log.txt"
+cp "$log" "$out/log.txt" 2>/dev/null || true
 echo "▶ log.txt ($(wc -l < "$log" 2>/dev/null || echo 0) lines): start-up, GL and GS lines"
 grep -E "^\[(ios|gs-gl|gs-hw|gs-present|gs-worker|gs-stage|gow-cd)\]|shader error|link error|FAILED|ERROR|terminate|fatal|unavailable" "$log" | head -120 || true
+echo "▶ log.txt, heartbeat lines"
+grep "^\[beat\]" "$log" | head -150 || true
 echo "▶ log.txt, first 150 lines"
 head -n 150 "$log" || true
 echo "▶ log.txt, last 40 lines"
