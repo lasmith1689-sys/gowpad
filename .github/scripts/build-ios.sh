@@ -18,10 +18,12 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 jobs=${CMAKE_BUILD_PARALLEL_LEVEL:-$(sysctl -n hw.ncpu)}
 case "$target" in
-  device) sysroot=iphoneos; platform=iPhoneOS ;;
-  simulator) sysroot=iphonesimulator; platform=iPhoneSimulator ;;
+  device) sysroot=iphoneos; platform=iPhoneOS; triple=arm64-apple-ios26.0 ;;
+  simulator) sysroot=iphonesimulator; platform=iPhoneSimulator; triple=arm64-apple-ios26.0-simulator ;;
   *) echo "::error::target must be device or simulator"; exit 1 ;;
 esac
+bundle=${GOWPAD_BUNDLE_ID:-com.lasmith1689.gowpad}
+group="group.$bundle" # shared by the app and its Background Assets downloader extension
 
 echo "▶ Staging the runtime with the generated code ($target)"
 rm -rf "$work/src"
@@ -42,8 +44,8 @@ cmake -S "$work/src" -B "$work/ios" -G Ninja \
   -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF \
   -DPS2X_ENABLE_FFMPEG=OFF -DPS2X_ENABLE_SCCACHE=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_RUNTIME_LOGS=OFF \
   -DPS2X_ENABLE_IOP_RPC_TRACE=OFF -DPS2X_VU1_PREGENERATED_DIR="$input/generated/vu1" \
-  -DPS2X_IOS_BUNDLE_ID="${GOWPAD_BUNDLE_ID:-com.lasmith1689.gowpad}" -DPS2X_IOS_APP_NAME=GoWPad \
-  -DPS2X_IOS_GAME_DIR="$input/game" -DPS2X_IOS_PLATFORM_NAME=$platform \
+  -DPS2X_IOS_BUNDLE_ID="$bundle" -DPS2X_IOS_APP_NAME=GoWPad \
+  -DPS2X_IOS_GAME_DIR="$input/game" -DPS2X_IOS_PLATFORM_NAME=$platform -DPS2X_IOS_APP_GROUP="$group" \
   > "$work/ios-configure.log" 2>&1 || { tail -80 "$work/ios-configure.log"; exit 1; }
 grep -E "VU1 compilada|ARM|sse2neon" "$work/ios-configure.log" || true
 start=$SECONDS
@@ -56,6 +58,17 @@ app=$(find "$work/ios" -maxdepth 3 -name 'GoWPad.app' -type d | head -n 1)
 rm -rf "$work/GoWPad.app"
 ditto "$app" "$work/GoWPad.app"
 app="$work/GoWPad.app"
+
+echo "▶ Background Assets downloader extension (Apple-hosted asset packs, iOS 26)"
+ext="$app/Extensions/GoWPadDownloader.appex"
+mkdir -p "$ext"
+xcrun --sdk $sysroot swiftc -target $triple -parse-as-library -application-extension -O -module-name GoWPadDownloader \
+  "$root/ios/downloader/DownloaderExtension.swift" -o "$ext/GoWPadDownloader"
+sed -e "s|@BUNDLE_ID@|$bundle.downloader|" -e "s|@PLATFORM@|$platform|" "$root/ios/downloader/Info.plist" > "$ext/Info.plist"
+plutil -lint "$ext/Info.plist"
+# entitlements for signing (testflight.sh / simulator-check.sh): the app group of both bundles
+sed "s|@APP_GROUP@|$group|" "$root/ios/GoWPad.entitlements" > "$work/GoWPad.entitlements"
+sed "s|@APP_GROUP@|$group|" "$root/ios/downloader/GoWPadDownloader.entitlements" > "$work/GoWPadDownloader.entitlements"
 
 echo "▶ App icon"
 icons="$work/Assets.xcassets/AppIcon.appiconset"

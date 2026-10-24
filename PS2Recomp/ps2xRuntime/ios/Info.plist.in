@@ -69,6 +69,14 @@
 	<string>GoWPad uses Bluetooth to connect your game controller.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<!-- Apple-hosted Background Assets: the disc's large files arrive as essential asset packs with the app; the
+	     downloader extension shares this app group -->
+	<key>BAAppGroupID</key>
+	<string>${PS2X_IOS_APP_GROUP}</string>
+	<key>BAHasManagedAssetPacks</key>
+	<true/>
+	<key>BAUsesAppleHosting</key>
+	<true/>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 </dict>

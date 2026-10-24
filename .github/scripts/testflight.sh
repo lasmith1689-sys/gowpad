@@ -42,7 +42,21 @@ plutil -replace DTXcodeBuild -string "$xcode_build" "$info"
 plutil -replace DTCompiler -string com.apple.compilers.llvm.clang.1_0 "$info"
 plutil -replace BuildMachineOSBuild -string "$(sw_vers -buildVersion)" "$info"
 plutil -replace ITSAppUsesNonExemptEncryption -bool NO "$info"
-codesign --force --deep --sign - "$APP"
+# the Background Assets downloader extension: same version and build info as the app; signed first, with its entitlements
+entitlements=$(cd "$(dirname "$built")" && pwd)
+for ext in "$APP"/Extensions/*.appex; do
+  [ -d "$ext" ] || continue
+  ei="$ext/Info.plist"
+  plutil -replace CFBundleShortVersionString -string "$app_version" "$ei"
+  plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$ei"
+  for key in DTPlatformName DTPlatformVersion DTPlatformBuild DTSDKName DTSDKBuild DTXcode DTXcodeBuild DTCompiler BuildMachineOSBuild; do
+    value=$(plutil -extract "$key" raw "$info")
+    plutil -replace "$key" -string "$value" "$ei"
+  done
+  codesign --force --sign - --entitlements "$entitlements/$(basename "$ext" .appex).entitlements" "$ext"
+done
+codesign --force --sign - --entitlements "$entitlements/GoWPad.entitlements" "$APP"
+codesign -d --entitlements - "$APP" 2>/dev/null | grep -A3 application-groups || true
 plutil -p "$info" | grep -E '"CFBundleIdentifier"|"CFBundleShortVersionString"|"CFBundleVersion"|"MinimumOSVersion"|"DTSDKName"|"CFBundleIconName"' || true
 
 python3 - "$ARCHIVE/Info.plist" "$info" <<'PY'

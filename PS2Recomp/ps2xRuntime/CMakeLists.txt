@@ -77,6 +77,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(PS2X_IOS_APP_NAME "PS2X" CACHE STRING "iOS app display name")
     set(PS2X_IOS_GAME_DIR "" CACHE PATH "Folder copied into the app bundle as game/ (guest ELF, loose disc files, IOP_MOD/)")
     set(PS2X_IOS_PLATFORM_NAME "iPhoneOS" CACHE STRING "CFBundleSupportedPlatforms entry (iPhoneSimulator for simulator builds)")
+    set(PS2X_IOS_APP_GROUP "group.com.example.ps2x" CACHE STRING "App group shared with the Background Assets downloader extension")
 endif()
 
 set(PS2X_SWITCH_APP_NAME "God of War" CACHE STRING "Title shown in the Switch homebrew menu")
@@ -811,8 +812,12 @@ if(PS2X_IS_IOS)
     target_sources(ps2_runtime PRIVATE src/lib/gs/gpu/gs_gl_ios.mm)
     set_source_files_properties(src/lib/gs/gpu/gs_gl_ios.mm PROPERTIES
         COMPILE_OPTIONS "-fobjc-arc" SKIP_UNITY_BUILD_INCLUSION TRUE SKIP_PRECOMPILE_HEADERS TRUE)
-    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_ios_runtime.cpp)
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_ios_runtime.cpp src/lib/ps2_ios_assets.mm)
     set_source_files_properties(src/lib/ps2_ios_runtime.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
+    # Apple-hosted asset packs (iOS 26; weakly linked so the app still starts on older systems)
+    set_source_files_properties(src/lib/ps2_ios_assets.mm PROPERTIES
+        COMPILE_OPTIONS "-fobjc-arc" SKIP_UNITY_BUILD_INCLUSION TRUE SKIP_PRECOMPILE_HEADERS TRUE)
+    target_link_options(ps2EntryRunner PRIVATE "SHELL:-weak_framework BackgroundAssets")
     target_link_libraries(ps2EntryRunner PRIVATE SDL2::SDL2main
         "-framework UIKit" "-framework Foundation" "-framework OpenGLES" "-framework QuartzCore"
         "-framework CoreGraphics" "-framework AVFoundation" "-framework AudioToolbox" "-framework CoreAudio"

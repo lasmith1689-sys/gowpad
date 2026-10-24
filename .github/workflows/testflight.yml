@@ -14,13 +14,17 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: simulator or testflight
+        description: simulator, testflight, or assetpacks (build and upload the disc's Apple-hosted asset packs)
         type: choice
-        options: [simulator, testflight, probe]
+        options: [simulator, testflight, assetpacks]
         default: simulator
+      packs:
+        description: assetpacks mode only, which packs (1 = PART1.PAK, 2 = PART2.PAK)
+        type: string
+        default: '1 2'
 
 concurrency:
-  group: testflight
+  group: testflight-${{ inputs.mode }}
   cancel-in-progress: false
 
 permissions:
@@ -31,38 +35,46 @@ env:
   GOWPAD_BUNDLE_ID: com.lasmith1689.gowpad
 
 jobs:
-  probe:
-    # what this Xcode offers for Apple-hosted Background Assets (templates, interfaces, ba-package)
-    name: Probe Xcode
-    if: inputs.mode == 'probe'
-    runs-on: macos-15
+  assetpacks:
+    # the disc's PART1/PART2.PAK as Apple-hosted asset packs (ba-package needs macOS 26)
+    name: Asset packs
+    if: inputs.mode == 'assetpacks'
+    runs-on: macos-26
+    timeout-minutes: 300
     steps:
-      - name: Background Assets templates, interfaces and tools
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Pick the newest Xcode and free disk space
         run: |
-          set +e
           xcode=$(for x in /Applications/Xcode_*.app; do [ -L "$x" ] || echo "$x"; done | sort -V | tail -n 1)
-          export DEVELOPER_DIR="$xcode/Contents/Developer"
-          echo "== $xcode"
-          t="$xcode/Contents/Developer/Platforms/iPhoneOS.platform/Developer/Library/Xcode/Templates/Project Templates/iOS/Application Extension/Background Download Extension.xctemplate"
-          find "$t" -type f | while IFS= read -r f; do
-            echo "---- ${f#$t/}"
-            case "$f" in *.png|*.pdf) ;; *) plutil -convert xml1 -o - "$f" 2>/dev/null || cat "$f" ;; esac
+          xcode=$(cd "$xcode" && pwd -P)
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          echo "Using $xcode"
+          for other in /Applications/Xcode*.app; do
+            [ -L "$other" ] && continue
+            [ "$(cd "$other" && pwd -P)" = "$xcode" ] || sudo rm -rf "$other" &
           done
-          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
-          fw="$sdk/System/Library/Frameworks/BackgroundAssets.framework"
-          ls "$fw" "$fw/Headers" 2>/dev/null
-          for h in "$fw"/Headers/BAAssetPack*.h "$fw"/Headers/BAManaged*.h; do echo "---- $h"; grep -v "^//\|^ *$" "$h"; done
-          si=$(find "$fw" -name '*.swiftinterface' | grep arm64-apple-ios | head -1)
-          echo "---- $si"; grep -n -i "func \|class AssetPackManager\|struct AssetPack\|protocol StoreDownloaderExtension\|availability\|descriptor\|url(" "$si" | head -120
-          sk=$(find "$sdk/System/Library/Frameworks/StoreKit.framework" -name '*.swiftinterface' | grep arm64-apple-ios | head -1)
-          grep -n -B2 -A12 "protocol StoreDownloaderExtension" "$sk" | head -60
-          xcrun ba-package --help 2>&1 | head -60
-          mkdir -p /tmp/ba && cd /tmp/ba && xcrun ba-package template -o Manifest.json 2>&1 | head; cat Manifest.json 2>/dev/null | head -80
-          xcrun altool --help 2>&1 | grep -i -A2 "asset\|background" | head -30
+          sudo rm -rf "${ANDROID_HOME:-/nonexistent}" "$HOME/.dotnet" /usr/local/share/dotnet &
+          wait
+          sw_vers
+          df -h /
+      - name: Package and upload the asset packs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAME_KEY: ${{ secrets.GAME_KEY }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          GOWPAD_APPLE_ID: '6825828710'
+        run: bash .github/scripts/asset-packs.sh "$RUNNER_TEMP/packs" "${{ inputs.packs }}"
+      - name: Remove the decrypted disc data
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/packs"
 
   build:
     name: Build (${{ inputs.mode }})
-    if: inputs.mode != 'probe'
+    if: inputs.mode != 'assetpacks'
     runs-on: macos-15
     timeout-minutes: 300
     steps:
