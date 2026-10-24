@@ -2000,11 +2000,30 @@ void EeScheduler::processDueDeadlines()
                         windowStart = wall;
                     }
                 }
+                // GOW-Port: GOW_VBLANK_MAX_LAG=<fields> (iOS default 2, elsewhere off): the next field's host deadline
+                // follows this one's, so after a stall every missed field came back to back and the game ran fast in
+                // bursts (jerky menus reading > 90 fps on the iPhone). Further behind than that, the grid restarts one
+                // field before now: the missed fields are dropped (the game steps by its own clock) instead.
+                static const long maxLagFields = [] {
+                    const char *v = std::getenv("GOW_VBLANK_MAX_LAG");
+#if defined(PS2X_IOS)
+                    return v ? std::atol(v) : 2L;
+#else
+                    return v ? std::atol(v) : 0L;
+#endif
+                }();
+                auto hostBase = scheduled.hostDeadline;
+                if (maxLagFields > 0)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - hostBase > kVBlankPeriod * maxLagFields)
+                        hostBase = now - kVBlankPeriod;
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              hostBase + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              hostBase + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
                 // GOW-Port: pacing points on the VBlank grid (cycle and host deadline in lockstep, no-op event). The
                 // guest clock may not run ahead of the wall clock by more than 1/16 field inside a frame: recompiled
@@ -2013,7 +2032,7 @@ void EeScheduler::processDueDeadlines()
                 // frame step (>= 1 field) ran 3 % fast at 60 fps (docs/performance.md, game speed).
                 for (uint64_t k = 1; k < kPaceSteps; ++k)
                     scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles * k / kPaceSteps,
-                                  scheduled.hostDeadline + kVBlankPeriod * k / kPaceSteps,
+                                  hostBase + kVBlankPeriod * k / kPaceSteps,
                                   EeEvent{EeEventType::ExternalWake, 0xFFFFFFFFu, ~0ull});
             }
             processEvent(scheduled.event);

@@ -972,7 +972,7 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startSpu2Audio(m_iopSubsystem.get()); // GOW-Port
 #endif
-#if !defined(PLATFORM_SWITCH)
+#if !defined(PLATFORM_SWITCH) && !defined(PS2X_IOS) // iOS: paced by the display refresh (gs_display_ios.mm)
         SetTargetFPS(60);
 #endif
         if (m_debugUiInitCallback)

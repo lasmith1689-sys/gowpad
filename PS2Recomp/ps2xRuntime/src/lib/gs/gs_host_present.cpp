@@ -16,6 +16,7 @@
 #include <thread>
 #if defined(PS2X_IOS)
 #include <SDL.h>
+void ps2xIosWaitDisplayRefresh(); // gs_display_ios.mm
 #endif
 
 namespace
@@ -487,6 +488,13 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
 GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncTick, const std::function<void()> &overlay)
 {
     View selected;
+#if defined(PS2X_IOS)
+    {
+        // one window frame per display refresh, latched right after it (gs_display_ios.mm; no raylib frame limiter)
+        ps2_perf::Scope perf(ps2_perf::Bucket::HostWait);
+        ps2xIosWaitDisplayRefresh();
+    }
+#endif
 #if defined(__SWITCH__)
     // GOW-Port: with shared textures nothing here waits for the GS thread, and Horizon does not time-slice threads of
     // one priority: the GL backend shares core 0 with this thread, and while this thread drew and swapped at 60 Hz
