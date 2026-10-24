@@ -1160,12 +1160,11 @@ namespace GSGL
         m_api.es = true;
         m_api.fbFetch = hasExtension(m_api, "GL_EXT_shader_framebuffer_fetch");
         m_api.graphics = true;
-        m_api.hwRaster = m_api.fbFetch; // destination reads need it (no texture barrier on ES)
+        // destination reads use framebuffer fetch, or copies of the target without it (gs_hw_backend destCopyMode)
+        m_api.hwRaster = true;
         std::fprintf(stderr, "[gs-gl] OpenGL ES context: %s, %s, framebuffer fetch %s\n",
                      reinterpret_cast<const char *>(m_api.GetString(kRenderer)), reinterpret_cast<const char *>(m_api.GetString(kVersion)),
-                     m_api.fbFetch ? "yes" : "NO");
-        if (!m_api.hwRaster)
-            error = "GL_EXT_shader_framebuffer_fetch missing";
+                     m_api.fbFetch ? "yes" : "no");
         return true;
     }
 

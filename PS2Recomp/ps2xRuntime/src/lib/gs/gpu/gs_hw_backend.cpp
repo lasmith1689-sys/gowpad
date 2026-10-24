@@ -1153,6 +1153,12 @@ void main()
             return false;
         }
         const Api &g = gl();
+        {
+            const char *copy = std::getenv("PS2X_GS_DEST_COPY");
+            destCopyMode = !g.fbFetch && ((copy && *copy == '1') || g.es);
+            if (destCopyMode)
+                std::fprintf(stderr, "[gs-hw] destination reads from a copy of the target (no framebuffer fetch)\n");
+        }
         const GLuint v = compile(GSGL::kVertexShader, kVsSource);
         drawVs = v;
         const GLuint f = compile(GSGL::kFragmentShader, {kFsSource, kReinterpretSource, kFsTail});
@@ -1362,9 +1368,10 @@ void main()
         GLuint texture = 0, fbo = 0;
     };
     std::unordered_map<uint64_t, SelfCopy> selfCopies;
-    // debug (PS2X_GS_DEST_COPY=1, no framebuffer fetch): destination reads sample a fresh copy of the target instead of the
-    // target itself after a texture barrier
-    const bool destCopyMode = [] { const char *v = std::getenv("PS2X_GS_DEST_COPY"); return v && *v == '1'; }();
+    // without framebuffer fetch: destination reads sample a fresh copy of the target instead of the target itself after a
+    // texture barrier. Always on ES without fetch (no barrier there, e.g. the iOS simulator's software renderer); on
+    // desktop GL with PS2X_GS_DEST_COPY=1 (testing). Set by ensure().
+    bool destCopyMode = false;
     // makes the next draw's destination reads see everything drawn so far (the colour mask is left all-on in copy mode)
     void refreshDest(RenderTarget &rt)
     {
@@ -2199,7 +2206,7 @@ void main()
         g.Uniform1f(locShScale, scale);
         g.Uniform4i(locShTexa, shuffleState.texa.ta0 >> 7, shuffleState.texa.ta1 >> 7, shuffleState.texa.aem ? 1 : 0, 0);
         g.Uniform2f(locShInvSize, 1.0f / dst.pxW, 1.0f / dst.pxH);
-        if (&src == &dst && !(g.es && !shuffleSrcZ))
+        if (&src == &dst && !(g.es && !shuffleSrcZ) && g.TextureBarrier) // (ES: no barrier exists; depth is not written)
             g.TextureBarrier(), ++stats.barriers;
         g.BindVertexArray(shuffleVao);
         g.BindBuffer(kArrayBuffer, shuffleVbo);

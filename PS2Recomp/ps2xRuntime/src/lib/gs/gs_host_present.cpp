@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <iostream>
 #include <thread>
 
@@ -97,7 +98,14 @@ void main()
             g_scalerTried = true;
             if (scalerEnabled())
             {
+#if defined(PS2X_IOS)
+                // GOW-Port: raylib's OpenGL ES 3.0 build: GLSL ES 3.00 (its default vertex shader feeds the same inputs)
+                std::string source = kScalerFragment;
+                source.replace(source.find("#version 330"), std::strlen("#version 330"), "#version 300 es\nprecision highp float;");
+                g_scaler = LoadShaderFromMemory(nullptr, source.c_str());
+#else
                 g_scaler = LoadShaderFromMemory(nullptr, kScalerFragment);
+#endif
                 if (g_scaler.id != 0u && g_scaler.id != rlGetShaderIdDefault())
                 {
                     g_scalerSrcSize = GetShaderLocation(g_scaler, "srcSize");

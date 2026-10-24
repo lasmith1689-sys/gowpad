@@ -43,9 +43,11 @@ for wait in 15 30 60 75; do
 done
 log="$data/Documents/log.txt"
 echo "▶ log.txt ($(wc -l < "$log" 2>/dev/null || echo 0) lines): start-up, GL and GS lines"
-grep -E "^\[(ios|gs-gl|gs-hw|gs-present|gs-worker|gs-stage|gow-cd)\]|shader error|link error|FAILED|ERROR|terminate|fatal|unavailable" "$log" | head -80 || true
-echo "▶ log.txt, last 60 lines"
-tail -n 60 "$log" || true
+grep -E "^\[(ios|gs-gl|gs-hw|gs-present|gs-worker|gs-stage|gow-cd)\]|shader error|link error|FAILED|ERROR|terminate|fatal|unavailable" "$log" | head -120 || true
+echo "▶ log.txt, first 150 lines"
+head -n 150 "$log" || true
+echo "▶ log.txt, last 40 lines"
+tail -n 40 "$log" || true
 # crash reports of the app, if any
 find "$HOME/Library/Logs/DiagnosticReports" -name 'GoWPad*' -newer "$app" 2>/dev/null | while read -r report; do
   echo "▶ crash report $report"

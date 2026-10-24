@@ -72,14 +72,17 @@ fs::path ps2xIosPrepare()
     std::error_code ec;
     fs::create_directories(docs, ec);
 
-    // logs: keep the previous run's, then stdout/stderr into log.txt (unbuffered stderr, line-buffered stdout)
+    // logs: keep the previous run's, then stdout and stderr into log.txt through one file descriptor (two separately
+    // opened descriptors would each keep their own offset and overwrite each other), stdout line-buffered
     const fs::path log = docs / "log.txt";
     if (fs::exists(log, ec))
         fs::rename(log, docs / "log-prev.txt", ec);
     if (std::freopen(log.c_str(), "w", stdout))
+    {
         std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    if (std::freopen(log.c_str(), "a", stderr))
+        dup2(fileno(stdout), fileno(stderr));
         std::setvbuf(stderr, nullptr, _IONBF, 0);
+    }
 
     chdir(docs.c_str());
     loadEnvFile(docs / "env.txt");
