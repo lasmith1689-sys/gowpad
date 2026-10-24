@@ -16,7 +16,7 @@ on:
       mode:
         description: simulator, testflight, or assetpacks (build and upload the disc's Apple-hosted asset packs)
         type: choice
-        options: [simulator, testflight, assetpacks]
+        options: [simulator, testflight, assetpacks, probe]
         default: simulator
       packs:
         description: assetpacks mode only, which packs (1 = PART1.PAK, 2 = PART2.PAK)
@@ -35,6 +35,25 @@ env:
   GOWPAD_BUNDLE_ID: com.lasmith1689.gowpad
 
 jobs:
+  probe:
+    # how Xcode links ExtensionKit extensions (entry point), for the downloader extension built with swiftc
+    name: Probe Xcode
+    if: inputs.mode == 'probe'
+    runs-on: macos-15
+    steps:
+      - name: ExtensionKit link settings
+        run: |
+          set +e
+          xcode=$(for x in /Applications/Xcode_*.app; do [ -L "$x" ] || echo "$x"; done | sort -V | tail -n 1)
+          export DEVELOPER_DIR="$xcode/Contents/Developer"
+          grep -rn -i "EXExtensionMain\|NSExtensionMain\|extensionkit-extension" "$xcode/Contents" --include='*.xcspec' 2>/dev/null | head -30
+          for f in $(grep -rl -i "extensionkit-extension" "$xcode/Contents" --include='*.xcspec' 2>/dev/null | head -3); do
+            echo "==== $f"; plutil -convert xml1 -o - "$f" 2>/dev/null | grep -n -i -B3 -A25 "extensionkit-extension" | head -120
+          done
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          grep -i "main" "$sdk/System/Library/Frameworks/ExtensionFoundation.framework/ExtensionFoundation.tbd" | head
+          grep -rn "_NSExtensionMain\|_EXExtensionMain" "$sdk/System/Library/Frameworks/Foundation.framework/Foundation.tbd" "$sdk/System/Library/Frameworks/ExtensionFoundation.framework/ExtensionFoundation.tbd" | head
+
   assetpacks:
     # the disc's PART1/PART2.PAK as Apple-hosted asset packs (ba-package needs macOS 26)
     name: Asset packs
@@ -74,7 +93,7 @@ jobs:
 
   build:
     name: Build (${{ inputs.mode }})
-    if: inputs.mode != 'assetpacks'
+    if: inputs.mode != 'assetpacks' && inputs.mode != 'probe'
     runs-on: macos-15
     timeout-minutes: 300
     steps:
