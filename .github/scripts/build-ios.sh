@@ -62,7 +62,9 @@ app="$work/GoWPad.app"
 echo "▶ Background Assets downloader extension (Apple-hosted asset packs, iOS 26)"
 ext="$app/Extensions/GoWPadDownloader.appex"
 mkdir -p "$ext"
+# (linked like Xcode's extensionkit-extension product type, which inherits LD_ENTRY_POINT = _NSExtensionMain)
 xcrun --sdk $sysroot swiftc -target $triple -parse-as-library -application-extension -O -module-name GoWPadDownloader \
+  -Xlinker -e -Xlinker _NSExtensionMain -Xlinker -application_extension \
   "$root/ios/downloader/DownloaderExtension.swift" -o "$ext/GoWPadDownloader"
 sed -e "s|@BUNDLE_ID@|$bundle.downloader|" -e "s|@PLATFORM@|$platform|" "$root/ios/downloader/Info.plist" > "$ext/Info.plist"
 plutil -lint "$ext/Info.plist"
