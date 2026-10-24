@@ -134,6 +134,11 @@ fs::path ps2xIosPrepare()
     setenv("GOW_GS_FINISH_ASINCRONO", "1", 0);
     setenv("GOW_AUDIO_DEVICE", "default", 0);
     setenv("GOW_HEARTBEAT", "5", 0); // EE progress in the log every 5 s (ps2_runtime.cpp)
+    // performance counters in the log and on screen (ps2_perf.h, gs_host_present.cpp); 0x1837B8 = the game's frame flip
+    setenv("GOW_PERF_DIAG", "1", 0);
+    setenv("GOW_PERF_FRAME_PC", "0x001837B8", 0);
+    setenv("GOW_DELTA_DIAG", "1", 0);
+    setenv("GOW_PERF_HUD", "1", 0);
 
     const fs::path game = bundleGameDir();
 

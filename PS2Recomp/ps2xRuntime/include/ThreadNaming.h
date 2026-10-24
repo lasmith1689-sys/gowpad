@@ -24,6 +24,9 @@ extern "C"
 }
 #elif defined(__APPLE__) || defined(__linux__)
 #include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #elif defined(__SWITCH__)
 // GOW-Port: ps2_switch_runtime.cpp. libnx starts every thread on the process's default core and Horizon does not
 // time-slice threads of one priority, so the runtime's busy threads are spread over the three application cores.
@@ -50,6 +53,9 @@ namespace ThreadNaming
 
 #elif defined(__APPLE__)
         pthread_setname_np(name.data());
+        // GOW-Port: the runtime's named threads (EE, GS worker / stage / GL) carry the game's frame: the highest
+        // quality of service keeps them on the performance cores (a lower class may put them on the efficiency cores)
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
 #elif defined(__linux__)
         pthread_setname_np(pthread_self(), name.data());

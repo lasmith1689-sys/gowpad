@@ -14,6 +14,9 @@
 #include <vector>
 #include <iostream>
 #include <thread>
+#if defined(PS2X_IOS)
+#include <SDL.h>
+#endif
 
 namespace
 {
@@ -132,6 +135,39 @@ void main()
                 line.resize(line.size() - 4);
             DrawText(line.c_str(), 8, y, fontSize, RAYWHITE);
         }
+    }
+
+    // GOW-Port: raylib's SDL platform keeps its screen and viewport in points (874x402 on an iPhone 17 Pro Max) while
+    // the high-DPI drawable has the panel's pixels (3x): the viewport is set to the drawable every frame, raylib keeps
+    // drawing in points, and the picture covers every pixel. Returns pixels per point.
+    float useFullDrawable()
+    {
+        int width = 0, height = 0;
+        SDL_GL_GetDrawableSize(static_cast<SDL_Window *>(GetWindowHandle()), &width, &height);
+        if (width <= 0 || height <= 0 || GetScreenWidth() <= 0)
+            return 1.0f;
+        rlViewport(0, 0, width, height);
+        return static_cast<float>(width) / static_cast<float>(GetScreenWidth());
+    }
+
+    // GOW-Port: GOW_PERF_HUD=1: one line of the performance counters (ps2_perf.h, GOW_PERF_DIAG=1 + GOW_DELTA_DIAG=1)
+    // at the top of the screen, so a screenshot shows the frame rate and where the time goes
+    void drawPerfHud()
+    {
+        static const bool on = [] { const char *v = std::getenv("GOW_PERF_HUD"); return v && *v == '1'; }();
+        if (!on)
+            return;
+        const auto &l = ps2_perf::latest;
+        const auto pct = [&l](ps2_perf::Bucket b) { return l.corePercent[static_cast<size_t>(b)].load(std::memory_order_relaxed); };
+        char text[192];
+        std::snprintf(text, sizeof(text), "game %.1f fps  speed %.2f  host %.0f  |  EE %.0f%%  VU %.0f%%  GS %.0f%%  IOP %.0f%%  up %.0f%%  wait %.0f%%",
+                      l.guestHz.load(std::memory_order_relaxed), l.speed.load(std::memory_order_relaxed),
+                      l.hostHz.load(std::memory_order_relaxed), pct(ps2_perf::Bucket::Ee), pct(ps2_perf::Bucket::Vu),
+                      pct(ps2_perf::Bucket::Gs), pct(ps2_perf::Bucket::Iop), pct(ps2_perf::Bucket::Upload),
+                      pct(ps2_perf::Bucket::GsQueueWait));
+        const int fontSize = std::max(8, GetScreenHeight() / 40);
+        DrawRectangle(0, 0, MeasureText(text, fontSize) + 12, fontSize + 6, Color{0, 0, 0, 170});
+        DrawText(text, 6, 3, fontSize, Color{255, 230, 120, 255});
     }
 #endif
 
@@ -497,6 +533,11 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
     const auto drawStart = std::chrono::steady_clock::now();
 #endif
     BeginDrawing();
+#if defined(PS2X_IOS)
+    const float pixelsPerPoint = useFullDrawable();
+#else
+    constexpr float pixelsPerPoint = 1.0f;
+#endif
     ClearBackground(BLACK);
     const float sourceWidth = static_cast<float>(std::max<uint32_t>(1u, selected.width));
     const float sourceHeight = static_cast<float>(std::max<uint32_t>(1u, selected.height));
@@ -514,7 +555,7 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
     // GOW-Port: textura del PBO con filas en orden; no invertir source.height.
     // The bicubic + sharpen pass only helps when the frame is magnified; a frame at least as large as its window
     // rectangle (PS2X_GS_HW_SCALE high enough, or a small window) is drawn with one linear tap (same shader, "plain").
-    const bool magnified = sourceWidth < destinationWidth || sourceHeight < destinationHeight;
+    const bool magnified = sourceWidth < destinationWidth * pixelsPerPoint || sourceHeight < destinationHeight * pixelsPerPoint;
     Shader *scaler = scalerShader();
     if (!scaler)
         SetTextureFilter(selected.texture, TEXTURE_FILTER_BILINEAR);
@@ -540,6 +581,8 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
     static const bool logOverlayAlways = [] { const char *v = std::getenv("GOW_LOG_OVERLAY"); return v && *v == '1'; }();
     if (selected.blank || logOverlayAlways)
         drawLogOverlay();
+    else
+        drawPerfHud();
 #endif
     // GOW-Port: GOW_HOST_SHOT=<n>: at host frame n write the window's back buffer (what is about to be shown) to
     // host_shot.png in the working directory, plus the frame / window sizes, to check presentation without a desktop grab.

@@ -929,6 +929,9 @@ bool PS2Runtime::initialize(const char *title)
                 }
                 std::fprintf(stderr, "[ios] display %dx%d -> window %dx%d\n", mode.w, mode.h, width, height);
             }
+            // the display mode is in points: without high DPI the drawable has that many pixels and iOS stretches it
+            // 3x (blurry). gs_host_present.cpp sets the viewport to the full drawable every frame.
+            SetConfigFlags(FLAG_WINDOW_HIGHDPI);
             InitWindow(width, height, title);
             if (false) // (no shrink-to-monitor on iOS)
 #else

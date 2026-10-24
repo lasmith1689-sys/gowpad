@@ -54,6 +54,14 @@ namespace ps2_perf
     }
     inline std::array<std::atomic<uint64_t>, bucketCount> nanos{};
     inline std::atomic<uint64_t> guestFlips{0}, hostFrames{0};
+    // GOW-Port: the latest report's values, for an on-screen readout (iOS has no console): game frames and host frames
+    // per second, game speed (GOW_DELTA_DIAG), and each bucket's share of one core in percent
+    struct Latest
+    {
+        std::atomic<float> guestHz{0.0f}, hostHz{0.0f}, speed{0.0f};
+        std::array<std::atomic<float>, bucketCount> corePercent{};
+    };
+    inline Latest latest;
     inline thread_local Accounting accounting;
     inline uint64_t nowNanos()
     {
@@ -120,6 +128,7 @@ namespace ps2_perf
         std::fprintf(stderr, "[gow-speed] frames=%llu wall=%.2f game=%.3f speed=%.3f delta_min=%.4f delta_max=%.4f\n",
                      static_cast<unsigned long long>(frames), wall, gameSeconds, gameSeconds / wall,
                      frames && maxDelta > 0.0 ? minDelta : 0.0, maxDelta);
+        latest.speed.store(static_cast<float>(gameSeconds / wall), std::memory_order_relaxed);
         windowStart = now; frames = 0; gameSeconds = 0.0; minDelta = 1e9; maxDelta = 0.0;
     }
     inline void guestEntry(uint32_t pc, const uint8_t *rdram = nullptr)
@@ -157,6 +166,10 @@ namespace ps2_perf
         std::fprintf(stderr, "[gow-perf] t=%.2f window=%.2f ee_ms=%.2f vu_ms=%.2f gs_ms=%.2f iop_ms=%.2f guest_wait_ms=%.2f upload_ms=%.2f host_wait_ms=%.2f guest_flip_hz=%.2f host_hz=%.2f gsq_wait_ms=%.2f\n",
             (now - first) * 1e-9, seconds, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6],
             (flips - previousFlips) / seconds, (frames - previousFrames) / seconds, ms[7]);
+        latest.guestHz.store(static_cast<float>((flips - previousFlips) / seconds), std::memory_order_relaxed);
+        latest.hostHz.store(static_cast<float>((frames - previousFrames) / seconds), std::memory_order_relaxed);
+        for (size_t i = 0; i < bucketCount; ++i)
+            latest.corePercent[i].store(static_cast<float>(ms[i] / (seconds * 10.0)), std::memory_order_relaxed);
         previousFlips = flips; previousFrames = frames; last = now;
     }
 }
