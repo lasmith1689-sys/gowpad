@@ -913,6 +913,16 @@ bool PS2Runtime::initialize(const char *title)
                     width = w, height = h;
             }
             InitWindow(width, height, title);
+#if defined(PS2X_IOS)
+            // GOW-Port: iOS: the window is the whole screen; raylib's size must be the display's (shrinking it to 16:9
+            // like on a PC left the picture in the left part of the phone's screen). The picture is fitted at 16:9.
+            if (IsWindowReady())
+            {
+                const int monitor = GetCurrentMonitor();
+                SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+            }
+            else
+#endif
             if (IsWindowReady())
             {
                 const int monitor = GetCurrentMonitor();

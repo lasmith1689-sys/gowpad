@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <iostream>
 #include <thread>
 
@@ -84,6 +85,55 @@ void main()
     Shader g_scaler{};
     int g_scalerSrcSize = -1, g_scalerSharpen = -1, g_scalerPlain = -1;
     bool g_scalerTried = false;
+
+#if defined(PS2X_IOS)
+    // GOW-Port: the last lines of log.txt (the working directory is Documents), re-read twice a second
+    void drawLogOverlay()
+    {
+        static std::vector<std::string> lines;
+        static double readAt = -1.0;
+        if (GetTime() - readAt > 0.5)
+        {
+            readAt = GetTime();
+            lines.clear();
+            if (std::FILE *f = std::fopen("log.txt", "rb"))
+            {
+                std::fseek(f, 0, SEEK_END);
+                const long size = std::ftell(f);
+                const long from = size > 6000 ? size - 6000 : 0;
+                std::fseek(f, from, SEEK_SET);
+                std::string text(static_cast<size_t>(size - from), '\0');
+                text.resize(std::fread(text.data(), 1, text.size(), f));
+                std::fclose(f);
+                size_t start = from > 0 ? text.find('\n') + 1 : 0;
+                while (start < text.size())
+                {
+                    size_t end = text.find('\n', start);
+                    if (end == std::string::npos)
+                        end = text.size();
+                    std::string line = text.substr(start, end - start);
+                    if (!line.empty() && line.rfind("INFO:", 0) != 0) // raylib's start-up chatter
+                        lines.push_back(line);
+                    start = end + 1;
+                }
+            }
+        }
+        const int height = GetScreenHeight(), width = GetScreenWidth();
+        const int fontSize = std::max(10, height / 30);
+        const int rows = std::max(1, height / (fontSize + 2) - 1);
+        DrawRectangle(0, 0, width, height, Color{0, 0, 0, 200});
+        DrawText("GoWPad log (Documents/log.txt)", 8, 4, fontSize, YELLOW);
+        const size_t first = lines.size() > static_cast<size_t>(rows - 1) ? lines.size() - static_cast<size_t>(rows - 1) : 0u;
+        int y = 4 + fontSize + 2;
+        for (size_t i = first; i < lines.size(); ++i, y += fontSize + 2)
+        {
+            std::string line = lines[i];
+            while (line.size() > 8 && MeasureText(line.c_str(), fontSize) > width - 16)
+                line.resize(line.size() - 4);
+            DrawText(line.c_str(), 8, y, fontSize, RAYWHITE);
+        }
+    }
+#endif
 
     bool scalerEnabled()
     {
@@ -484,6 +534,13 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         EndShaderMode();
     if (overlay)
         overlay();
+#if defined(PS2X_IOS)
+    // GOW-Port: iOS has no console: while the game has shown nothing (the magenta placeholder), the end of
+    // Documents/log.txt is drawn on screen, so a screenshot shows what happened (GOW_LOG_OVERLAY=1: always)
+    static const bool logOverlayAlways = [] { const char *v = std::getenv("GOW_LOG_OVERLAY"); return v && *v == '1'; }();
+    if (selected.blank || logOverlayAlways)
+        drawLogOverlay();
+#endif
     // GOW-Port: GOW_HOST_SHOT=<n>: at host frame n write the window's back buffer (what is about to be shown) to
     // host_shot.png in the working directory, plus the frame / window sizes, to check presentation without a desktop grab.
     static const long hostShotAt = [] { const char *v = std::getenv("GOW_HOST_SHOT"); return v ? std::atol(v) : -1L; }();
