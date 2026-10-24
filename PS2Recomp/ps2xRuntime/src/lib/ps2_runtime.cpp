@@ -48,7 +48,7 @@ static bool gowUsePcsx2Vu1(); // GOW_VU1_PCSX2=1, defined before PS2Runtime::ini
 // has played (including silence fill) and frames the sound engine produced (= GOW_AUDIO_PCM file position).
 std::atomic<uint64_t> g_gowAudioFramesPlayed{0};
 std::atomic<uint64_t> g_gowAudioFramesProduced{0};
-#if defined(PLATFORM_SWITCH)
+#if defined(PLATFORM_SWITCH) || defined(PS2X_IOS)
 #include <SDL.h>
 #endif
 #if !defined(PLATFORM_VITA)
@@ -912,16 +912,24 @@ bool PS2Runtime::initialize(const char *title)
                 if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240)
                     width = w, height = h;
             }
-            InitWindow(width, height, title);
 #if defined(PS2X_IOS)
-            // GOW-Port: iOS: the window is the whole screen; raylib's size must be the display's (shrinking it to 16:9
-            // like on a PC left the picture in the left part of the phone's screen). The picture is fitted at 16:9.
-            if (IsWindowReady())
+            // GOW-Port: iOS: the window is the whole screen, so raylib's screen size must be the display's from the
+            // start (landscape); resizing afterwards leaves raylib's viewport at the old size. The picture is fitted
+            // at 16:9 inside it (gs_host_present.cpp).
             {
-                const int monitor = GetCurrentMonitor();
-                SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+                SDL_InitSubSystem(SDL_INIT_VIDEO);
+                SDL_DisplayMode mode{};
+                if (SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0)
+                {
+                    width = std::max(mode.w, mode.h);
+                    height = std::min(mode.w, mode.h);
+                }
+                std::fprintf(stderr, "[ios] display %dx%d -> window %dx%d\n", mode.w, mode.h, width, height);
             }
-            else
+            InitWindow(width, height, title);
+            if (false) // (no shrink-to-monitor on iOS)
+#else
+            InitWindow(width, height, title);
 #endif
             if (IsWindowReady())
             {
