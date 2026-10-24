@@ -62,6 +62,13 @@
 	</array>
 	<key>GCSupportsControllerUserInteraction</key>
 	<true/>
+	<!-- SDL2's game controller support includes Bluetooth LE controllers -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>GoWPad uses Bluetooth to connect your game controller.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>GoWPad uses Bluetooth to connect your game controller.</string>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 </dict>
