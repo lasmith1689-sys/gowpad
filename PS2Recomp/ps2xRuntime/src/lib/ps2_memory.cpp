@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_display.h"
 #include "runtime/ps2_thread_stack.h"
 #include <chrono>
+#include <future>
 #include <map>
 #include <string>
 #include "runtime/ps2_address.h"
@@ -265,8 +266,15 @@ PS2Memory::PS2Memory()
     m_gsWorkerEnabled = worker != nullptr && worker[0] == '1';
     if (m_gsWorkerEnabled)
     {
-        m_gsWorker = std::thread(ps2xLargeStack([this] { gsWorkerLoop(); }));
-        m_gsWorkerId = m_gsWorker.get_id();
+        // the id of the thread the loop really runs on: with ps2xLargeStack (Apple) that is not m_gsWorker's own
+        // thread, and onGsWorkerThread() must be true on it, or the worker waits for itself to go idle (deadlock)
+        std::promise<std::thread::id> started;
+        std::future<std::thread::id> id = started.get_future();
+        m_gsWorker = std::thread(ps2xLargeStack([this, &started] {
+            started.set_value(std::this_thread::get_id());
+            gsWorkerLoop();
+        }));
+        m_gsWorkerId = id.get();
         std::fprintf(stderr, "[gs-worker] VIF1/GIF processing on a worker thread (PS2X_GS_WORKER=1)\n");
     }
 }
