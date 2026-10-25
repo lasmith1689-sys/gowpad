@@ -18,8 +18,8 @@ concurrency:
 jobs:
   source-build-probe:
     name: Check cloud Xcode and runtime build inputs
-    runs-on: macos-15
-    timeout-minutes: 30
+    runs-on: macos-26
+    timeout-minutes: 60
     steps:
       - name: Check out pinned runtime source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -35,11 +35,48 @@ jobs:
           set -euo pipefail
           xcodebuild -version
           sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
-          xcrun --sdk iphoneos --show-sdk-version
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhone SDK: $sdk_version"
+          test "${sdk_version%%.*}" -ge 26
           xcrun clang --version | head -n 1
           printf '#include <TargetConditionals.h>\nint probe(void) { return TARGET_OS_IPHONE; }\n' > "$RUNNER_TEMP/ios-sdk-probe.c"
-          xcrun clang -target arm64-apple-ios17.0 -isysroot "$sdk" -fsyntax-only "$RUNNER_TEMP/ios-sdk-probe.c"
+          xcrun clang -target arm64-apple-ios26.0 -isysroot "$sdk" -fsyntax-only "$RUNNER_TEMP/ios-sdk-probe.c"
           printf 'Cloud Mac/Xcode iPhone SDK probe passed. No app has been built or signed.\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Build media decoding libraries from checked source
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          bash build/ffmpeg/build.sh || {
+            tail -n 80 build/ffmpeg/obj/configure.log 2>/dev/null || true
+            tail -n 80 build/ffmpeg/obj/make.log 2>/dev/null || true
+            exit 1
+          }
+          for lib in avformat avcodec swresample avutil; do
+            xcrun lipo -info "app/Madeira/lib$lib.a"
+          done
+      - name: Build on-device pairing library from locked source
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          cd runtime
+          bash build/rppairing-ios/build.sh
+          xcrun lipo -info app/Madeira/libmadeira_rppairing.a
+      - name: Build CPU translation core from pinned submodule
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake ninja ccache
+          cd runtime
+          git submodule update --init --depth 1 --recursive FEX
+          export CMAKE_BUILD_PARALLEL_LEVEL=3
+          bash build/fex-ios/build.sh
+          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore.a
+          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
       - name: Inventory actual source-build prerequisites
         shell: bash
         run: |
