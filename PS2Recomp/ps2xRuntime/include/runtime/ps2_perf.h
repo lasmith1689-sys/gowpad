@@ -76,6 +76,26 @@ namespace ps2_perf
         std::lock_guard<std::mutex> lock(latest.glLineMutex);
         return latest.glLine;
     }
+
+    // GOW-Port: GOW_GL_AB=1 (iOS default in this test build): the GS renderer's GL thread cycles through candidate
+    // settings, one per 5 s report window, and measures its busy time per presented frame under each (gs_threaded_backend
+    // report). Every setting draws the same picture. -1 = off; 0 as shipped, 1 GL state cache, 2 uber program only,
+    // 3 vertex uploads by BufferSubData instead of mapping.
+    constexpr int kAbConfigs = 4;
+    inline const char *const kAbNames[kAbConfigs] = {"base", "cache", "uber", "bufsub"};
+    inline std::atomic<int> abConfig{-1};
+    inline std::mutex abLineMutex;
+    inline std::string abLine;
+    inline void setAbLine(std::string line)
+    {
+        std::lock_guard<std::mutex> lock(abLineMutex);
+        abLine = std::move(line);
+    }
+    inline std::string getAbLine()
+    {
+        std::lock_guard<std::mutex> lock(abLineMutex);
+        return abLine;
+    }
     inline thread_local Accounting accounting;
     inline uint64_t nowNanos()
     {

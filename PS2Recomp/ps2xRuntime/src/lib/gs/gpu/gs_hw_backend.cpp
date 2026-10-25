@@ -1069,7 +1069,8 @@ void main()
 #endif
         }();
         void *target = nullptr;
-        if (g.es && mapped && g.MapBufferRange && g.UnmapBuffer)
+        // (GOW_GL_AB setting 3: BufferSubData)
+        if (g.es && mapped && ps2_perf::abConfig.load(std::memory_order_relaxed) != 3 && g.MapBufferRange && g.UnmapBuffer)
             target = g.MapBufferRange(kArrayBuffer, at, length, 0x0002 /* WRITE */ | 0x0004 /* INVALIDATE_RANGE */ | 0x0020 /* UNSYNCHRONIZED */);
         if (target)
         {
@@ -1181,6 +1182,7 @@ void main()
             failed = true;
             return false;
         }
+        GSGL::InstallStateCache(context.mutableGl()); // skipping on per ps2_perf A/B or PS2X_GS_STATE_CACHE (applyTuning)
         const Api &g = gl();
         {
             const char *copy = std::getenv("PS2X_GS_DEST_COPY");
@@ -2496,6 +2498,12 @@ void main()
 
     void flushPending()
     {
+        // GL state cache (gs_gl_cache.cpp): PS2X_GS_STATE_CACHE=1, or GOW_GL_AB's setting 1 while that test runs
+        {
+            static const bool cacheSetting = [] { const char *v = std::getenv("PS2X_GS_STATE_CACHE"); return v && *v == '1'; }();
+            const int ab = ps2_perf::abConfig.load(std::memory_order_relaxed);
+            GSGL::SetStateCacheEnabled(ab >= 0 ? ab == 1 : cacheSetting);
+        }
         ++batchSerial; // the next sprite starts a new batch: no seam with the previous one
         flushShuffle();
         if (!havePending || pending.empty())
@@ -2906,7 +2914,9 @@ void main()
     void useDrawProgram(bool dualSource)
     {
         const Api &g = gl();
-        DrawVariant &v = drawVariantFor(specializeDraws ? drawVariantKey(dualSource) : kUberVariant);
+        // (GOW_GL_AB setting 2: the uber program only)
+        const bool specialize = specializeDraws && ps2_perf::abConfig.load(std::memory_order_relaxed) != 2;
+        DrawVariant &v = drawVariantFor(specialize ? drawVariantKey(dualSource) : kUberVariant);
         g.UseProgram(v.program);
         for (int i = 0; i < kDrawUniforms; ++i)
         {
@@ -3534,6 +3544,7 @@ void main()
                      (unsigned long long)stats.clutReadbacks, (unsigned long long)stats.paletteUploads);
         stats.shuffles = stats.draws = stats.batches = stats.texDecodes = stats.texHits = stats.skippedPsm = stats.skippedPrim = stats.unsupportedBlend = 0;
         stats.glDraws = stats.barriers = stats.selfCopies = stats.uploadBytes = stats.orphans = stats.clutReadbacks = stats.paletteUploads = 0;
+        GSGL::ReportStateCacheVerify();
     }
 
     RenderTarget *findTarget(uint32_t fbp)

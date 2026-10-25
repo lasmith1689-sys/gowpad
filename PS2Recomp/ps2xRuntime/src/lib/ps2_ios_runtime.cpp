@@ -145,6 +145,11 @@ fs::path ps2xIosPrepare()
     // render targets at 3x the PS2's (448 lines -> 1344): at least the panel's height (1206 on the iPhone 17 Pro Max), so
     // the picture is scaled down to fit instead of up (2x was soft)
     setenv("PS2X_GS_HW_SCALE", "3", 0);
+    // GL state cache (gs_gl_cache.cpp): the GS GL thread was the limit, ~2/3 of it in Apple's GL driver; on the PC the
+    // cache skips ~5000 redundant calls per frame and was verified call by call (PS2X_GS_STATE_CACHE_VERIFY, 0 mismatches)
+    setenv("PS2X_GS_STATE_CACHE", "1", 0);
+    // first 3 minutes: the GL thread's cost per frame under each candidate setting, on the readout's third line
+    setenv("GOW_GL_AB", "1", 0);
 
     const fs::path game = bundleGameDir();
 

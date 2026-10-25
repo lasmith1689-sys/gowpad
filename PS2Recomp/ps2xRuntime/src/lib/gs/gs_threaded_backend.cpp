@@ -75,6 +75,41 @@ namespace
                         used += std::snprintf(hud + used, sizeof(hud) - used, " %s %.0f%%", names[order[k]], nanos[order[k]] * 100.0 / window);
                 ps2_perf::setGlLine(hud);
             }
+            // GOW_GL_AB=1 (ps2_perf.h): this window's GL milliseconds per presented frame count for the setting it ran
+            // with (windows with fewer than 30 presents, e.g. loading, are left out); the next window runs the next one
+            {
+                static const bool ab = [] { const char *v = std::getenv("GOW_GL_AB"); return v && *v == '1'; }();
+                // the test runs for the first GOW_GL_AB_SECONDS (default 180) only, then the shipped settings stay on
+                static const double abSeconds = [] { const char *v = std::getenv("GOW_GL_AB_SECONDS"); return v ? std::atof(v) : 180.0; }();
+                static const auto abStart = std::chrono::steady_clock::now();
+                static bool abDone = false;
+                if (ab && !abDone && std::chrono::duration<double>(now - abStart).count() > abSeconds)
+                {
+                    abDone = true;
+                    ps2_perf::abConfig.store(-1, std::memory_order_relaxed);
+                    ps2_perf::setAbLine(ps2_perf::getAbLine() + "  [done]");
+                }
+                if (ab && !abDone)
+                {
+                    static double total[ps2_perf::kAbConfigs] = {};
+                    static int samples[ps2_perf::kAbConfigs] = {};
+                    const int config = ps2_perf::abConfig.load(std::memory_order_relaxed);
+                    const uint64_t presents = count[8];
+                    if (config >= 0 && presents >= 30u)
+                    {
+                        total[config] += busy * 1e-6 / static_cast<double>(presents);
+                        ++samples[config];
+                    }
+                    ps2_perf::abConfig.store((config + 1) % ps2_perf::kAbConfigs, std::memory_order_relaxed);
+                    char text[200];
+                    int used = std::snprintf(text, sizeof(text), "A/B GL ms/frame:");
+                    for (int i = 0; i < ps2_perf::kAbConfigs && used > 0 && used < static_cast<int>(sizeof(text)); ++i)
+                        used += std::snprintf(text + used, sizeof(text) - used, "  %s %.2f (%d)", ps2_perf::kAbNames[i],
+                                              samples[i] ? total[i] / samples[i] : 0.0, samples[i]);
+                    std::fprintf(stderr, "[gl-ab] %s\n", text);
+                    ps2_perf::setAbLine(text);
+                }
+            }
             *this = GlOpTiming{};
         }
     };

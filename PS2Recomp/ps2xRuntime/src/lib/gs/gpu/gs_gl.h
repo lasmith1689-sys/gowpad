@@ -200,6 +200,7 @@ namespace GSGL
         void Destroy();
         bool Valid() const { return m_context != nullptr; }
         const Api &gl() const { return m_api; }
+        Api &mutableGl() { return m_api; }
         bool Shared() const { return m_shared; }
         void *CreateWorker() const;
         bool MakeWorkerCurrent(void *worker) const;
@@ -222,4 +223,10 @@ namespace GSGL
                               uint32_t displayFbp, uint32_t sourceFbp, uint64_t vsyncTick);
     bool SharedAvailable(const Api &gl);
     void DestroyShared(const Api &gl);
+
+    // GOW-Port: GL state cache (gs_gl_cache.cpp): wraps the state-setting entry points of api so that calls setting what
+    // is already set are skipped while enabled (the shadow state is kept either way; one context per thread)
+    void InstallStateCache(Api &api);
+    void SetStateCacheEnabled(bool enabled);
+    void ReportStateCacheVerify(); // PS2X_GS_STATE_CACHE_VERIFY=1: skipped calls checked / mismatches so far
 }

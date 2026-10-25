@@ -477,6 +477,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_threaded_backend.cpp
     src/lib/gs/gs_swizzle.cpp
     src/lib/gs/gpu/gs_gl.cpp
+    src/lib/gs/gpu/gs_gl_cache.cpp
     src/lib/gs/gpu/gs_hw_backend.cpp
 
 src/lib/gs/gpu/gs_texture_store.cpp
