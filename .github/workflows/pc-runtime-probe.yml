@@ -1,0 +1,92 @@
+name: PC game runtime build probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-runtime-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-runtime-probe
+  cancel-in-progress: false
+
+jobs:
+  source-build-probe:
+    name: Check cloud Xcode and runtime build inputs
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out pinned runtime source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: willfaust/Madeira
+          ref: e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          persist-credentials: false
+          submodules: false
+          path: runtime
+      - name: Verify cloud tools and cross-compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun clang --version | head -n 1
+          printf '#include <TargetConditionals.h>\nint probe(void) { return TARGET_OS_IPHONE; }\n' > "$RUNNER_TEMP/ios-sdk-probe.c"
+          xcrun clang -target arm64-apple-ios17.0 -isysroot "$sdk" -fsyntax-only "$RUNNER_TEMP/ios-sdk-probe.c"
+          printf 'Cloud Mac/Xcode iPhone SDK probe passed. No app has been built or signed.\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Inventory actual source-build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          test "$(git rev-parse HEAD)" = e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          git submodule status
+          xcodebuild -list -project app/Madeira.xcodeproj -json > "$RUNNER_TEMP/runtime-project.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          required = [
+              "FEX/build-ios/FEXCore/Source/libFEXCore.a",
+              "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a",
+              "app/Madeira/libdxmt_combined.a",
+              "app/Madeira/libavformat.a",
+              "app/Madeira/libavcodec.a",
+              "app/Madeira/libswresample.a",
+              "app/Madeira/libavutil.a",
+              "app/Madeira/libmadeira_rppairing.a",
+              "app/Madeira/x86_64-vcruntime",
+          ]
+          missing = [path for path in required if not Path(path).exists()]
+          report = {"source": "e3a88fddb8daed1f5ac28a45dcb4663d65192629",
+                    "cloud_sdk_checked": True, "missing_build_inputs": missing,
+                    "game_files_supplied": False, "signing_attempted": False,
+                    "iphone_gameplay_verified": False}
+          print(json.dumps(report, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+              stream.write("\nRuntime source-build input check\n\n")
+              stream.write("Missing inputs: " + str(len(missing)) + "\n")
+              for path in missing:
+                  stream.write("- " + path + "\n")
+              stream.write("\nThis is a build prerequisite probe, not a playable game or signed IPA.\n")
+          if missing:
+              raise SystemExit("Native runtime dependency builds are required before the app can compile.")
+          PY
+      - name: Attempt unsigned runtime build only when inputs exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project runtime/app/Madeira.xcodeproj -scheme Madeira -configuration Debug \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/pc-runtime-derived" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO build > "$RUNNER_TEMP/pc-runtime-build.log" 2>&1 || {
+              tail -n 100 "$RUNNER_TEMP/pc-runtime-build.log"
+              exit 1
+            }
+          printf '\nUnsigned runtime build passed. No game or device test has run.\n' >> "$GITHUB_STEP_SUMMARY"
