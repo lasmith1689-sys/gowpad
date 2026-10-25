@@ -2762,10 +2762,21 @@ void main()
             for (const auto &item : built)
                 async.pending.erase(item.first);
         }
+        const Api &g = gl();
         for (const auto &[key, prog] : built)
         {
             ++variantsBuilt;
-            drawVariants[key] = prog ? makeDrawVariant(prog) : drawVariants[kUberVariant];
+            // an object another context changed is only up to date here once bound (EAGL share groups): bind it, and
+            // check it linked, before asking for its uniforms (the caller binds the program it draws with next)
+            GLint linked = 0;
+            if (prog)
+            {
+                g.UseProgram(prog);
+                g.GetProgramiv(prog, kLinkStatus, &linked);
+                if (!linked)
+                    std::fprintf(stderr, "[gs-hw] background variant %06x is not linked here: uber program\n", key);
+            }
+            drawVariants[key] = linked ? makeDrawVariant(prog) : drawVariants[kUberVariant];
         }
     }
 

@@ -1,5 +1,8 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#if defined(PS2X_IOS)
+#include "runtime/ps2_touch_pad.h"
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -149,6 +152,16 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+#if defined(PS2X_IOS)
+        // GOW-Port: the on-screen controls (shown while no controller is connected)
+        uint16_t touched = 0;
+        uint8_t sticks[4];
+        if (ps2_touch_pad::read(touched, sticks))
+        {
+            clearBit(touched);
+            std::memcpy(data + 4, sticks, sizeof(sticks));
+        }
+#endif
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

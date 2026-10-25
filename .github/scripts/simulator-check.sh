@@ -29,6 +29,9 @@ xcrun simctl boot "$udid"
 xcrun simctl bootstatus "$udid" -b > /dev/null
 xcrun simctl install "$udid" "$app"
 data=$(xcrun simctl get_app_container "$udid" "$bundle" data)
+# diagnostics the app reads from Documents/env.txt: GL errors per batch and the shader variant builds in the log
+mkdir -p "$data/Documents"
+echo "GOW_GS_HW_STATS=1" > "$data/Documents/env.txt"
 echo "▶ Launching $bundle"
 xcrun simctl launch "$udid" "$bundle"
 elapsed=0

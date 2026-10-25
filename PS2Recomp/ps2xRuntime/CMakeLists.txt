@@ -809,7 +809,7 @@ endif()
 
 if(PS2X_IS_IOS)
     # the GS renderer's EAGL context and the display-refresh pacing of the host window (Objective-C++, ARC)
-    target_sources(ps2_runtime PRIVATE src/lib/gs/gpu/gs_gl_ios.mm src/lib/gs/gs_display_ios.mm)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gpu/gs_gl_ios.mm src/lib/gs/gs_display_ios.mm src/lib/ps2_touch_pad.cpp)
     set_source_files_properties(src/lib/gs/gpu/gs_gl_ios.mm src/lib/gs/gs_display_ios.mm PROPERTIES
         COMPILE_OPTIONS "-fobjc-arc" SKIP_UNITY_BUILD_INCLUSION TRUE SKIP_PRECOMPILE_HEADERS TRUE)
     target_sources(ps2EntryRunner PRIVATE src/lib/ps2_ios_runtime.cpp src/lib/ps2_ios_assets.mm)

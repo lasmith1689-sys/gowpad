@@ -16,6 +16,7 @@
 #include <thread>
 #if defined(PS2X_IOS)
 #include <SDL.h>
+#include "runtime/ps2_touch_pad.h"
 void ps2xIosWaitDisplayRefresh(); // gs_display_ios.mm
 #endif
 
@@ -591,6 +592,7 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         drawLogOverlay();
     else
         drawPerfHud();
+    ps2_touch_pad::updateAndDraw(); // on-screen controls while no controller is connected
 #endif
     // GOW-Port: GOW_HOST_SHOT=<n>: at host frame n write the window's back buffer (what is about to be shown) to
     // host_shot.png in the working directory, plus the frame / window sizes, to check presentation without a desktop grab.

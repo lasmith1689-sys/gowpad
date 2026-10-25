@@ -305,8 +305,13 @@ namespace
         uint8_t state[32]{};
         if (!buffer || !socket || socket->port != 0 || !runtime ||
             !runtime->padBackend().readState(0, 0, state, sizeof(state))) { padReturn(ctx, 0xffffffffu); return; }
-        // GOW-Port: keyboard sticks only without any gamepad (PSPadBackend uses the first available slot).
+        // GOW-Port: keyboard sticks only without any gamepad (PSPadBackend uses the first available slot). Not on iOS:
+        // there the sticks without a gamepad are the on-screen controls' (ps2_touch_pad.cpp), set by readState.
+#if !defined(PS2X_IOS)
         if (!IsGamepadAvailable(0) && !IsGamepadAvailable(1) && !IsGamepadAvailable(2) && !IsGamepadAvailable(3))
+#else
+        if (false)
+#endif
         {
             state[6] = IsKeyDown(KEY_A) ? 0 : IsKeyDown(KEY_D) ? 255 : 128;
             state[7] = IsKeyDown(KEY_W) ? 0 : IsKeyDown(KEY_S) ? 255 : 128;
