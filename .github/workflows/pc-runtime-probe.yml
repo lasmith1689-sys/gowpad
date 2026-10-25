@@ -74,6 +74,11 @@ jobs:
           cd runtime
           git submodule update --init --depth 1 --recursive FEX
           export CMAKE_BUILD_PARALLEL_LEVEL=3
+          cmake -S FEX -B FEX/build-ios -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON
           bash build/fex-ios/build.sh
           xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore.a
           xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
@@ -83,8 +88,6 @@ jobs:
           set -euo pipefail
           cd runtime
           test "$(git rev-parse HEAD)" = e3a88fddb8daed1f5ac28a45dcb4663d65192629
-          git submodule status
-          xcodebuild -list -project app/Madeira.xcodeproj -json > "$RUNNER_TEMP/runtime-project.json"
           python3 - <<'PY'
           import json, os
           from pathlib import Path
@@ -114,6 +117,8 @@ jobs:
           if missing:
               raise SystemExit("Native runtime dependency builds are required before the app can compile.")
           PY
+          git submodule status
+          xcodebuild -list -project app/Madeira.xcodeproj -json > "$RUNNER_TEMP/runtime-project.json"
       - name: Attempt unsigned runtime build only when inputs exist
         shell: bash
         run: |
@@ -127,3 +132,5 @@ jobs:
               exit 1
             }
           printf '\nUnsigned runtime build passed. No game or device test has run.\n' >> "$GITHUB_STEP_SUMMARY"
+
+
