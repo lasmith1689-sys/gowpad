@@ -19,7 +19,13 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include "ThreadNaming.h"
 
 namespace
 {
@@ -1207,6 +1213,19 @@ void main()
             return false;
         }
         drawVariants[kUberVariant] = makeDrawVariant(program);
+        {
+            const char *setting = std::getenv("PS2X_GS_ASYNC_SHADERS");
+#if defined(PS2X_IOS)
+            const bool background = !(setting && *setting == '0');
+#else
+            const bool background = setting && *setting == '1';
+#endif
+            if (background && specializeDraws)
+            {
+                g.Flush(); // the vertex shader the compile thread attaches is complete for its context
+                startAsyncVariants();
+            }
+        }
 
         g.GenVertexArrays(1, &vao);
         g.BindVertexArray(vao);
@@ -2653,11 +2672,133 @@ void main()
                bit(recordedInt(locSwBlend) == 2) << 22;
         return key;
     }
+    // GOW-Port: background variant builds (PS2X_GS_ASYNC_SHADERS; on by default on iOS, PS2X_GS_ASYNC_SHADERS=1 elsewhere).
+    // A variant built on this thread stalled the frame it first appeared in (Apple's GL compiler takes tens of ms per
+    // program: a hitch whenever a new effect showed up). A missing variant is queued for a compile thread with its own
+    // context in this context's share group; the uber program (same output, every path) draws until it is linked.
+    struct AsyncVariants
+    {
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::vector<uint32_t> queue;
+        std::vector<std::pair<uint32_t, GLuint>> built;
+        std::unordered_set<uint32_t> pending;
+        std::atomic<bool> anyBuilt{false};
+        bool stop = false;
+        void *worker = nullptr;
+    } async;
+    bool asyncVariants = false;
+
+    void startAsyncVariants()
+    {
+        async.worker = context.CreateWorker();
+        if (!async.worker)
+        {
+            std::fprintf(stderr, "[gs-hw] no worker context: shader variants build on the GL thread\n");
+            return;
+        }
+        asyncVariants = true;
+        async.thread = std::thread([this] {
+            ThreadNaming::SetCurrentThreadName("GSCompile");
+            const bool current = context.MakeWorkerCurrent(async.worker);
+            if (!current)
+                std::fprintf(stderr, "[gs-hw] worker context unusable: every variant stays the uber program\n");
+            for (;;)
+            {
+                uint32_t key = 0;
+                {
+                    std::unique_lock<std::mutex> lock(async.mutex);
+                    async.wake.wait(lock, [this] { return async.stop || !async.queue.empty(); });
+                    if (async.stop)
+                        break;
+                    key = async.queue.front();
+                    async.queue.erase(async.queue.begin());
+                }
+                const auto start = std::chrono::steady_clock::now();
+                GLuint prog = 0;
+                if (current)
+                {
+                    prog = buildVariantProgram(key);
+                    gl().Finish(); // complete before the GL thread's context uses it
+                }
+                if (statsEnabled)
+                    std::fprintf(stderr, "[gs-hw] draw variant key=%06x %s in the background in %.1f ms\n", key, prog ? "built" : "FAILED (uber)",
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+                std::lock_guard<std::mutex> lock(async.mutex);
+                async.built.emplace_back(key, prog);
+                async.anyBuilt.store(true, std::memory_order_release);
+            }
+        });
+        std::fprintf(stderr, "[gs-hw] shader variants build on a background thread\n");
+    }
+
+    void stopAsyncVariants()
+    {
+        if (async.thread.joinable())
+        {
+            {
+                std::lock_guard<std::mutex> lock(async.mutex);
+                async.stop = true;
+            }
+            async.wake.notify_all();
+            async.thread.join();
+        }
+        if (async.worker)
+            GSGL::Context::DestroyWorker(async.worker);
+        async.worker = nullptr;
+    }
+
+    ~Impl() { stopAsyncVariants(); }
+
+    // GL thread: the variants the compile thread finished become usable
+    void collectAsyncVariants()
+    {
+        std::vector<std::pair<uint32_t, GLuint>> built;
+        {
+            std::lock_guard<std::mutex> lock(async.mutex);
+            built.swap(async.built);
+            async.anyBuilt.store(false, std::memory_order_relaxed);
+            for (const auto &item : built)
+                async.pending.erase(item.first);
+        }
+        for (const auto &[key, prog] : built)
+        {
+            ++variantsBuilt;
+            drawVariants[key] = prog ? makeDrawVariant(prog) : drawVariants[kUberVariant];
+        }
+    }
+
     DrawVariant &drawVariantFor(uint32_t key)
     {
+        if (asyncVariants && async.anyBuilt.load(std::memory_order_acquire))
+            collectAsyncVariants();
         if (const auto it = drawVariants.find(key); it != drawVariants.end())
             return it->second;
+        if (asyncVariants)
+        {
+            std::lock_guard<std::mutex> lock(async.mutex);
+            if (async.pending.insert(key).second)
+            {
+                async.queue.push_back(key);
+                async.wake.notify_one();
+            }
+            return drawVariants[kUberVariant];
+        }
         const auto start = std::chrono::steady_clock::now();
+        const GLuint prog = buildVariantProgram(key);
+        ++variantsBuilt;
+        if (statsEnabled && variantsBuilt <= 256u)
+            std::fprintf(stderr, "[gs-hw] draw variant #%u key=%06x %s in %.1f ms\n", variantsBuilt, key, prog ? "built" : "FAILED (uber)",
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        if (!prog)
+            return drawVariants[key] = drawVariants[kUberVariant];
+        return drawVariants[key] = makeDrawVariant(prog);
+    }
+
+    // the variant's program (0 when it does not build); only GL calls on the calling thread's context
+    GLuint buildVariantProgram(uint32_t key)
+    {
         const auto field = [&](int shift, uint32_t mask) { return static_cast<int>((key >> shift) & mask); };
         std::string defines = "#define GS_SPECIALIZED 1\n";
         const auto define = [&](const char *name, int value) { defines += std::string("#define ") + name + " " + std::to_string(value) + "\n"; };
@@ -2702,13 +2843,7 @@ void main()
                 prog = 0;
             }
         }
-        ++variantsBuilt;
-        if (statsEnabled && variantsBuilt <= 256u)
-            std::fprintf(stderr, "[gs-hw] draw variant #%u key=%06x %s in %.1f ms\n", variantsBuilt, key, prog ? "built" : "FAILED (uber)",
-                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
-        if (!prog)
-            return drawVariants[key] = drawVariants[kUberVariant];
-        return drawVariants[key] = makeDrawVariant(prog);
+        return prog;
     }
     // binds the draw program for the recorded uniforms and sends it the values it lacks (before every draw call: the CLUT
     // readback, the shuffle and the presentation bind their own programs in between)
