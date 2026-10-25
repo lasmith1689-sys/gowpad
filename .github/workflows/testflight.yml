@@ -141,6 +141,7 @@ jobs:
           bash .github/scripts/build-ios.sh "$RUNNER_TEMP/input" "$RUNNER_TEMP/work" "$target"
       - name: Run it in the iOS Simulator
         if: inputs.mode == 'simulator'
+        timeout-minutes: 15 # the check takes ~4 min; a hung simctl/sample once held the queue for over an hour
         run: bash .github/scripts/simulator-check.sh "$RUNNER_TEMP/work/GoWPad.app" "$RUNNER_TEMP/simcheck"
       - name: Keep the simulator screenshots, log and sample (one day)
         if: inputs.mode == 'simulator' && always()
