@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <mutex>
 #include <algorithm>
 
 namespace ps2_perf
@@ -60,8 +61,21 @@ namespace ps2_perf
     {
         std::atomic<float> guestHz{0.0f}, hostHz{0.0f}, speed{0.0f};
         std::array<std::atomic<float>, bucketCount> corePercent{};
+        std::atomic<float> gpuFramesBehind{0.0f}; // presented frames the GPU had not finished, averaged (GS backend)
+        std::mutex glLineMutex;
+        std::string glLine; // the GL thread's time split ([gs-gl], gs_threaded_backend.cpp)
     };
     inline Latest latest;
+    inline void setGlLine(std::string line)
+    {
+        std::lock_guard<std::mutex> lock(latest.glLineMutex);
+        latest.glLine = std::move(line);
+    }
+    inline std::string glLine()
+    {
+        std::lock_guard<std::mutex> lock(latest.glLineMutex);
+        return latest.glLine;
+    }
     inline thread_local Accounting accounting;
     inline uint64_t nowNanos()
     {

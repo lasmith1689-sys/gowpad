@@ -30,6 +30,8 @@ extern "C"
 
 #include "Syscalls/Helpers/State.h"
 
+// Start held on any host input (ps2_pad.cpp): skips the movie playing.
+bool ps2HostStartDown();
 // Audio device position, defined in ps2_runtime.cpp (movie A/V check, GOW_MPEG_DIAG).
 extern std::atomic<uint64_t> g_gowAudioFramesPlayed, g_gowAudioFramesProduced;
 // Time spent in the decoder stubs (movie cost check, printed by the GOW_MPEG_DIAG sync line).
@@ -2649,6 +2651,19 @@ namespace ps2_stubs
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            // GOW-Port: Start skips the movie (a press that begins while it plays; one held from before does not): the
+            // video ends here and the game's player finishes as at the movie's own end (sceMpegIsEnd below)
+            {
+                static bool startWasDown = true;
+                const bool startDown = ps2HostStartDown();
+                if (startDown && !startWasDown && !videoEnded(playback))
+                {
+                    playback.streamEnded = true;
+                    playback.decodedFrames.clear();
+                    std::fprintf(stderr, "[mpeg] movie skipped (Start) after %u pictures\n", playback.picturesServed);
+                }
+                startWasDown = startDown;
+            }
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !videoEnded(playback) &&

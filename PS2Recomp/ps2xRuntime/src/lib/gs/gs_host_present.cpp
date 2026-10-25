@@ -170,6 +170,15 @@ void main()
         const int fontSize = std::max(8, GetScreenHeight() / 40);
         DrawRectangle(0, 0, MeasureText(text, fontSize) + 12, fontSize + 6, Color{0, 0, 0, 170});
         DrawText(text, 6, 3, fontSize, Color{255, 230, 120, 255});
+        // second line: where the GS GL thread's time goes and how many frames the GPU runs behind it
+        const std::string gl = ps2_perf::glLine();
+        if (!gl.empty())
+        {
+            char line[224];
+            std::snprintf(line, sizeof(line), "%s | GPU behind %.1f", gl.c_str(), l.gpuFramesBehind.load(std::memory_order_relaxed));
+            DrawRectangle(0, fontSize + 6, MeasureText(line, fontSize) + 12, fontSize + 6, Color{0, 0, 0, 170});
+            DrawText(line, 6, fontSize + 9, fontSize, Color{160, 220, 255, 255});
+        }
     }
 #endif
 

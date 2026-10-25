@@ -177,6 +177,30 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     return true;
 }
 
+// GOW-Port: Start held on any input (a gamepad, Enter, the on-screen controls): movies are skipped on a press
+// (Kernel/Stubs/MPEG.cpp). GOW_MOVIE_SKIP_TEST=1 (tests): "pressed" from the 90th check of each movie on.
+bool ps2HostStartDown()
+{
+    static const bool test = [] { const char *v = std::getenv("GOW_MOVIE_SKIP_TEST"); return v && *v == '1'; }();
+    if (test)
+    {
+        static unsigned checks = 0;
+        return ++checks % 400u >= 90u;
+    }
+    for (int i = 0; i < 4; ++i)
+        if (IsGamepadAvailable(i) && IsGamepadButtonDown(i, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+            return true;
+    if (IsKeyDown(KEY_ENTER))
+        return true;
+#if defined(PS2X_IOS)
+    uint16_t touched = 0;
+    uint8_t sticks[4];
+    if (ps2_touch_pad::read(touched, sticks) && (touched & PAD_START))
+        return true;
+#endif
+    return false;
+}
+
 void PSPadBackend::setActuators(int port, bool small, uint8_t large)
 {
     if (port != 0 || (small == m_small && large == m_large))

@@ -61,6 +61,20 @@ namespace
                     at += std::snprintf(line + at, sizeof(line) - at, " %s=%.1fms/%llu", names[i], nanos[i] * 1e-6,
                                         static_cast<unsigned long long>(count[i]));
             std::fprintf(stderr, "%s\n", line);
+            // the on-screen readout's second line: busy share of the GL thread and its four largest ops, in % of the window
+            {
+                const double window = std::chrono::duration<double>(now - last).count() * 1e9;
+                size_t order[kOps];
+                for (size_t i = 0; i < kOps; ++i)
+                    order[i] = i;
+                std::sort(order, order + kOps, [this](size_t a, size_t b) { return nanos[a] > nanos[b]; });
+                char hud[160];
+                int used = std::snprintf(hud, sizeof(hud), "GL busy %.0f%% |", busy * 100.0 / window);
+                for (size_t k = 0; k < 4 && used > 0 && used < static_cast<int>(sizeof(hud)); ++k)
+                    if (count[order[k]])
+                        used += std::snprintf(hud + used, sizeof(hud) - used, " %s %.0f%%", names[order[k]], nanos[order[k]] * 100.0 / window);
+                ps2_perf::setGlLine(hud);
+            }
             *this = GlOpTiming{};
         }
     };

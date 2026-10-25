@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <deque>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -793,7 +794,7 @@ void main()
     {
         uint64_t shuffles = 0;
         uint64_t draws = 0, batches = 0, skippedPsm = 0, unsupportedBlend = 0, texDecodes = 0, texHits = 0, skippedPrim = 0;
-        uint64_t glDraws = 0, barriers = 0, uploadBytes = 0, orphans = 0; // GL calls the driver sees (GOW_GS_HW_STATS)
+        uint64_t glDraws = 0, barriers = 0, uploadBytes = 0, orphans = 0, clutReadbacks = 0, paletteUploads = 0; // GL calls the driver sees (GOW_GS_HW_STATS)
         uint64_t selfCopies = 0; // ES: render targets copied because a draw samples the target it draws into
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     } stats;
@@ -1864,6 +1865,7 @@ void main()
             g.BindTexture(kTexture2D, paletteTex);
             g.PixelStorei(kUnpackAlignment, 4);
             g.TexSubImage2D(kTexture2D, 0, 0, 0, 256, 1, kRgba, kUnsignedByte, palette);
+            ++stats.paletteUploads;
         }
         g.ActiveTexture(kTexture0 + 1);
         g.BindTexture(kTexture2D, colorOverride ? colorOverride : rt.color);
@@ -1979,6 +1981,7 @@ void main()
         g.DrawArrays(kTriangles, 0, 3);
         g.PixelStorei(kPackAlignment, 4);
         g.ReadPixels(0, 0, static_cast<GLsizei>(count), 1, kRgba, kUnsignedByte, words);
+        ++stats.clutReadbacks;
         g.BindVertexArray(vao);
         g.BindBuffer(kArrayBuffer, vbo);
         if (clutCache.size() > 4096u)
@@ -2751,6 +2754,38 @@ void main()
 
     ~Impl() { stopAsyncVariants(); }
 
+    // GOW-Port: how far the GPU runs behind the GL thread, for the on-screen readout: a fence per presented frame; the
+    // ones not yet signalled at the next present are frames the GPU still owes (~0: the GL thread's CPU work is the
+    // limit; 2-3: the GPU is). Averaged over 60 presents into ps2_perf::latest.gpuFramesBehind.
+    std::deque<GSGL::GLsync> presentFences;
+    uint32_t lagSamples = 0, lagTotal = 0;
+    void trackGpuLag()
+    {
+        const Api &g = gl();
+        if (!g.FenceSync || !g.ClientWaitSync || !g.DeleteSync)
+            return;
+        while (!presentFences.empty())
+        {
+            const auto status = g.ClientWaitSync(presentFences.front(), 0u, 0u);
+            if (status != GSGL::kAlreadySignaled && status != GSGL::kConditionSatisfied)
+                break;
+            g.DeleteSync(presentFences.front());
+            presentFences.pop_front();
+        }
+        lagTotal += static_cast<uint32_t>(presentFences.size());
+        if (++lagSamples == 60u)
+        {
+            ps2_perf::latest.gpuFramesBehind.store(static_cast<float>(lagTotal) / 60.0f, std::memory_order_relaxed);
+            lagSamples = lagTotal = 0u;
+        }
+        while (presentFences.size() >= 8u)
+        {
+            g.DeleteSync(presentFences.front());
+            presentFences.pop_front();
+        }
+        presentFences.push_back(g.FenceSync(GSGL::kSyncGpuCommandsComplete, 0u));
+    }
+
     // GL thread: the variants the compile thread finished become usable
     void collectAsyncVariants()
     {
@@ -3481,13 +3516,14 @@ void main()
         if (now - stats.last < std::chrono::seconds(5))
             return;
         stats.last = now;
-        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu uploadKB=%llu orphans=%llu\n",
+        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
                      (unsigned long long)stats.shuffles, (unsigned long long)stats.draws, (unsigned long long)stats.batches, (unsigned long long)stats.texDecodes,
                      (unsigned long long)stats.texHits, (unsigned long long)stats.skippedPsm, (unsigned long long)stats.skippedPrim,
                      (unsigned long long)stats.unsupportedBlend, textures.size(), (unsigned long long)stats.glDraws, (unsigned long long)stats.barriers,
-                     (unsigned long long)stats.selfCopies, (unsigned long long)(stats.uploadBytes >> 10), (unsigned long long)stats.orphans);
+                     (unsigned long long)stats.selfCopies, (unsigned long long)(stats.uploadBytes >> 10), (unsigned long long)stats.orphans,
+                     (unsigned long long)stats.clutReadbacks, (unsigned long long)stats.paletteUploads);
         stats.shuffles = stats.draws = stats.batches = stats.texDecodes = stats.texHits = stats.skippedPsm = stats.skippedPrim = stats.unsupportedBlend = 0;
-        stats.glDraws = stats.barriers = stats.selfCopies = stats.uploadBytes = stats.orphans = 0;
+        stats.glDraws = stats.barriers = stats.selfCopies = stats.uploadBytes = stats.orphans = stats.clutReadbacks = stats.paletteUploads = 0;
     }
 
     RenderTarget *findTarget(uint32_t fbp)
@@ -3954,6 +3990,8 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
     {
         // GOW-Port: zero-copy presentation: GPU copy into a texture shared with the host window, no pixels returned.
         GSGL::PublishSharedTexture(g, d.presentTex, outW, outH, d.presentCount, fbp, fbp, request.vsyncTick);
+        if (ps2_perf::countFrames())
+            d.trackGpuLag();
         return PresentationFrame{};
     }
     if (request.asyncReadback && g.MapBufferRange && g.FenceSync)
