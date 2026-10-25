@@ -2652,6 +2652,16 @@ void main()
         v.program = prog;
         for (int i = 0; i < kDrawUniforms; ++i)
             v.loc[i] = gl().GetUniformLocation(prog, names[i]);
+        // GOW-Port: every sampler on its own unit from the start (the units draw() binds). Unset samplers all sit on unit
+        // 0, and OpenGL ES rejects a draw (INVALID_OPERATION) whose program has samplers of different types (uTex
+        // sampler2D, uTables usampler2D) on one unit: Apple's driver dropped the uber program's draws until each had
+        // been set once (the first batches with background-built variants; specialised variants compile unused ones out).
+        const Api &g = gl();
+        g.UseProgram(prog);
+        const std::pair<int, GLint> units[] = {{locTex, 0}, {locRtColor, 1}, {locTables, 2}, {locPalette, 3}, {locDest, 4}, {locIdxPalette, 5}};
+        for (const auto &[id, unit] : units)
+            if (v.loc[id] >= 0)
+                g.Uniform1i(v.loc[id], unit);
         return v;
     }
     // the variant key: every value the shader branches on, normalised where a branch makes another one irrelevant
