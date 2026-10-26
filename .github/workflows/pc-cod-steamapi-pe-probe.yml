@@ -410,26 +410,113 @@ jobs:
           cd source
           export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
           python3 - <<'PY'
-          import hashlib,json,pathlib,re,struct,subprocess
+          import hashlib,json,pathlib,re,shutil,struct,subprocess
           root=pathlib.Path('.work/cod-steamapi-pe').resolve();t=json.loads((root/'tools.json').read_text())
           tool=str(pathlib.Path(t['mingw'])/'bin/llvm-readobj')
+          strip=str(pathlib.Path(t['mingw'])/'bin/llvm-strip')
+          # The verified 20260922 package supplies this tool. LLVM's COFF StripDebug removes discardable
+          # debug sections (llvmorg-23.1.2 llvm/lib/ObjCopy/COFF/COFFObjcopy.cpp); runtime strings receive no exception.
+          def pe_snapshot(data):
+              assert len(data)>=64 and data[:2]==b'MZ','Invalid DOS header'
+              at=struct.unpack_from('<I',data,0x3c)[0]
+              assert 64<=at<=len(data)-24 and data[at:at+4]==b'PE\0\0','Invalid PE header'
+              machine,count,stamp,symbols,symbol_count,opt_size,flags=struct.unpack_from('<HHIIIHH',data,at+4)
+              opt=at+24;assert opt_size>=112 and opt+opt_size<=len(data)
+              magic=struct.unpack_from('<H',data,opt)[0];assert magic in (0x10b,0x20b)
+              directories=96 if magic==0x10b else 112
+              assert opt_size>=directories and (opt_size-directories)%8==0
+              directory_count=struct.unpack_from('<I',data,opt+directories-4)[0]
+              assert directory_count<=16 and directories+8*directory_count<=opt_size
+              dirs=[struct.unpack_from('<II',data,opt+directories+8*i) for i in range(directory_count)]
+              assert len(dirs)>6 and dirs[4]==(0,0),'Unexpected certificate directory'
+              strings=b''
+              if symbols:
+                  start=symbols+18*symbol_count;assert start+4<=len(data)
+                  length=struct.unpack_from('<I',data,start)[0];assert length>=4 and start+length<=len(data)
+                  strings=data[start:start+length]
+              sections={};table=opt+opt_size;assert table+40*count<=len(data)
+              for i in range(count):
+                  row=table+40*i;name=data[row:row+8].split(b'\0',1)[0]
+                  if name.startswith(b'/'):
+                      offset=int(name[1:]);assert 4<=offset<len(strings) and b'\0' in strings[offset:]
+                      name=strings[offset:].split(b'\0',1)[0]
+                  name=name.decode('ascii');assert name not in sections
+                  virtual_size,rva,size,offset=struct.unpack_from('<4I',data,row+8)
+                  characteristics=struct.unpack_from('<I',data,row+36)[0]
+                  assert offset<=len(data) and size<=len(data)-offset
+                  sections[name]={'rva':rva,'virtualSize':virtual_size,'characteristics':characteristics,
+                      'offset':offset,'bytes':size,'sha256':hashlib.sha256(data[offset:offset+size]).hexdigest()}
+              loader={'machine':machine,'magic':magic,'timestamp':stamp,'characteristics':flags,
+                  'entry':struct.unpack_from('<I',data,opt+16)[0],
+                  'imageBase':struct.unpack_from('<I' if magic==0x10b else '<Q',data,opt+(28 if magic==0x10b else 24))[0],
+                  'alignment':struct.unpack_from('<II',data,opt+32),
+                  'subsystemAndDllFlags':struct.unpack_from('<HH',data,opt+68),
+                  'stackAndHeap':data[opt+72:opt+directories-8].hex(),
+                  'directoriesExceptDebug':[(i,value) for i,value in enumerate(dirs) if i!=6]}
+              assert loader['entry'] and flags&0x2000 and stamp==0
+              return {'loader':loader,'sections':sections}
+          def assert_debug_only(before,after):
+              assert before['loader']==after['loader'],'Strip changed required PE loader metadata'
+              def retained(snapshot):
+                  return {name:{k:v for k,v in row.items() if k!='offset'} for name,row in snapshot['sections'].items()
+                      if not (name.startswith('.debug') and row['characteristics']&0x2000000)}
+              assert retained(before)==retained(after),'Strip changed code or retained loader/data section payload'
+              assert not any(name.startswith('.debug') for name in after['sections']),'Debug sections remain'
+          def path_findings(data,snapshot,prefixes):
+              findings=[]
+              for prefix in dict.fromkeys(prefixes):
+                  offsets=[m.start() for m in re.finditer(re.escape(prefix.encode()),data)]
+                  if not offsets:continue
+                  rows=[]
+                  for offset in offsets[:256]:
+                      sections=[name for name,row in snapshot['sections'].items() if row['offset']<=offset<row['offset']+row['bytes']]
+                      left=max(offset-96,data.rfind(b'\0',max(0,offset-96),offset)+1)
+                      right=data.find(b'\0',offset,min(len(data),offset+len(prefix.encode())+96))
+                      if right<0:right=min(len(data),offset+len(prefix.encode())+96)
+                      rows.append({'offset':offset,'section':sections or ['COFF/header/overlay'],
+                          'boundedStringContext':repr(data[left:right])})
+                  findings.append({'prefix':prefix,'count':len(offsets),'firstOffsetsAndContexts':rows,'diagnosticsTruncated':len(offsets)>256})
+              return findings
+          def abi_records(text):
+              exports=sorted(re.findall(r'Export\s*\{([^}]+)\}',text,re.S))
+              imports=sorted(re.findall(r'((?:DelayImport|Import)\s*\{[^}]+\})',text,re.S))
+              assert exports and imports,'Missing actual import/export records'
+              return {'exports':exports,'imports':imports}
           expected={'x86_64-windows/steam_api64.dll':(0x8664,0x20b),'i386-windows/steam_api.dll':(0x14c,0x10b)}
           assert {str(path.relative_to(root/'pe')) for path in (root/'pe').rglob('*') if path.is_file()}==set(expected)
           system={'advapi32.dll','bcrypt.dll','comctl32.dll','comdlg32.dll','dbghelp.dll','dwmapi.dll','gdi32.dll',
                   'imm32.dll','iphlpapi.dll','kernel32.dll','msvcrt.dll','ntdll.dll','ole32.dll','oleaut32.dll',
                   'opengl32.dll','secur32.dll','setupapi.dll','shell32.dll','shlwapi.dll','ucrtbase.dll','user32.dll',
                   'userenv.dll','version.dll','winmm.dll','wldap32.dll','ws2_32.dll','xinput1_3.dll'}
-          result={}
+          result={};remaining_paths=[]
           for relative,(machine,magic) in expected.items():
-              path=root/'pe'/relative;data=path.read_bytes();assert data[:2]==b'MZ'
+              path=root/'pe'/relative;raw=path.read_bytes();before=pe_snapshot(raw)
+              raw_text=subprocess.check_output([tool,'--coff-imports','--coff-exports','--sections',str(path)],text=True)
+              prefixes=(str(root),str(pathlib.Path.cwd()),str(pathlib.Path.home()))
+              raw_paths=path_findings(raw,before,prefixes)
+              print(json.dumps({'file':relative,'phase':'before-debug-strip','sha256':hashlib.sha256(raw).hexdigest(),
+                  'bytes':len(raw),'pathFindings':raw_paths},indent=2),flush=True)
+              preserved=root/'raw-pe'/relative;preserved.parent.mkdir(parents=True,exist_ok=True)
+              assert not preserved.exists();shutil.copy2(path,preserved)
+              stripped=root/'stripped-pe'/relative;stripped.parent.mkdir(parents=True,exist_ok=True);assert not stripped.exists()
+              subprocess.run([strip,'--strip-debug','-o',str(stripped),str(path)],check=True)
+              data=stripped.read_bytes();after=pe_snapshot(data)
+              stripped_paths=path_findings(data,after,prefixes)
+              print(json.dumps({'file':relative,'phase':'after-debug-strip','sha256':hashlib.sha256(data).hexdigest(),
+                  'bytes':len(data),'pathFindings':stripped_paths},indent=2),flush=True)
+              assert_debug_only(before,after)
+              text=subprocess.check_output([tool,'--coff-imports','--coff-exports','--sections',str(stripped)],text=True)
+              assert abi_records(raw_text)==abi_records(text),'Strip changed exact exports/imports or their ABI metadata'
+              assert path.read_bytes()==raw and preserved.read_bytes()==raw,'Raw source build changed during audit'
+              if stripped_paths:remaining_paths.append(relative)
+              shutil.copy2(stripped,path)
+              assert path.read_bytes()==data,'Final DLL differs from audited debug-stripped bytes'
+              assert data[:2]==b'MZ'
               at=struct.unpack_from('<I',data,0x3c)[0];assert data[at:at+4]==b'PE\0\0'
               actual_machine,sections,stamp,ptr,count,optional_size,characteristics=struct.unpack_from('<HHIIIHH',data,at+4)
               assert actual_machine==machine and characteristics&0x2000 and struct.unpack_from('<H',data,at+24)[0]==magic
               assert stamp==0,'Link must retain --no-insert-timestamp'
               assert b'Wine builtin DLL' not in data[:4096] and b'Wine placeholder DLL' not in data[:4096]
-              for prefix in (str(root).encode(),str(pathlib.Path.cwd()).encode(),str(pathlib.Path.home()).encode()):
-                  assert prefix not in data,(relative,'Current runner build path embedded')
-              text=subprocess.check_output([tool,'--coff-imports','--coff-exports','--sections',str(path)],text=True)
               exports=set(re.findall(r'Export\s*\{[^}]*?\bName:\s*(\S+)',text,re.S))
               assert len(exports)>=1000 and {'SteamAPI_Init','SteamAPI_RunCallbacks','SteamInternal_CreateInterface'}<=exports,(relative,len(exports))
               imports=[]
@@ -440,7 +527,10 @@ jobs:
               assert imports
               assert not re.search(r'^\s*Name:\s+\.debug_',text,re.M),'Frozen release symbols=Off must be retained'
               result[relative]={'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),'machine':hex(machine),
-                  'coffTimestamp':stamp,'exports':sorted(exports),'imports':imports,'noPostBuildStripPerformed':True}
+                  'coffTimestamp':stamp,'exports':sorted(exports),'imports':imports,'debugOnlyStripPerformed':True,
+                  'rawSha256':hashlib.sha256(raw).hexdigest(),'rawBytes':len(raw),'rawPathFindings':raw_paths,
+                  'remainingPathFindings':stripped_paths,'codeLoaderDataAndAbiUnchanged':True}
+          assert not remaining_paths,('Current runner build path remains after debug-only stripping; inspect section/context diagnostics',remaining_paths)
           for tree in (root/'gbe',root/'gbe/third-party/common/linux',root/'gbe/third-party/deps/common',root/'premake-core',root/'abseil-cpp'):
               subprocess.run(['git','-C',str(tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
           subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
