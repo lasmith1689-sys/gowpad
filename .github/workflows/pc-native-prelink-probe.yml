@@ -1,0 +1,281 @@
+name: Native Mach-O common-symbol prelink capability
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-native-prelink-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-native-prelink-probe
+  cancel-in-progress: false
+
+jobs:
+  native-prelink-capability:
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - name: "Test installed linkers with a synthetic iPhone common symbol"
+        id: "probe"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re, shutil, struct, subprocess
+
+          def packed_version(text):
+              parts = list(map(int, text.split('.')))
+              assert 1 <= len(parts) <= 3
+              parts += [0] * (3 - len(parts))
+              return (parts[0] << 16) | (parts[1] << 8) | parts[2]
+
+          def inspect_macho(data):
+              assert len(data) >= 32, 'Truncated Mach-O header'
+              magic, cpu, subtype, filetype, count, length, flags, reserved = struct.unpack_from('<8I', data)
+              assert magic == 0xfeedfacf and cpu == 0x0100000c and filetype == 1, 'Expected ARM64 MH_OBJECT'
+              assert 32 + length <= len(data), 'Truncated load commands'
+              sections, symbols, platforms = [], {}, []
+              table = None
+              position = 32
+              for unused in range(count):
+                  assert position + 8 <= 32 + length
+                  command, size = struct.unpack_from('<II', data, position)
+                  assert size >= 8 and position + size <= 32 + length
+                  if command == 0x19:
+                      assert size >= 72
+                      nsects = struct.unpack_from('<I', data, position + 64)[0]
+                      assert 72 + nsects * 80 <= size
+                      for index in range(nsects):
+                          values = struct.unpack_from('<16s16sQQIIIIIIII', data, position + 72 + index * 80)
+                          sections.append({'name': values[0].split(bytes([0]))[0].decode(),
+                                           'segment': values[1].split(bytes([0]))[0].decode(),
+                                           'address': values[2], 'size': values[3], 'flags': values[8]})
+                  elif command == 0x32:
+                      assert size >= 24
+                      platforms.append(struct.unpack_from('<III', data, position + 8))
+                  elif command == 0x25:
+                      assert size == 16
+                      minos, sdk = struct.unpack_from('<II', data, position + 8)
+                      platforms.append((2, minos, sdk))
+                  elif command in (0x24, 0x2f, 0x30):
+                      raise AssertionError('Unexpected non-iPhone platform command')
+                  elif command == 2:
+                      assert size == 24 and table is None
+                      table = struct.unpack_from('<IIII', data, position + 8)
+                  position += size
+              assert position == 32 + length and len(platforms) == 1 and table
+              symoff, nsyms, stroff, strsize = table
+              assert symoff + nsyms * 16 <= len(data) and stroff + strsize <= len(data)
+              strings = data[stroff:stroff + strsize]
+              for index in range(nsyms):
+                  nameoff, kind, section, desc, value = struct.unpack_from('<IBBHQ', data, symoff + index * 16)
+                  assert nameoff < len(strings)
+                  end = strings.find(bytes([0]), nameoff)
+                  assert end >= nameoff
+                  name = strings[nameoff:end].decode()
+                  if not name or kind & 0xe0:
+                      continue
+                  assert name not in symbols, 'Duplicate symbol in synthetic object'
+                  symbols[name] = {'type': kind, 'section': section, 'description': desc, 'value': value}
+              platform, minos, sdk = platforms[0]
+              return {'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data), 'platform': platform,
+                      'minos': minos, 'sdk': sdk, 'sections': sections, 'symbols': symbols}
+
+          def parse_nm(text):
+              symbols = {}
+              for line in text.splitlines():
+                  match = re.fullmatch(r'(\S+) ([A-Za-z?\-]) ([0-9a-f]*) +([0-9a-f]+)', line)
+                  assert match and match[1] not in symbols and match[2] != '?', 'Unparsed/unknown native nm symbol: ' + line
+                  symbols[match[1]] = {'type': match[2], 'value': int(match[3] or '0', 16), 'size': int(match[4], 16)}
+              return symbols
+
+          def validate_semantics(info, nm_symbols, mode, sdk_version):
+              assert info['platform'] == 2
+              assert info['minos'] == 0x110000
+              assert info['sdk'] == packed_version(sdk_version)
+              symbols = info['symbols']
+              fn, var = symbols['_common_fn'], symbols['_common_symbol']
+              assert fn['type'] & 0x0e == 0x0e and fn['section'] > 0
+              assert nm_symbols['_common_fn']['type'] == 'T'
+              actual_exports = {name for name, row in symbols.items() if row['type'] & 1 and not row['type'] & 0x10}
+              expected_exports = {'_common_fn'} if mode == 'final' else {'_common_fn', '_common_symbol'}
+              assert actual_exports == expected_exports
+              assert not any(row['type'] & 0x0e == 0 and row['value'] == 0 for row in symbols.values()), 'Unexpected unresolved symbol'
+              if mode == 'input':
+                  assert var['type'] & 0x0e == 0 and var['value'] == 4 and var['section'] == 0
+                  assert nm_symbols['_common_symbol']['type'] == 'C'
+                  assert sum(row['type'] == 'C' for row in nm_symbols.values()) == 1
+              else:
+                  assert not any(symbol['type'] == 'C' for symbol in nm_symbols.values())
+                  assert var['type'] & 0x0e == 0x0e and 0 < var['section'] <= len(info['sections'])
+                  section = info['sections'][var['section'] - 1]
+                  assert section['size'] == 4 and section['flags'] & 0xff == 1
+                  assert var['value'] == section['address']
+                  if mode == 'final':
+                      assert not var['type'] & 1
+                      assert nm_symbols['_common_symbol']['type'] in ('b', 's', 'd')
+                  else:
+                      assert nm_symbols['_common_symbol']['type'] in ('B', 'S', 'D')
+
+          root = pathlib.Path('.work/native-prelink-capability').resolve()
+          root.mkdir(parents=True, exist_ok=False)
+          record = {'commands': [], 'results': [], 'unavailableCandidates': [], 'passedCandidates': [],
+                    'targetOutputExecuted': False, 'sdkExported': False, 'toolsInstalled': False}
+          record['scope'] = 'synthetic installed-linker capability only; no media or app build'
+          record['primarySemantics'] = {
+              'url': 'https://github.com/apple-oss-distributions/ld64/blob/main/doc/man/man1/ld-classic.1',
+              'gitBlob': '257ffde35eacb8914648618acc357a88aa948270',
+              'commonDefinitionLines': [410, 416], 'classicSelector': '-ld_classic',
+          }
+
+          def command(arguments, check=True, input_text=None):
+              arguments = list(map(str, arguments))
+              assert pathlib.Path(arguments[0]).name in {'uname', 'xcodebuild', 'xcode-select', 'xcrun', 'clang', 'ld', 'ld-classic', 'ld64', 'llvm-nm', 'ld64.lld'}, 'Only native build/inspection tools may execute'
+              try:
+                  result = subprocess.run(arguments, capture_output=True, text=True, input=input_text, timeout=20)
+              except subprocess.TimeoutExpired as error:
+                  def decode(value):
+                      return value.decode(errors='replace') if isinstance(value, bytes) else (value or '')
+                  result = subprocess.CompletedProcess(arguments, 124, decode(error.stdout), decode(error.stderr) + '\nNative tool timed out after 20 seconds')
+              row = {'arguments': arguments, 'returncode': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+              if input_text is not None:
+                  row['stdinSha256'] = hashlib.sha256(input_text.encode()).hexdigest()
+              record['commands'].append(row)
+              if check:
+                  assert result.returncode == 0, json.dumps(row)
+              return row
+
+          def out(*args):
+              return command(args)['stdout'].strip()
+
+          try:
+              assert out('uname', '-m') == 'arm64'
+              record['xcode'] = out('xcodebuild', '-version')
+              record['developerDirectory'] = out('xcode-select', '-p')
+              sdk = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-path')
+              sdk_version = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-version')
+              assert packed_version(sdk_version) >= packed_version('26.0') and pathlib.Path(sdk).is_dir()
+              clang = pathlib.Path(out('xcrun', '--sdk', 'iphoneos', '--find', 'clang'))
+              apple_ld = pathlib.Path(out('xcrun', '--sdk', 'iphoneos', '--find', 'ld'))
+              assert clang.is_absolute() and clang.is_file() and apple_ld.is_absolute() and apple_ld.is_file()
+              record['tools'] = {'clang': str(clang), 'ld': str(apple_ld), 'sdk': sdk, 'sdkVersion': sdk_version,
+                                 'clangSha256': hashlib.sha256(clang.read_bytes()).hexdigest(),
+                                 'ldSha256': hashlib.sha256(apple_ld.read_bytes()).hexdigest()}
+              record['clangVersion'] = command([clang, '--version'])
+              candidates = [('apple-default', [str(apple_ld)]),
+                            ('apple-classic-selector', [str(apple_ld), '-ld_classic'])]
+              for directory in sorted({clang.parent, apple_ld.parent}):
+                  for name in ('ld-classic', 'ld64'):
+                      path = directory / name
+                      if path.is_file():
+                          candidates.append(('apple-direct-' + name, [str(path)]))
+                      else:
+                          record['unavailableCandidates'].append({'path': str(path), 'reason': 'not present in selected Xcode toolchain'})
+              nm_paths = []
+              for prefix in ('/opt/homebrew/opt', '/usr/local/opt'):
+                  for major in ('22', '21', '20'):
+                      nm_paths.append(pathlib.Path(prefix) / ('llvm@' + major) / 'bin/llvm-nm')
+                  nm_paths.append(pathlib.Path(prefix) / 'llvm/bin/llvm-nm')
+              if shutil.which('llvm-nm'):
+                  nm_paths.append(pathlib.Path(shutil.which('llvm-nm')))
+              xcode_nm = command(['xcrun', '--sdk', 'iphoneos', '--find', 'llvm-nm'], check=False)
+              if xcode_nm['returncode'] == 0:
+                  nm_paths.append(pathlib.Path(xcode_nm['stdout'].strip()))
+              inspectors = []
+              seen = set()
+              for path in nm_paths:
+                  if not path.is_absolute() or not path.is_file() or path.resolve() in seen:
+                      continue
+                  seen.add(path.resolve())
+                  version = command([path, '--version'], check=False)
+                  match = re.search(r'\b(?:LLVM version|version)\s+(\d+)\.', version['stdout'] + version['stderr'])
+                  version_major = int(match[1]) if match else 0
+                  if version['returncode'] == 0 and version_major in (20, 21, 22):
+                      inspectors.append((version_major, path, version))
+              inspectors.sort(key=lambda row: -row[0])
+              # These are presence probes only. No package manager or tool download.
+              lld_paths = [pathlib.Path('/opt/homebrew/opt/llvm@22/bin/ld64.lld')]
+              lld_paths += [row[1].parent / 'ld64.lld' for row in inspectors]
+              seen = set()
+              for path in lld_paths:
+                  if not path.is_file():
+                      record['unavailableCandidates'].append({'path': str(path), 'reason': 'not installed'})
+                  elif path.resolve() not in seen:
+                      seen.add(path.resolve())
+                      candidates.append(('installed-lld-' + str(len(seen)), [str(path)]))
+              record['candidateInventory'] = []
+              for name, prefix in candidates:
+                  is_lld = pathlib.Path(prefix[0]).name == 'ld64.lld'
+                  record['candidateInventory'].append({
+                      'name': name, 'command': prefix,
+                      'sha256': hashlib.sha256(pathlib.Path(prefix[0]).read_bytes()).hexdigest(),
+                      'version': command(prefix + ['--version' if is_lld else '-v'], check=False),
+                      'help': command(prefix + ['--help' if is_lld else '-help'], check=False),
+                  })
+              record['inspectionAvailability'] = [{'path': str(row[1]), 'major': row[0], 'version': row[2]} for row in inspectors]
+              assert inspectors, 'No installed LLVM 20/21/22 llvm-nm; no install was attempted'
+              unused, nm, nm_version = inspectors[0]
+              record['inspector'] = {'path': str(nm), 'version': nm_version,
+                                     'sha256': hashlib.sha256(nm.read_bytes()).hexdigest()}
+              source = 'int common_symbol; int common_fn(void){return common_symbol;}\n'
+              input_object = root / 'common-input.o'
+              record['compile'] = command([clang, '-target', 'arm64-apple-ios17.0', '-isysroot', sdk,
+                                           '-fcommon', '-g0', '-fno-stack-protector', '-x', 'c', '-', '-c', '-o', input_object], input_text=source)
+              def inspect(path):
+                  result = command([nm, '--format=posix', '--no-demangle', '--debug-syms', '--no-sort', path])
+                  assert not result['stderr'], 'Native nm diagnostic requires review'
+                  return inspect_macho(path.read_bytes()), parse_nm(result['stdout'])
+              input_info, input_symbols = inspect(input_object)
+              validate_semantics(input_info, input_symbols, 'input', sdk_version)
+              record['inputObject'] = {'macho': input_info, 'nm': input_symbols, 'sourceSha256': hashlib.sha256(source.encode()).hexdigest()}
+              for name, prefix in candidates:
+                  directory = root / name
+                  directory.mkdir()
+                  first, final = directory / 'prelinked.o', directory / 'final.o'
+                  row = {'name': name, 'command': prefix, 'status': 'started'}
+                  record['results'].append(row)
+                  try:
+                      first_args = ['-r', '-d', '-arch', 'arm64', '-platform_version', 'ios', '17.0', sdk_version,
+                                    '-syslibroot', sdk, '-u', '_common_fn', '-o', str(first), str(input_object)]
+                      row['firstLink'] = command(prefix + first_args, check=False)
+                      assert row['firstLink']['returncode'] == 0, 'First -r -d link failed'
+                      first_info, first_symbols = inspect(first)
+                      validate_semantics(first_info, first_symbols, 'first', sdk_version)
+                      row['firstObject'] = {'macho': first_info, 'nm': first_symbols}
+                      second_args = ['-r', '-S', '-arch', 'arm64', '-platform_version', 'ios', '17.0', sdk_version,
+                                     '-syslibroot', sdk, '-exported_symbol', '_common_fn', '-o', str(final), str(first)]
+                      row['visibilityLink'] = command(prefix + second_args, check=False)
+                      assert row['visibilityLink']['returncode'] == 0, 'Second visibility link failed'
+                      final_info, final_symbols = inspect(final)
+                      validate_semantics(final_info, final_symbols, 'final', sdk_version)
+                      row['finalObject'] = {'macho': final_info, 'nm': final_symbols}
+                      assert hashlib.sha256(input_object.read_bytes()).hexdigest() == input_info['sha256']
+                      assert hashlib.sha256(first.read_bytes()).hexdigest() == first_info['sha256']
+                      row['status'] = 'passed'
+                      record['passedCandidates'].append(name)
+                  except Exception as error:
+                      row.update(status='failed', error=str(error))
+              assert record['passedCandidates'], 'No installed candidate preserved -r -d and the visibility pass'
+              record['status'] = 'passed'
+          except Exception as error:
+              record.update(status='failed', error=str(error))
+              raise
+          finally:
+              (root / 'capability-results.json').write_text(json.dumps(record, indent=2))
+              print(json.dumps(record, indent=2))
+          PY
+      - name: "Record capability boundary and next action"
+        if: "${{ always() }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Native installed-linker capability probe: ${{ steps.probe.outcome }}.' \
+            'Synthetic ARM64 iPhone object only; explicit COMMON input, allocation and second-pass privacy/export checks.' \
+            'Selected Xcode SDK was used in place. No target object executed; no tool installation, account, signing, media build or SDK export.' \
+            'Next: inspect per-candidate diagnostics before selecting a proven linker for the media recipe. Continue in the current thread; no new thread required.' >> "$GITHUB_STEP_SUMMARY"
