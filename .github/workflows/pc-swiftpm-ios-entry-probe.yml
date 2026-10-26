@@ -100,13 +100,22 @@ jobs:
         env.update(DEVELOPER_DIR=t['developer'],TMPDIR=str(root/'tmp'),LC_ALL='C',PLAYPORT_VARIANT='release')
         env['PATH']=t['llvm']+os.pathsep+env.get('PATH','');swift=t['swift'];release=root/'fixtures/RootPackage';commands=[]
         def run(args,check=True):
-            args=list(map(str,args));log=root/('command-'+str(len(commands)).zfill(2)+'.log')
+            args=list(map(str,args));stem='command-'+str(len(commands)).zfill(2)
+            stdout_log=root/(stem+'.stdout.log');stderr_log=root/(stem+'.stderr.log')
             print('COMMAND',json.dumps(args),flush=True)
-            with log.open('w') as output:result=subprocess.run(args,cwd=root/'work',env=env,stdout=output,stderr=subprocess.STDOUT)
-            text=log.read_text();print(text,flush=True)
-            commands.append({'arguments':args,'returncode':result.returncode,'log':log.name,'sha256':hashlib.sha256(log.read_bytes()).hexdigest()})
+            with stdout_log.open('w') as output,stderr_log.open('w') as errors:
+                result=subprocess.run(args,cwd=root/'work',env=env,stdout=output,stderr=errors)
+            stdout=stdout_log.read_text();stderr=stderr_log.read_text()
+            print('STDOUT',stdout,'STDERR',stderr,flush=True)
+            commands.append({'arguments':args,'returncode':result.returncode,
+                'stdoutLog':stdout_log.name,'stdoutSha256':hashlib.sha256(stdout_log.read_bytes()).hexdigest(),
+                'stderrLog':stderr_log.name,'stderrSha256':hashlib.sha256(stderr_log.read_bytes()).hexdigest()})
             if check:assert result.returncode==0,'Exact CLI command failed: '+json.dumps(args)
-            return result.returncode,text
+            return result.returncode,stdout,stderr
+        def parse_bin_path(stdout,scratch):
+            path=pathlib.Path(stdout.strip()).resolve(strict=True)
+            assert path.is_relative_to(scratch.resolve(strict=True))
+            return path
         def package_args(path):
             return [swift,'package','--configuration','release','--build-system','native','--swift-sdk','arm64-apple-ios',
                 '--package-path',str(path),'--cache-path',str(root/'work/swiftpm-cache'),'--config-path',str(root/'work/swiftpm-config'),
@@ -119,7 +128,7 @@ jobs:
             assert path.is_relative_to(root/'fixtures') and path.is_dir()
             if identity in paths:assert paths[identity]==str(path);return
             paths[identity]=str(path)
-            _,text=run(package_args(path)+['-q','describe','--type','json'])
+            _,text,_=run(package_args(path)+['-q','describe','--type','json'])
             descriptions[identity]=json.loads(text[text.index('{'):])
             for child in row.get('dependencies',[]):visit(child)
         visit(dependencies)
@@ -133,13 +142,13 @@ jobs:
             args+=['-Xswiftc','-debug-prefix-map','-Xswiftc',original+'='+replacement,'-Xswiftc','-file-prefix-map','-Xswiftc',original+'='+replacement,
                 '-Xcc','-ffile-prefix-map='+original+'='+replacement,'-Xcc','-fdebug-prefix-map='+original+'='+replacement]
         # First test production sequence unchanged: only the library root was resolved.
-        status,text=run(args,check=False);needed=False
+        status,stdout,stderr=run(args,check=False);text=stdout+stderr;needed=False
         if status:
             assert ('automatic dependency resolution is disabled' in text and ('resolved file is required' in text or 'out-of-date resolved file' in text)),text
             needed=True
             run(package_args(root/'work/builder')+['resolve'])
             run(args)
-        _,output=run(args+['--show-bin-path']);bin_dir=pathlib.Path(output.strip()).resolve(strict=True)
+        _,output,_=run(args+['--show-bin-path']);bin_dir=parse_bin_path(output,root/'work/scratch')
         assert bin_dir.is_relative_to(root/'work/scratch')
         (root/'build-result.json').write_text(json.dumps({'commands':commands,'graph':dependencies,'descriptions':descriptions,
             'binDirectory':str(bin_dir),'buildCommand':args,'productionSequencePassedWithoutBuilderResolve':not needed,
