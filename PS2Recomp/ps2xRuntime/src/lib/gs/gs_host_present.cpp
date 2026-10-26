@@ -180,12 +180,21 @@ void main()
             DrawText(line, 6, fontSize + 9, fontSize, Color{160, 220, 255, 255});
         }
         // third line: the GOW_GL_AB test's GL milliseconds per frame for each setting (sample windows in brackets)
+        int row = 2;
         const std::string ab = ps2_perf::getAbLine();
         if (!ab.empty())
         {
-            const int y = 2 * (fontSize + 6);
+            const int y = row++ * (fontSize + 6);
             DrawRectangle(0, y, MeasureText(ab.c_str(), fontSize) + 12, fontSize + 6, Color{0, 0, 0, 170});
             DrawText(ab.c_str(), 6, y + 3, fontSize, Color{170, 255, 170, 255});
+        }
+        // the hitch line: the longest game frame and the worst GL-thread event of the last 30 s (ps2_perf.h)
+        const std::string hitch = ps2_perf::hitchLine();
+        if (!hitch.empty())
+        {
+            const int y = row * (fontSize + 6);
+            DrawRectangle(0, y, MeasureText(hitch.c_str(), fontSize) + 12, fontSize + 6, Color{0, 0, 0, 170});
+            DrawText(hitch.c_str(), 6, y + 3, fontSize, Color{255, 170, 170, 255});
         }
     }
 #endif

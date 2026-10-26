@@ -359,8 +359,21 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
             {
                 if (!on)
                     return;
-                s_glTiming.nanos[index] += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+                const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+                s_glTiming.nanos[index] += spent;
                 ++s_glTiming.count[index];
+                // one op over 25 ms stalls the frame: on the readout's hitch line (a draw inside it may name the cause)
+                if (spent > 25000000)
+                {
+                    static const char *const names[GlOpTiming::kOps] = {"mxcsr", "submit", "clut", "begintx", "upload", "texflush", "wvram", "sync",
+                                                                         "present", "state", "verts", "vrun", "call", "pad", "?", "?"};
+                    char note[200];
+                    std::snprintf(note, sizeof(note), "%.0f ms in %s%s%s", spent * 1e-6, names[index],
+                                  ps2_perf::slowDrawDetail.empty() ? "" : ": ", ps2_perf::slowDrawDetail.c_str());
+                    ps2_perf::noteHitch(spent * 1e-6, note);
+                    std::fprintf(stderr, "[gs-hitch] %s\n", note);
+                }
+                ps2_perf::slowDrawDetail.clear();
             }
         } opTimer{timed, std::min<size_t>(static_cast<size_t>(op), GlOpTiming::kOps - 1u),
                   timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};

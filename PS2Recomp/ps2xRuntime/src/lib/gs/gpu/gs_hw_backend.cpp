@@ -2521,8 +2521,20 @@ void main()
         const auto drawStart = std::chrono::steady_clock::now();
         cpuTiming.vertices += pending.size();
         ++cpuTiming.draws;
+        const uint64_t decodesBefore = decodes, selfCopiesBefore = stats.selfCopies;
+        drawFirstProgram = false;
         draw(pendingState, pending);
-        cpuTiming.drawNanos += nanosSince(drawStart);
+        const uint64_t spent = nanosSince(drawStart);
+        cpuTiming.drawNanos += spent;
+        // GOW-Port: a draw over 10 ms says what it did, for the readout's hitch line (gs_threaded_backend op timer)
+        if (spent > 10000000u)
+        {
+            char detail[160];
+            std::snprintf(detail, sizeof(detail), "draw %.0f ms, %zu verts%s%s%s", spent * 1e-6, pending.size(),
+                          drawFirstProgram ? ", first use of a shader" : "", decodes > decodesBefore ? ", texture decode" : "",
+                          stats.selfCopies > selfCopiesBefore ? ", target copy" : "");
+            ps2_perf::slowDrawDetail = detail;
+        }
         pending.clear();
         reportCpu();
     }
@@ -2710,6 +2722,8 @@ void main()
         void *worker = nullptr;
     } async;
     bool asyncVariants = false;
+    std::unordered_set<GLuint> usedPrograms; // draw programs drawn with so far (hitch readout)
+    bool drawFirstProgram = false;           // the current draw used one for the first time
 
     void startAsyncVariants()
     {
@@ -2917,6 +2931,8 @@ void main()
         // (GOW_GL_AB setting 2: the uber program only)
         const bool specialize = specializeDraws && ps2_perf::abConfig.load(std::memory_order_relaxed) != 2;
         DrawVariant &v = drawVariantFor(specialize ? drawVariantKey(dualSource) : kUberVariant);
+        if (usedPrograms.insert(v.program).second)
+            drawFirstProgram = true; // (Apple's GL builds its Metal pipeline at a program's first draws)
         g.UseProgram(v.program);
         for (int i = 0; i < kDrawUniforms; ++i)
         {

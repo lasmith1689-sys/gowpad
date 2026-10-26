@@ -77,6 +77,58 @@ namespace ps2_perf
         return latest.glLine;
     }
 
+    // GOW-Port: hitch readout (iOS, on screen): the longest game frame and the worst single GS GL-thread event of the
+    // last 30 s, each kept for 30 s so a screenshot taken after a stutter still shows it
+    struct Hitch
+    {
+        std::mutex mutex;
+        double frameMs = 0.0, noteMs = 0.0;
+        std::string note;
+        std::chrono::steady_clock::time_point frameAt{}, noteAt{};
+    };
+    inline Hitch hitch;
+    inline std::atomic<uint32_t> longestFlipGapUs{0}; // this window's longest gap between game frames (guestEntry)
+    // GS GL thread: what a slow draw inside the current queued op did (first use of a program, texture decodes...),
+    // attached to that op's hitch note and cleared after it
+    inline thread_local std::string slowDrawDetail;
+    inline void noteHitch(double ms, std::string text)
+    {
+        std::lock_guard<std::mutex> lock(hitch.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (ms > hitch.noteMs || now - hitch.noteAt > std::chrono::seconds(30))
+        {
+            hitch.noteMs = ms;
+            hitch.note = std::move(text);
+            hitch.noteAt = now;
+        }
+    }
+    inline void noteLongFrame(double ms)
+    {
+        std::lock_guard<std::mutex> lock(hitch.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (ms > hitch.frameMs || now - hitch.frameAt > std::chrono::seconds(30))
+        {
+            hitch.frameMs = ms;
+            hitch.frameAt = now;
+        }
+    }
+    inline std::string hitchLine()
+    {
+        std::lock_guard<std::mutex> lock(hitch.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (hitch.frameMs <= 0.0 && hitch.note.empty())
+            return {};
+        char text[256];
+        const double frameAgo = std::chrono::duration<double>(now - hitch.frameAt).count();
+        const double noteAgo = std::chrono::duration<double>(now - hitch.noteAt).count();
+        if (hitch.note.empty() || noteAgo > 30.0)
+            std::snprintf(text, sizeof(text), "longest frame %.0f ms (%.0f s ago) | no GL hitch > 25 ms in 30 s", hitch.frameMs, frameAgo);
+        else
+            std::snprintf(text, sizeof(text), "longest frame %.0f ms (%.0f s ago) | GL hitch %s (%.0f s ago)", hitch.frameMs, frameAgo,
+                          hitch.note.c_str(), noteAgo);
+        return text;
+    }
+
     // GOW-Port: GOW_GL_AB=1 (iOS default in this test build): the GS renderer's GL thread cycles through candidate
     // settings, one per 5 s report window, and measures its busy time per presented frame under each (gs_threaded_backend
     // report). Every setting draws the same picture. -1 = off; 0 as shipped, 1 GL state cache, 2 uber program only,
@@ -175,6 +227,20 @@ namespace ps2_perf
         }();
         // Solo entradas a la función elegida: las reanudaciones no cuentan como cuadros nuevos.
         if (framePc == 0u || pc != framePc) return;
+        {
+            // the gap since the previous game frame (only this thread runs guest code), largest per report window
+            static uint64_t lastFlip = 0;
+            const uint64_t now = nowNanos();
+            if (lastFlip)
+            {
+                const uint32_t gapUs = static_cast<uint32_t>(std::min<uint64_t>((now - lastFlip) / 1000u, 0xFFFFFFFFu));
+                uint32_t seen = longestFlipGapUs.load(std::memory_order_relaxed);
+                while (gapUs > seen && !longestFlipGapUs.compare_exchange_weak(seen, gapUs, std::memory_order_relaxed))
+                {
+                }
+            }
+            lastFlip = now;
+        }
         if (frames) guestFlips.fetch_add(1, std::memory_order_relaxed);
         if (speed && rdram) gameSpeedFrame(rdram);
     }
@@ -200,6 +266,7 @@ namespace ps2_perf
         std::fprintf(stderr, "[gow-perf] t=%.2f window=%.2f ee_ms=%.2f vu_ms=%.2f gs_ms=%.2f iop_ms=%.2f guest_wait_ms=%.2f upload_ms=%.2f host_wait_ms=%.2f guest_flip_hz=%.2f host_hz=%.2f gsq_wait_ms=%.2f\n",
             (now - first) * 1e-9, seconds, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6],
             (flips - previousFlips) / seconds, (frames - previousFrames) / seconds, ms[7]);
+        noteLongFrame(longestFlipGapUs.exchange(0u, std::memory_order_relaxed) * 1e-3);
         latest.guestHz.store(static_cast<float>((flips - previousFlips) / seconds), std::memory_order_relaxed);
         latest.hostHz.store(static_cast<float>((frames - previousFrames) / seconds), std::memory_order_relaxed);
         for (size_t i = 0; i < bucketCount; ++i)
