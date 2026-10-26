@@ -132,7 +132,7 @@ jobs:
         run('compile-dedicated-uikit-eagl-worker',[tools['clang'],*flags,'-fobjc-arc','-fblocks','-c',root/'cod_gl_ios.m','-o',root/'cod_gl_ios.o'])\n\
         dylib=root/'libCodNativeGLIOS.dylib'\nrun('link-whole-library-and-surface',[tools['clang'],'-target','arm64-apple-ios26.0','-isysroot',sdk,\n\
         \  '-dynamiclib',root/'cod_gl_ios.o',root/'cod_gl_dispatch.o',root/'cod_gl4es_execute.o','-Wl,-force_load,'+str(archive),\n\
-        \  '-framework','UIKit','-framework','QuartzCore','-framework','OpenGLES','-framework','Foundation','-framework','CoreFoundation',\n\
+        \  '-framework','UIKit','-framework','QuartzCore','-framework','CoreGraphics','-framework','OpenGLES','-framework','Foundation','-framework','CoreFoundation',\n\
         \  '-Wl,-no_adhoc_codesign','-install_name','@rpath/libCodNativeGLIOS.dylib','-o',dylib])\nrun('upstream-tracked-files-unchanged',['git','-C',source,'diff','--exit-code'])\n\
         print(json.dumps({'archiveBytes':archive.stat().st_size,'archiveSha256':hashlib.sha256(archive.read_bytes()).hexdigest(),\n\
         \  'dylibBytes':dylib.stat().st_size,'dylibSha256':hashlib.sha256(dylib.read_bytes()).hexdigest()},indent=2))\n\
@@ -203,9 +203,9 @@ jobs:
         \ at==len(data),('Archive end mismatch',at,len(data))\nassert actual_members==expected_members,('Exact production\
         \ member mismatch',actual_members,expected_members)\nmetadata=macho(dylib.read_bytes(),6)\nassert metadata['installIds']==['@rpath/libCodNativeGLIOS.dylib']\
         \ and not metadata['rpaths'] and not metadata['signaturePresent']\nallowed={'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/QuartzCore.framework/QuartzCore',\n\
-        \  '/System/Library/Frameworks/OpenGLES.framework/OpenGLES','/System/Library/Frameworks/Foundation.framework/Foundation',\n\
+        \  '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics',\n  '/System/Library/Frameworks/OpenGLES.framework/OpenGLES','/System/Library/Frameworks/Foundation.framework/Foundation',\n\
         \  '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation',\n  '/usr/lib/libobjc.A.dylib','/usr/lib/libSystem.B.dylib'}\n\
-        assert set(metadata['loads'])<=allowed and {'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/OpenGLES.framework/OpenGLES'}<=set(metadata['loads']),metadata\n\
+        assert set(metadata['loads'])<=allowed and {'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/OpenGLES.framework/OpenGLES','/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics'}<=set(metadata['loads']),metadata\n\
         env=dict(os.environ,DEVELOPER_DIR=plan['developer'])\ndef symbols(label,args):\n    p=subprocess.run([plan['tools']['nm'],*map(str,args)],env=env,capture_output=True,timeout=60)\n\
         \    (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)\n\
         \    assert p.returncode==0,(label,p.stderr.decode(errors='replace'))\n    return set(line.strip() for line\
