@@ -1,0 +1,412 @@
+name: CoD matched native Wine and display source probe
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - codex/pc-games-runtime-probe-20261025
+    paths:
+    - .github/workflows/pc-cod-native-probe.yml
+permissions:
+  contents: read
+concurrency:
+  group: pc-cod-native-probe
+  cancel-in-progress: false
+jobs:
+  cod-native-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+    - name: Check out fixed Playport source
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: playportdev/playport
+        ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+        persist-credentials: false
+        submodules: false
+        path: source
+    - name: Provision host tools and record selected Xcode SDKs
+      shell: bash
+      run: |
+        set -euo pipefail
+        brew install cmake bison flex pkgconf llvm@22 gettext coreutils
+        cd source
+        export TMPDIR="$PWD/.work/cod-native/tmp"
+        mkdir -p "$TMPDIR"
+        mkdir -p .work/cod-native
+        python3 - <<'PY'
+        import json, pathlib, subprocess
+        root = pathlib.Path('.work/cod-native').resolve()
+        def out(*args):
+            return subprocess.check_output(args, text=True).strip()
+        assert out('uname', '-m') == 'arm64', 'This native configure recipe requires the Mac arm64 runner.'
+        sdk = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-path')
+        version = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-version')
+        assert int(version.split('.')[0]) >= 26, version
+        macsdk = out('xcrun', '--sdk', 'macosx', '--show-sdk-path')
+        tools = {name: out('xcrun', '--sdk', 'iphoneos', '--find', name)
+                 for name in ('clang', 'clang++', 'ar', 'ranlib', 'strip', 'ld')}
+        record = {'sdk': sdk, 'sdk_version': version, 'macsdk': macsdk, 'tools': tools,
+                  'native_ld': out('xcrun', '--sdk', 'macosx', '--find', 'ld'),
+                  'llvm': out('brew', '--prefix', 'llvm@22')}
+        (root / 'tools.json').write_text(json.dumps(record, indent=2))
+        print(json.dumps(record, indent=2))
+        subprocess.run(['xcodebuild', '-version'], check=True)
+        subprocess.run(['xcrun', '--sdk', 'macosx', 'clang', '-isysroot', macsdk,
+                        '-fuse-ld=' + record['native_ld'], '-x', 'c', '-', '-o', str(root / 'host-link-probe')],
+                       input='int main(void) { return 0; }\n', text=True, check=True)
+        PY
+        brew list --versions cmake bison flex pkgconf llvm@22 gettext coreutils
+    - name: Fetch matched Madeira and Wine with every ordered patch
+      id: sources
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-native/tmp"
+        mkdir -p "$TMPDIR"
+        python3 - <<'PY'
+        import hashlib, json, pathlib, subprocess
+        repo = pathlib.Path.cwd()
+        root = repo / '.work/cod-native'
+        expected = {
+            'madeira': ('8c050d03f4d89096e1e2e2c8bb44479fffd86619', 'https://github.com/willfaust/Madeira.git'),
+            'wine': ('455e3509b98a6919fd4ad1def4803e08c41c03b2', 'https://gitlab.winehq.org/wine/wine.git'),
+            'wine-port': ('723d1bf5132768276cea9bc35ab59c83557bb5fb', 'https://github.com/willfaust/wine.git'),
+            'wine-valve': ('750fd011356cfcb28125c96d295ddef0d9e66dac', 'https://github.com/ValveSoftware/wine.git'),
+            'freetype': ('VER-2-14-3', 'https://github.com/freetype/freetype.git'),
+        }
+        pins = {p[0]: p[1:3] for line in pathlib.Path('pins.lock').read_text().splitlines()
+                if (p := line.split()) and not line.startswith('#')}
+        for name, value in expected.items():
+            assert pins[name] == list(value), (name, pins[name])
+        assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == '412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+        link = subprocess.check_output(['git', 'ls-tree', 'HEAD', 'upstream/madeira'], text=True).split()
+        assert link[0:3] == ['160000', 'commit', expected['madeira'][0]], link
+        record = {}
+        def prepare(name, url, revision, series):
+            target = root / name
+            subprocess.run(['git', 'init', str(target)], check=True)
+            def git(*args):
+                subprocess.run(['git', '-C', str(target), *args], check=True)
+            git('fetch', '--depth=1', url, revision)
+            git('checkout', '--detach', 'FETCH_HEAD')
+            actual = subprocess.check_output(['git', '-C', str(target), 'rev-parse', 'HEAD'], text=True).strip()
+            assert actual == revision, (name, actual)
+            count = 0
+            record[name] = {'base': actual, 'url': url, 'series': {}}
+            for component, expected_count in series:
+                rows = [line.strip() for line in pathlib.Path('patches', component, 'series').read_text().splitlines()
+                        if line.strip() and not line.startswith('#')]
+                assert len(rows) == expected_count and len(set(rows)) == expected_count, component
+                paths = []
+                hashes = []
+                for entry in rows:
+                    assert pathlib.PurePosixPath(entry).name == entry, entry
+                    path = repo / 'patches' / component / entry
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    print('patch', component, entry, digest, flush=True)
+                    hashes.append([entry, digest])
+                    paths.append(str(path))
+                git('-c', 'user.name=CoD native source probe', '-c', 'user.email=probe@localhost',
+                    'am', '--committer-date-is-author-date', *paths)
+                count += len(paths)
+                record[name]['series'][component] = hashes
+            assert subprocess.check_output(['git', '-C', str(target), 'rev-parse', f'HEAD~{count}'], text=True).strip() == revision
+            git('diff', '--exit-code', '--ignore-submodules=all', 'HEAD')
+            record[name]['patched_head'] = subprocess.check_output(['git', '-C', str(target), 'rev-parse', 'HEAD'], text=True).strip()
+            return target
+        m = prepare('madeira', *expected['madeira'], [('madeira-unix', 143), ('madeira-winios', 5)])
+        w = prepare('wine', *expected['wine'], [('wine-port', 57), ('wine-valve', 132), ('wine-unix', 37)])
+        # The frozen port's relative includes must reach this same Madeira build tree.
+        for path, destination in ((m / 'wine', w), (root / 'build', m / 'build')):
+            if path.exists():
+                assert path.is_dir() and not any(path.iterdir()), path
+                path.rmdir()
+            path.symlink_to(destination, target_is_directory=True)
+        f = m / 'research/freetype'
+        assert not f.exists() or (f.is_dir() and not any(f.iterdir())), f
+        if f.exists():
+            f.rmdir()
+        subprocess.run(['git', 'init', str(f)], check=True)
+        subprocess.run(['git', '-C', str(f), 'fetch', '--depth=1', expected['freetype'][1], 'refs/tags/VER-2-14-3'], check=True)
+        subprocess.run(['git', '-C', str(f), 'checkout', '--detach', 'FETCH_HEAD'], check=True)
+        ft_pin = subprocess.check_output(['git', '-C', str(f), 'rev-parse', 'HEAD'], text=True).strip()
+        assert ft_pin == '0a0221a1347e2f1e07c395263540026e9a0aa7c7', ft_pin
+        record['freetype'] = {'tag': 'VER-2-14-3', 'commit': ft_pin}
+        (root / 'sources.json').write_text(json.dumps(record, indent=2))
+        # Remove known outputs in this isolated clone before any build; never reuse tracked archives.
+        import shutil
+        for relative in ('build/ntdll-unix/obj', 'build/win32u-unix/obj', 'build/wineserver/obj',
+                         'build/gnutls-ios/obj', 'build/freetype-ios/build', 'toolchains/gnutls-ios'):
+            path = m / relative
+            assert path.resolve().is_relative_to(root), path
+            if path.exists():
+                shutil.rmtree(path)
+        for name in ('libntdll_unix.a', 'libwin32u_unix.a', 'libwineserver.a'):
+            path = m / 'app/Madeira' / name
+            path.unlink(missing_ok=True)
+            assert not path.exists(), path
+        print('Matched source trees prepared; tracked runtime archives removed from scratch clone.')
+        PY
+    - name: Fetch only the official checksummed Mac configure toolchain
+      id: toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-native/tmp"
+        mkdir -p "$TMPDIR"
+        root="$PWD/.work/cod-native"
+        mkdir -p "$root/inputs"
+        # Official release API asset 581762292: digest independently read before this workflow was prepared.
+        # https://api.github.com/repos/mstorsjo/llvm-mingw/releases/assets/581762292
+        curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+          -o "$root/inputs/llvm-mingw.tar.xz" \
+          https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz
+        printf '%s  %s\n' 52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3 "$root/inputs/llvm-mingw.tar.xz" | shasum -a 256 -c -
+        tar -xf "$root/inputs/llvm-mingw.tar.xz" -C "$root/inputs"
+        mingw="$root/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+        "$mingw/bin/clang" --version
+        printf 'int configure_probe(void) { return 0; }\n' | \
+          "$mingw/bin/clang" --target=aarch64-windows-gnu -x c - -c -o "$root/configure-probe.obj"
+        "$mingw/bin/llvm-readobj" --file-headers "$root/configure-probe.obj" | grep -q 'Machine: IMAGE_FILE_MACHINE_ARM64 '
+        printf 'Matching 20260922 toolchain verified for configure/header probes. No ARM64EC CRT or production PE/FEX build is claimed.\n'
+    - name: Configure matching Wine and generate actual native header targets
+      id: headers
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-native/tmp"
+        mkdir -p "$TMPDIR"
+        root="$PWD/.work/cod-native"
+        wine="$root/wine"
+        mingw="$root/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+        export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$(brew --prefix gettext)/bin:$PATH"
+        mkdir -p "$wine/build-macos"
+        macsdk="$(xcrun --sdk macosx --show-sdk-path)"
+        macld="$(xcrun --sdk macosx --find ld)"
+        # Pinned Wine configure rejects --without-mingw on aarch64 Darwin. Supply the matched PE compiler.
+        # No all-target make is used: only concrete generated include/*.h targets below are built.
+        (cd "$wine/build-macos" && \
+          CC="xcrun --sdk macosx clang" CXX="xcrun --sdk macosx clang++" \
+          OBJC="xcrun --sdk macosx clang -x objective-c" \
+          AR="$(xcrun --sdk macosx --find ar)" RANLIB="$(xcrun --sdk macosx --find ranlib)" \
+          LDFLAGS="-isysroot $macsdk -fuse-ld=$macld" \
+          ../configure --enable-archs=aarch64 --with-mingw="$mingw/bin/clang" \
+            --without-x --without-freetype --without-gnutls --without-gstreamer --disable-tests) || {
+              tail -n 160 "$wine/build-macos/config.log" || true
+              exit 1
+            }
+        python3 - <<'PY'
+        import hashlib, pathlib, re, subprocess
+        root = pathlib.Path('.work/cod-native').resolve()
+        build = root / 'wine/build-macos'
+        text = (build / 'Makefile').read_text().replace('\\\n', ' ')
+        targets = set()
+        for line in text.splitlines():
+            if line.startswith(('\t', '#')) or ':' not in line:
+                continue
+            for name in line.split(':', 1)[0].split():
+                if re.fullmatch(r'include/[A-Za-z0-9_./-]+\.h', name):
+                    targets.add(name)
+        assert {'include/dwrite.h', 'include/dwrite_3.h', 'include/mfobjects.h', 'include/mftransform.h'} <= targets
+        print('Building', len(targets), 'actual Wine generated-header targets.', flush=True)
+        subprocess.run(['make', '-C', str(build), '-j3', *sorted(targets)], check=True)
+        # Native archive recipes consume the same architecture-independent WIDL headers at this path.
+        (root / 'wine/build-arm64ec').mkdir()
+        (root / 'wine/build-arm64ec/include').symlink_to(build / 'include', target_is_directory=True)
+        config = build / 'include/config.h'
+        s = config.read_text()
+        for macro in ('HAVE_GNUTLS_CIPHER_INIT', 'SONAME_LIBGNUTLS'):
+            assert not re.search(r'^#define\s+' + macro + r'\s+', s, re.M), 'Unexpected host crypto detection: ' + macro
+        # Match unix-gaps.sh static-GnuTLS generated-config additions.
+        s += '\n#define HAVE_GNUTLS_CIPHER_INIT 1\n#define SONAME_LIBGNUTLS "libgnutls.30.dylib"\n'
+        config.write_text(s)
+        print('Generated Wine config SHA256:', hashlib.sha256(config.read_bytes()).hexdigest())
+        (root / 'headers.txt').write_text('\n'.join(sorted(targets)) + '\n')
+        PY
+    - name: Rebuild crypto and FreeType from the pinned source inputs
+      id: libraries
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-native/tmp"
+        mkdir -p "$TMPDIR"
+        root="$PWD/.work/cod-native"
+        m="$root/madeira"
+        export PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix llvm@22)/bin:$PATH"
+        export LC_ALL=C
+        (cd "$m/build/gnutls-ios/src" && sha256sum -c SHA256SUMS)
+        CC="$(xcrun --sdk iphoneos --find clang)" CXX="$(xcrun --sdk iphoneos --find clang++)" \
+          bash "$m/build/freetype-ios/build.sh"
+        bash "$m/build/gnutls-ios/build.sh" || {
+          find "$m/build/gnutls-ios/obj" -name '*.log' -exec tail -n 18 {} \;
+          exit 1
+        }
+        for name in gmp nettle hogweed gnutls; do
+          test -s "$m/toolchains/gnutls-ios/lib/lib$name.a"
+        done
+        test -s "$m/build/freetype-ios/build/libfreetype.a"
+    - name: Reconstruct wineserver base and build all three native archives
+      id: archives
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-native/tmp"
+        mkdir -p "$TMPDIR"
+        root="$PWD/.work/cod-native"
+        m="$root/madeira"
+        export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+        export LC_ALL=C
+        python3 - <<'PY'
+        import pathlib, re, subprocess
+        root = pathlib.Path('.work/cod-native').resolve()
+        m = root / 'madeira'
+        w = root / 'wine'
+        b = m / 'build/wineserver'
+        base = root / 'wineserver-base'
+        base.mkdir()
+        sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
+        # Reconstruct the pristine-source base exactly as the pinned unix-gaps recipe specifies.
+        recipe = pathlib.Path('build/stages/unix-gaps.sh').read_text()
+        match = re.search(r'^UNPATCHED="([^"]+)"', recipe, re.M)
+        assert match, 'Pinned base source list missing'
+        names = match.group(1).split()
+        assert len(names) == 27, names
+        if (w / 'server/alpc.c').is_file():
+            names.insert(0, 'alpc')
+        flags = ['-arch', 'arm64', '-isysroot', sdk, '-miphoneos-version-min=17.0', '-O2']
+        for directory in (w / 'include', w / 'include/wine', w / 'build-macos/include', b, w / 'server', m / 'build/ntdll-unix/shims'):
+            flags += ['-I' + str(directory)]
+        for header in (str(b / 'config_ios.h'), 'stdarg.h', str(b / 'unicode_fix.h'), str(b / 'wineserver_ios_kill.h')):
+            flags += ['-include', header]
+        flags += ['-DBINDIR="/usr/local/bin"', '-DDATADIR="/usr/local/share"',
+                  '-D__WINESRC__', '-DWINE_IOS=1', '-Dmain=wineserver_main', '-Wno-implicit-function-declaration']
+        for name in names:
+            subprocess.run(['xcrun', '--sdk', 'iphoneos', 'clang', *flags,
+                            '-c', str(w / 'server' / (name + '.c')), '-o', str(base / (name + '.o'))], check=True)
+        archive = m / 'app/Madeira/libwineserver.a'
+        assert not archive.exists(), 'Fresh source base must not reuse the tracked app archive'
+        subprocess.run(['xcrun', '--sdk', 'iphoneos', 'ar', 'rcs', str(archive),
+                        *map(str, sorted(base.glob('*.o')))], check=True)
+        print('Reconstructed', len(names), 'source-built wineserver base members.')
+        PY
+        bash "$m/build/wineserver/build.sh"
+        bash "$m/build/ntdll-unix/build.sh" || {
+          find "$m/build/ntdll-unix/obj" -name '*.err' -size +0 -print -exec tail -n 15 {} \;
+          exit 1
+        }
+        bash "$m/build/win32u-unix/build.sh" || {
+          find "$m/build/win32u-unix/obj" -name '*.err' -size +0 -print -exec tail -n 15 {} \;
+          exit 1
+        }
+    - name: Compile same-pin Winios and display shim source with ARC
+      id: display
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-native/tmp"
+        mkdir -p "$TMPDIR"
+        python3 - <<'PY'
+        import pathlib, subprocess
+        root = pathlib.Path('.work/cod-native').resolve()
+        m = root / 'madeira'
+        out = root / 'display'
+        out.mkdir()
+        sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
+        for name, source in {
+            'Winios': m / 'app/Madeira/Winios/Winios.m',
+            'WiniosGamepad': m / 'app/Madeira/Winios/WiniosGamepad.c',
+            'IOSDisplayShim': m / 'app/Madeira/IOSDisplayShim.m',
+        }.items():
+            command = ['xcrun', '--sdk', 'iphoneos', 'clang', '-target', 'arm64-apple-ios26.0',
+                       '-isysroot', sdk, '-O2', '-I' + str(m / 'app/Madeira/Winios'), '-I' + str(m / 'app/Madeira')]
+            if source.suffix == '.m':
+                command += ['-fobjc-arc']
+            subprocess.run(command + ['-c', str(source), '-o', str(out / (name + '.o'))], check=True)
+        print('Same-pin patched Winios and display units compiled; no app was linked.')
+        PY
+    - name: Inspect fresh iOS outputs and report the real symbol inventory
+      id: inspect
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-native/tmp"
+        mkdir -p "$TMPDIR"
+        export PATH="$(brew --prefix llvm@22)/bin:$PATH"
+        python3 - <<'PY'
+        import hashlib, json, pathlib, re, subprocess
+        root = pathlib.Path('.work/cod-native').resolve()
+        m = root / 'madeira'
+        def out(*args):
+            return subprocess.check_output(list(map(str, args)), text=True)
+        files = [m / 'app/Madeira' / name for name in ('libntdll_unix.a', 'libwin32u_unix.a', 'libwineserver.a')]
+        files += [m / 'toolchains/gnutls-ios/lib' / ('lib' + name + '.a') for name in ('gmp', 'nettle', 'hogweed', 'gnutls')]
+        files += [m / 'build/freetype-ios/build/libfreetype.a']
+        files += sorted((root / 'display').glob('*.o'))
+        assert len(files) == 11, files
+        inventory = {}
+        all_defined, all_undefined = set(), set()
+        for path in files:
+            assert path.is_file() and path.stat().st_size > 0, path
+            archs = out('xcrun', 'lipo', '-archs', path).split()
+            assert archs == ['arm64'], (path.name, archs)
+            heads = out('llvm-objdump', '--macho', '--private-headers', path)
+            assert 'ARM64' in heads, path.name
+            # Every Mach-O member must name iOS; archive symbol tables have no load commands.
+            platforms = re.findall(r'\bplatform\s+(\S+)', heads)
+            assert platforms and all(p.lower() in ('ios', '2') for p in platforms), (path.name, platforms)
+            assert 'LC_VERSION_MIN_MACOSX' not in heads, path.name
+            minimums = sorted(set(re.findall(r'\bminos\s+(\S+)', heads)))
+            defined = {s for s in out('llvm-nm', '-g', '--defined-only', '-j', path).splitlines() if s.startswith('_')}
+            undefined = {s for s in out('llvm-nm', '-u', '-j', path).splitlines() if s.startswith('_')}
+            all_defined |= defined
+            all_undefined |= undefined
+            inventory[path.name] = {'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                                    'bytes': path.stat().st_size, 'archs': archs, 'minos': minimums,
+                                    'defined_count': len(defined), 'undefined': sorted(undefined)}
+            print(path.name, json.dumps({k:v for k,v in inventory[path.name].items() if k != 'undefined'}))
+            if path.suffix == '.a':
+                print('Archive member count:', path.name, len(out('llvm-ar', 't', path).splitlines()))
+        required = {
+            'libntdll_unix.a': {'_opengl32_unix_call_funcs', '_opengl32_unix_call_wow64_funcs',
+                               '_winevulkan_unix_call_funcs', '_secur32_unix_call_funcs', '_crypt32_unix_call_funcs'},
+            'libwin32u_unix.a': {'_win32u_unix_lib_init'},
+            'libwineserver.a': {'_wineserver_main', '_ws_shared_session', '_ws_user_shared_data'},
+            'IOSDisplayShim.o': {'_macdrv_functions', '_get_win_data', '_release_win_data',
+                                '_macdrv_view_create_metal_view', '_macdrv_view_get_metal_layer', '_macdrv_view_release_metal_view'},
+            'Winios.o': {'_winios_post_client_pointer', '_winios_post_focus'},
+            'WiniosGamepad.o': {'_winios_gamepad_get_state', '_winios_gamepad_set_state'},
+        }
+        for name, symbols in required.items():
+            path = next(p for p in files if p.name == name)
+            defined = set(out('llvm-nm', '-g', '--defined-only', '-j', path).splitlines())
+            assert symbols <= defined, (name, sorted(symbols - defined))
+            print('Required definitions:', name, ', '.join(sorted(symbols)))
+        assert b'@rpath/MesaEGL.framework/MesaEGL' in (m / 'app/Madeira/libwin32u_unix.a').read_bytes()
+        assert b'@rpath/KosmicKrisp.framework/KosmicKrisp' in (m / 'app/Madeira/libwin32u_unix.a').read_bytes()
+        inventory['remaining_external_symbols'] = sorted(all_undefined - all_defined)
+        (root / 'symbol-inventory.json').write_text(json.dumps(inventory, indent=2))
+        print('Remaining external symbols across these components:', json.dumps(inventory['remaining_external_symbols']))
+        print('Unresolved inventory includes framework/app/DXMT/media hooks; this is not a complete app link or import-resolution claim.')
+        subprocess.run(['git', 'diff', '--exit-code', 'HEAD'], check=True)
+        print('PASS: matched fresh native Wine archives and Winios/display sources built and inspected for iOS arm64.')
+        PY
+    - name: Write source-only milestone result
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        printf '%s\n' \
+          'Matched native component compile gate only; no app link, production PE/FEX build, device execution or gameplay claim.' \
+          'Playport 412de5f8c0bdd26d84e0127eb5776ba992e3b152; Madeira 8c050d03f4d89096e1e2e2c8bb44479fffd86619; Wine 455e3509b98a6919fd4ad1def4803e08c41c03b2; full ordered patch series retained.' \
+          'Matching 20260922 Mac MinGW toolchain is a checksummed configure dependency; no blocked runtime IPA was downloaded.' \
+          'Sources: ${{ steps.sources.outcome }}; toolchain: ${{ steps.toolchain.outcome }}; headers: ${{ steps.headers.outcome }}; libraries: ${{ steps.libraries.outcome }}; archives: ${{ steps.archives.outcome }}; display: ${{ steps.display.outcome }}; inspection: ${{ steps.inspect.outcome }}.' \
+          'No SDK, runtime, source-build cache or artifact uploads; no signing, account or phone inputs.' \
+          'Next step after a pass: matching complete PE/WoW64/FEX assembly and real app bindings in the current thread. No new thread required.' >> "$GITHUB_STEP_SUMMARY"
+
