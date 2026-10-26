@@ -1,0 +1,140 @@
+name: Installed Mac Swift toolchain inventory
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-swift-toolchain-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-swift-toolchain-probe
+  cancel-in-progress: false
+
+jobs:
+  swift-toolchain-inventory:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - name: Inventory public installed Xcodes and Swift toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, platform, plistlib, re, subprocess
+
+          def version_tuple(text):
+              match = re.search(r'\bSwift version\s+(\d+)\.(\d+)(?:\.(\d+))?', text)
+              return tuple(map(int, (match.group(1), match.group(2), match.group(3) or '0'))) if match else None
+
+          def environment(developer, toolchain=None):
+              result = dict(os.environ)
+              for name in ('SDKROOT', 'SDK_NAME', 'SDK_VERSION', 'TOOLCHAINS', 'SWIFT_EXEC',
+                           'IPHONEOS_DEPLOYMENT_TARGET', 'MACOSX_DEPLOYMENT_TARGET'):
+                  result.pop(name, None)
+              if developer:
+                  result['DEVELOPER_DIR'] = str(developer)
+              else:
+                  result.pop('DEVELOPER_DIR', None)
+              if toolchain:
+                  result['TOOLCHAINS'] = toolchain
+              return result
+
+          def command(args, developer, toolchain=None):
+              record = {'args': list(map(str, args)), 'developerDir': str(developer) if developer else None,
+                        'selectedToolchain': toolchain}
+              try:
+                  value = subprocess.run(record['args'], env=environment(developer, toolchain),
+                                         capture_output=True, text=True, timeout=20, check=False)
+                  record.update({'returncode': value.returncode, 'stdout': value.stdout[:6000], 'stderr': value.stderr[:6000]})
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  record.update({'returncode': None, 'errorType': type(error).__name__, 'error': str(error)[:1000]})
+              return record
+
+          def swift_result(result):
+              parsed = version_tuple(result.get('stdout', '') + '\n' + result.get('stderr', ''))
+              return {'version': list(parsed) if parsed else None,
+                      'meetsVersionMinimum6_4': result.get('returncode') == 0 and parsed is not None and parsed[:2] >= (6, 4)}
+
+          xcodes = []
+          for app in sorted(pathlib.Path('/Applications').glob('Xcode*.app')):
+              developer = app / 'Contents/Developer'
+              row = {'application': str(app), 'resolvedApplication': str(app.resolve()), 'developerDir': str(developer)}
+              if not developer.is_dir():
+                  row['error'] = 'Contents/Developer is absent'
+                  xcodes.append(row)
+                  continue
+              row['xcodeVersion'] = command(['/usr/bin/xcodebuild', '-version'], developer)
+              row['swiftPath'] = command(['/usr/bin/xcrun', '--sdk', 'macosx', '--find', 'swiftc'], developer)
+              row['swiftVersion'] = command(['/usr/bin/xcrun', '--sdk', 'macosx', 'swiftc', '--version'], developer)
+              row.update(swift_result(row['swiftVersion']))
+              row['sdks'] = {}
+              for sdk in ('macosx', 'iphoneos'):
+                  row['sdks'][sdk] = {
+                      'version': command(['/usr/bin/xcrun', '--sdk', sdk, '--show-sdk-version'], developer),
+                      'path': command(['/usr/bin/xcrun', '--sdk', sdk, '--show-sdk-path'], developer),
+                  }
+              xcodes.append(row)
+
+          valid_developers = [row['developerDir'] for row in xcodes if 'swiftVersion' in row]
+          current = os.environ.get('DEVELOPER_DIR')
+          baseline = current if current and pathlib.Path(current).is_dir() else (valid_developers[0] if valid_developers else None)
+          public = []
+          for bundle in sorted(pathlib.Path('/Library/Developer/Toolchains').glob('*.xctoolchain')):
+              row = {'bundle': str(bundle), 'resolvedBundle': str(bundle.resolve()), 'metadata': {}}
+              for name in ('Info.plist', 'ToolchainInfo.plist'):
+                  path = bundle / name
+                  if path.is_file():
+                      try:
+                          data = plistlib.loads(path.read_bytes())
+                          row['metadata'][name] = {key: data[key] for key in ('CFBundleIdentifier', 'CFBundleName', 'CFBundleShortVersionString', 'Identifier') if isinstance(data.get(key), str)}
+                      except (OSError, ValueError, plistlib.InvalidFileException) as error:
+                          row['metadata'][name] = {'errorType': type(error).__name__}
+              identifiers = [item.get('CFBundleIdentifier') or item.get('Identifier') for item in row['metadata'].values()]
+              identifier = next((value for value in identifiers if value), None)
+              row['identifier'] = identifier
+              compiler = bundle / 'usr/bin/swiftc'
+              row['compiler'] = str(compiler)
+              if compiler.is_file() and os.access(compiler, os.X_OK):
+                  row['directCompilerVersion'] = command([compiler, '--version'], baseline)
+                  row.update(swift_result(row['directCompilerVersion']))
+              else:
+                  row['error'] = 'Public toolchain has no executable usr/bin/swiftc'
+              row['xcodeSelections'] = []
+              if identifier:
+                  for developer in valid_developers:
+                      found = command(['/usr/bin/xcrun', '--sdk', 'macosx', '--find', 'swiftc'], developer, identifier)
+                      version = command(['/usr/bin/xcrun', '--sdk', 'macosx', 'swiftc', '--version'], developer, identifier)
+                      row['xcodeSelections'].append({'developerDir': developer, 'swiftPath': found, 'swiftVersion': version, **swift_result(version)})
+              public.append(row)
+
+          candidates = []
+          for row in xcodes:
+              if row.get('meetsVersionMinimum6_4'):
+                  candidates.append({'kind': 'xcode-default', 'developerDir': row['developerDir'], 'version': row['version']})
+          for row in public:
+              if row.get('meetsVersionMinimum6_4'):
+                  candidates.append({'kind': 'public-direct-compiler', 'developerDir': baseline,
+                                     'compiler': row['compiler'], 'toolchain': row['identifier'], 'version': row['version']})
+              for selected in row['xcodeSelections']:
+                  if selected.get('meetsVersionMinimum6_4'):
+                      candidates.append({'kind': 'public-toolchain-selection', 'developerDir': selected['developerDir'], 'toolchain': row['identifier'], 'version': selected['version']})
+          record = {'scope': 'installed public compiler and SDK inventory only; no compile, import compatibility, app or device claim',
+                    'machine': platform.machine(), 'runnerImageVersion': os.environ.get('ImageVersion'),
+                    'originalDeveloperDir': current, 'sdkRootRemovedForEveryQuery': True,
+                    'xcodeApplications': xcodes, 'publicSwiftToolchains': public,
+                    'versionMinimumCandidates': candidates}
+          print('SWIFT_TOOLCHAIN_INVENTORY_BEGIN')
+          print(json.dumps(record, indent=2))
+          print('SWIFT_TOOLCHAIN_INVENTORY_END')
+          summary = '\nInstalled public Swift inventory\n\n'
+          summary += 'Xcode bundles: ' + str(len(xcodes)) + '; public toolchains: ' + str(len(public)) + '; compiler candidates meeting Swift 6.4: ' + str(len(candidates)) + '.\n'
+          summary += 'An inventory success is not a compile/import compatibility result. No global developer-directory or toolchain setting changed.\n'
+          summary += 'Next: select an existing qualifying compiler only after reviewing its actual SDK pairing; otherwise assess an official public compiler acquisition route. Continue in the current thread; no new thread required.\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write(summary)
+          PY
