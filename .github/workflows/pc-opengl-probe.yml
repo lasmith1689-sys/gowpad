@@ -1,0 +1,218 @@
+name: PC OpenGL source compile probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-opengl-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-opengl-probe
+  cancel-in-progress: false
+
+jobs:
+  opengl-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out pinned public source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: playportdev/playport
+          ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+          persist-credentials: false
+          submodules: false
+          path: source
+
+      - name: Provision host tools and Python generators
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install bison flex pkgconf llvm ninja
+          cd source
+          mkdir -p .work/opengl
+          python3 -m venv .work/opengl/venv
+          .work/opengl/venv/bin/python -m pip install meson mako pyyaml packaging ply setuptools
+          .work/opengl/venv/bin/python -m pip list --format=freeze
+          .work/opengl/venv/bin/meson --version
+          ninja --version
+          "$(brew --prefix bison)/bin/bison" --version | head -n 1
+          "$(brew --prefix flex)/bin/flex" --version
+          "$(brew --prefix llvm)/bin/llvm-objdump" --version | head -n 1
+          uname -m
+          xcodebuild -version
+
+      - name: Resolve installed Apple SDK and generate cross files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          .work/opengl/venv/bin/python - <<'PY'
+          import json, pathlib, subprocess
+          root = pathlib.Path('.work/opengl').resolve()
+          def out(*args):
+              return subprocess.check_output(args, text=True).strip()
+          sdk = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-path')
+          version = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-version')
+          assert int(version.split('.')[0]) >= 26, version
+          tools = {name: out('xcrun', '--sdk', 'iphoneos', '--find', name)
+                   for name in ('clang', 'clang++', 'ar', 'strip', 'install_name_tool')}
+          for name, path in tools.items():
+              assert pathlib.Path(path).is_file(), (name, path)
+          # Xcode may keep libc++ headers in the toolchain rather than the SDK.
+          candidates = [pathlib.Path(sdk) / 'usr/include/c++/v1',
+                        pathlib.Path(tools['clang++']).resolve().parent.parent / 'include/c++/v1']
+          headers = next((p for p in candidates if (p / 'vector').is_file()), None)
+          assert headers is not None, 'No matching Xcode libc++ vector header: ' + str(candidates)
+          target = ['-target', 'arm64-apple-ios26.0', '-isysroot', sdk]
+          maps = ['-ffile-prefix-map=' + str(root) + '=/opengl-probe',
+                  '-ffile-prefix-map=' + str(pathlib.Path.cwd()) + '=/source',
+                  '-ffile-prefix-map=' + out('xcode-select', '-p') + '=/xcode']
+          c = ['/usr/bin/xcrun', '--sdk', 'iphoneos', 'clang'] + target + maps
+          cpp = ['/usr/bin/xcrun', '--sdk', 'iphoneos', 'clang++'] + target + maps
+          cpp += ['-stdlib=libc++', '-nostdinc++', '-isystem', str(headers)]
+          cross = '[binaries]\n'
+          for key, value in {'c': c, 'cpp': cpp, 'objc': c,
+                             'ar': [tools['ar']], 'strip': [tools['strip']],
+                             'pkg-config': ['false']}.items():
+              cross += key + ' = ' + repr(value) + '\n'
+          cross += '\n[built-in options]\n'
+          for key in ('c_link_args', 'cpp_link_args', 'objc_link_args'):
+              cross += key + ' = ' + repr(target) + '\n'
+          cross += "\n[properties]\nneeds_exe_wrapper = true\n\n[host_machine]\n"
+          cross += "system = 'darwin'\nsubsystem = 'ios'\nkernel = 'xnu'\n"
+          cross += "cpu_family = 'aarch64'\ncpu = 'arm64'\nendian = 'little'\n"
+          (root / 'ios.cross').write_text(cross)
+          # Native generators must link against macOS, with its SDK selected explicitly.
+          native = "[binaries]\nc = ['/usr/bin/xcrun', '--sdk', 'macosx', 'clang']\n"
+          native += "cpp = ['/usr/bin/xcrun', '--sdk', 'macosx', 'clang++']\n"
+          (root / 'host.native').write_text(native)
+          (root / 'apple-tools.json').write_text(json.dumps({'sdk': sdk, 'version': version,
+                                                          'headers': str(headers), 'tools': tools}))
+          print('iPhone SDK:', version, sdk)
+          print('Selected Xcode libc++ headers:', headers)
+          subprocess.run(['/usr/bin/xcrun', '--sdk', 'iphoneos', 'clang', '--version'], check=True)
+          subprocess.run(cpp + ['-x', 'c++', '-std=c++17', '-fsyntax-only', '-'],
+                         input='#include <vector>\nint probe() { std::vector<int> v; return v.size(); }\n',
+                         text=True, check=True)
+          subprocess.run(['/usr/bin/xcrun', '--sdk', 'macosx', 'clang', '-x', 'c', '-',
+                          '-o', str(root / 'native-link-probe')],
+                         input='int main(void) { return 0; }\n', text=True, check=True)
+          PY
+
+      - name: Fetch exact Mesa pin and apply all 35 published patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          .work/opengl/venv/bin/python - <<'PY'
+          import hashlib, pathlib, subprocess
+          expected = 'b39d173ca9369c19fda2635be6655d308067e52d'
+          canonical = 'https://gitlab.freedesktop.org/mesa/mesa.git'
+          pin = next(line.split() for line in pathlib.Path('pins.lock').read_text().splitlines()
+                     if line.startswith('mesa '))
+          assert pin[1:3] == [expected, canonical], pin
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == '412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+          series = pathlib.Path('patches/mesa/series').read_text().splitlines()
+          names = [line.strip() for line in series if line.strip() and not line.startswith('#')]
+          assert len(names) == 35 and len(set(names)) == 35, names
+          patches = []
+          for index, name in enumerate(names, 1):
+              assert pathlib.PurePosixPath(name).name == name and name.startswith(f'{index:04d}-'), name
+              patch = pathlib.Path('patches/mesa', name).resolve()
+              print('patch', index, name, hashlib.sha256(patch.read_bytes()).hexdigest(), flush=True)
+              patches.append(str(patch))
+          print('Playport source: 412de5f8c0bdd26d84e0127eb5776ba992e3b152', flush=True)
+          print('Mesa source:', expected, canonical, flush=True)
+          checker = pathlib.Path('build/check-macho-imports.py')
+          print('Pinned import checker SHA256:', hashlib.sha256(checker.read_bytes()).hexdigest(), flush=True)
+          tree = pathlib.Path('.work/opengl/mesa')
+          subprocess.run(['git', 'init', str(tree)], check=True)
+          def git(*args):
+              subprocess.run(['git', '-C', str(tree), *args], check=True)
+          git('fetch', '--depth=1', canonical, expected)
+          git('checkout', '--detach', expected)
+          git('-c', 'user.name=OpenGL source probe', '-c', 'user.email=probe@localhost',
+              'am', '--committer-date-is-author-date', *patches)
+          base = subprocess.check_output(['git', '-C', str(tree), 'rev-parse', 'HEAD~35'], text=True).strip()
+          assert base == expected, base
+          git('diff', '--exit-code', 'HEAD')
+          git('log', '--format=%H %s', '-35', '--reverse')
+          subprocess.run(['git', 'diff', '--exit-code', 'HEAD'], check=True)
+          PY
+
+      - name: Compile only iOS Mesa EGL and Gallium Zink
+        id: compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export PATH="$PWD/.work/opengl/venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          meson setup .work/opengl/ios-gl .work/opengl/mesa \
+            --cross-file .work/opengl/ios.cross --native-file .work/opengl/host.native \
+            -Dvulkan-drivers= -Dgallium-drivers=zink -Dopengl=true -Degl=enabled \
+            -Dgles1=disabled -Dgles2=disabled -Dglx=disabled -Dgbm=disabled -Dglvnd=disabled \
+            -Dzstd=disabled -Dllvm=disabled -Dexpat=disabled -Dvideo-codecs= \
+            -Dvulkan-loader-rpath= -Dunversion-libgallium=true \
+            -Dplatforms=macos -Dbuildtype=release -Dwrap_mode=nofallback
+          ninja -C .work/opengl/ios-gl -j "$(sysctl -n hw.logicalcpu)" \
+            src/egl/libEGL.1.dylib src/gallium/targets/dri/libgallium_dri.dylib
+
+      - name: Inspect arm64 iOS imports and exports without executing libraries
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export PATH="$(brew --prefix llvm)/bin:$PATH"
+          .work/opengl/venv/bin/python - <<'PY'
+          import json, pathlib, shutil, subprocess
+          root = pathlib.Path('.work/opengl')
+          apple = json.loads((root / 'apple-tools.json').read_text())
+          out = root / 'out'
+          out.mkdir()
+          egl = out / 'MesaEGL'
+          gallium = out / 'MesaGallium'
+          shutil.copy2(root / 'ios-gl/src/egl/libEGL.1.dylib', egl)
+          shutil.copy2(root / 'ios-gl/src/gallium/targets/dri/libgallium_dri.dylib', gallium)
+          egl_id = '@rpath/MesaEGL.framework/MesaEGL'
+          gallium_id = '@rpath/MesaGallium.framework/MesaGallium'
+          tool = apple['tools']['install_name_tool']
+          subprocess.run([tool, '-id', egl_id, '-change', '@rpath/libgallium_dri.dylib', gallium_id, str(egl)], check=True)
+          subprocess.run([tool, '-id', gallium_id, str(gallium)], check=True)
+          checker = ['.work/opengl/venv/bin/python', 'build/check-macho-imports.py',
+                     '--sdk', apple['sdk'], '--platform', 'ios', '--minos', '26.0']
+          subprocess.run(checker + [str(gallium)], check=True)
+          subprocess.run(checker + ['--with', str(gallium), '--exports',
+                         'eglGetProcAddress,eglGetPlatformDisplay,eglInitialize,eglCreateContext,eglCreateWindowSurface,eglSwapBuffers',
+                         str(egl)], check=True)
+          for binary in (egl, gallium):
+              imports = subprocess.check_output(['llvm-objdump', '--macho', '--dylibs-used', str(binary)], text=True)
+              print(imports)
+              assert 'moltenvk' not in imports.lower(), imports
+              data = binary.read_bytes()
+              for forbidden in (b'MoltenVK', str(pathlib.Path.cwd()).encode(),
+                                str(pathlib.Path.home()).encode(), apple['sdk'].encode()):
+                  assert forbidden not in data, 'Unexpected dependency or host path in ' + binary.name
+              assert b'@rpath/KosmicKrisp.framework/KosmicKrisp' in data or binary == egl, 'Missing Zink iOS loader path'
+          subprocess.run(['git', 'diff', '--exit-code', 'HEAD'], check=True)
+          print('PASS: two source-built iOS libraries compiled, linked and inspected; no library executed.')
+          PY
+
+      - name: Write source-only result
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'OpenGL component compile probe only; no app, signing, device or gameplay test.' \
+            'Playport 412de5f8c0bdd26d84e0127eb5776ba992e3b152; Mesa b39d173ca9369c19fda2635be6655d308067e52d plus 35 patches.' \
+            'Compile outcome: ${{ steps.compile.outcome }}; import inspection outcome: ${{ steps.inspect.outcome }}.' \
+            'Next step after a pass: assess Mac-native KosmicKrisp shader tools and matching Wine/FEX integration in the current thread. No new thread required.' \
+            'No SDK, build-cache, runtime-library or IPA artifacts were uploaded.' >> "$GITHUB_STEP_SUMMARY"
+
