@@ -56,9 +56,9 @@ jobs:
         assert output=='PASS: four newly authored SM2/SM3 shader translations'\nmetal=run('find-metal',['xcrun','--sdk','iphoneos','--find','metal'])\n\
         metallib=run('find-metallib',['xcrun','--sdk','iphoneos','--find','metallib'])\nlibraries=[]\nfor name in\
         \ ('own_vs2','own_vs3','own_ps2','own_ps3'):\n    source=shaders/(name+'.metal');air=shaders/(name+'.air');library=shaders/(name+'.metallib')\n\
-        \    run('metal-'+name,[metal,'-target','air64-apple-ios26.0','-isysroot',sdk,'-std=ios-metal3.1',\n   \
-        \   '-fno-fast-math','-c',source,'-o',air])\n    run('metallib-'+name,[metallib,air,'-o',library])\n   \
-        \ libraries.append({'name':name,'sourceSha256':hashlib.sha256(source.read_bytes()).hexdigest(),\n      'metallibBytes':library.stat().st_size,'metallibSha256':hashlib.sha256(library.read_bytes()).hexdigest()})\n\
+        \    run('metal-'+name,[metal,'-target','air64-apple-ios26.0','-isysroot',sdk,'-std=metal3.1',\n      '-fno-fast-math','-c',source,'-o',air])\n\
+        \    run('metallib-'+name,[metallib,air,'-o',library])\n    libraries.append({'name':name,'sourceSha256':hashlib.sha256(source.read_bytes()).hexdigest(),\n\
+        \      'metallibBytes':library.stat().st_size,'metallibSha256':hashlib.sha256(library.read_bytes()).hexdigest()})\n\
         manifest=json.loads((root/'source/adapter-manifest.json').read_text())\nresult={'status':'native-UIKit-renderer-and-own-SM2-SM3-iPhone-shaders-compiled',\n\
         \  'sdkVersion':sdk_version,'clangVersion':version,'upstreamCommit':manifest['upstreamCommit'],\n  'rendererSourceSha256':manifest['adaptedRendererSha256'],'adapterScriptSha256':hashlib.sha256(adapter).hexdigest(),\n\
         \  'rendererObjectBytes':renderer.stat().st_size,'rendererObjectSha256':hashlib.sha256(renderer.read_bytes()).hexdigest(),\n\
