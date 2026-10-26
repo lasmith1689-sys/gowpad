@@ -34,7 +34,7 @@ jobs:
         mkdir -p "$root/tmp" "$root/inputs"
         export TMPDIR="$root/tmp"
         python3 -m venv "$root/venv"
-        "$root/venv/bin/python" -m pip install pefile
+        "$root/venv/bin/python" -m pip install pefile packaging
         "$root/venv/bin/python" - <<'PY'
         import json,pathlib,shutil,subprocess
         root=pathlib.Path('.work/cod-pe-fex').resolve()
@@ -255,6 +255,11 @@ jobs:
         pe=pe.replace(old,'--with-mingw="$M/bin/clang" --enable-archs="$2" --disable-tests $3')
         (a/'stages/wine-pe.sh').write_text(pe)
         fex=(repo/'build/stages/fex.sh').read_text()
+        # The pinned native CPU detector reads Linux /proc. Select an explicit
+        # non-SVE ARM64 baseline for the Apple host instead of probing the runner.
+        fex_tune='-DFEX_IOS_HOST_BUILD=ON -DENABLE_LTO=FALSE -DCMAKE_BUILD_TYPE=Release'
+        assert fex.count(fex_tune)==1
+        fex=fex.replace(fex_tune,fex_tune+' -DTUNE_CPU=cortex-a78')
         (a/'stages/fex.sh').write_text(fex)
         for name in ('wine-pe.sh','gstreamer.sh','fex.sh'):
          path=a/'stages'/name
