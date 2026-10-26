@@ -189,6 +189,12 @@ jobs:
             assert entry in names and metadata['entryAddress']==names[entry]
             if product=='PlayportJIT-Extension':
                 objc=subprocess.check_output([str(pathlib.Path(t['llvm'])/'llvm-objdump'),'--macho','--objc-meta-data',str(path)],env=env,text=True)
+                version=subprocess.check_output([str(pathlib.Path(t['llvm'])/'llvm-objdump'),'--version'],env=env,text=True)
+                class_symbols=[line for line in text.splitlines() if '_OBJC_CLASS_' in line or '_OBJC_METACLASS_' in line or 'EntrySmokePrincipal' in line]
+                ascii_offsets=[match.start() for match in re.finditer(re.escape(b'EntrySmokePrincipal'),data)]
+                print(json.dumps({'phase':'before-helper-principal-guard','product':product,'llvmObjdump':str(pathlib.Path(t['llvm'])/'llvm-objdump'),
+                    'llvmObjdumpVersion':version,'rawObjectiveCMetadataDump':objc,'classSymbolInventory':class_symbols,
+                    'exactAsciiClassNamePresent':bool(ascii_offsets),'exactAsciiClassNameOffsets':ascii_offsets},indent=2),flush=True)
                 assert 'EntrySmokePrincipal' in objc
             for prefix in (str(root),str(pathlib.Path.cwd()),str(pathlib.Path.home())):assert prefix.encode() not in data,('Fresh-output path',product,prefix)
             checker=root/'tools/check-macho-imports.py';assert hashlib.sha256(checker.read_bytes()).hexdigest()=='cd155383b94a75c30876f420d27383b365503b772743540372729baf2bf032b4'
