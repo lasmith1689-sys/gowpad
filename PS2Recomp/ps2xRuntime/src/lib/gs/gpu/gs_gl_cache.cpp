@@ -80,6 +80,9 @@ namespace GSGL
             Known<GLint, 1> packAlignment, unpackAlignment;
         };
         thread_local State t_state;
+        // bumped whenever the program, blending, colour mask or draw framebuffer actually changes (CurrentPipelineState users
+        // can skip a draw whose pipeline cannot have changed since the previous one)
+        thread_local uint64_t t_pipelineGeneration = 0;
 
         struct Verify
         {
@@ -116,7 +119,9 @@ namespace GSGL
 
         void useProgram(GLuint p)
         {
-            if (!skip(t_state.program.same({p})))
+            const bool same = t_state.program.same({p});
+            t_pipelineGeneration += same ? 0u : 1u;
+            if (!skip(same))
                 return g_real.UseProgram(p);
             if (g_verify.on)
                 verifyInt("program", 0x8B8D, static_cast<GLint>(p));
@@ -143,7 +148,11 @@ namespace GSGL
             if (target == kReadFb || target == kFramebuffer)
                 same = t_state.readFb.same({fb}) && same;
             if (target == kDrawFb || target == kFramebuffer)
-                same = t_state.drawFb.same({fb}) && same;
+            {
+                const bool drawSame = t_state.drawFb.same({fb});
+                t_pipelineGeneration += drawSame ? 0u : 1u;
+                same = drawSame && same;
+            }
             if (!skip(same))
                 return g_real.BindFramebuffer(target, fb);
             if (g_verify.on)
@@ -209,7 +218,9 @@ namespace GSGL
         void setCap(GLenum cap, bool on)
         {
             const int i = capIndex(cap);
-            if (i < 0 || !skip(t_state.caps[i].same({static_cast<GLboolean>(on ? 1 : 0)})))
+            const bool same = i >= 0 && t_state.caps[i].same({static_cast<GLboolean>(on ? 1 : 0)});
+            t_pipelineGeneration += same ? 0u : 1u;
+            if (i < 0 || !skip(same))
                 return on ? g_real.Enable(cap) : g_real.Disable(cap);
             if (g_verify.on && g_verify.isEnabled)
             {
@@ -223,7 +234,9 @@ namespace GSGL
         void disable(GLenum cap) { setCap(cap, false); }
         void blendFuncSeparate(GLenum a, GLenum b, GLenum c, GLenum d)
         {
-            if (!skip(t_state.blendFunc.same({a, b, c, d})))
+            const bool same = t_state.blendFunc.same({a, b, c, d});
+            t_pipelineGeneration += same ? 0u : 1u;
+            if (!skip(same))
                 return g_real.BlendFuncSeparate(a, b, c, d);
             if (g_verify.on)
             {
@@ -235,7 +248,9 @@ namespace GSGL
         }
         void blendEquationSeparate(GLenum a, GLenum b)
         {
-            if (!skip(t_state.blendEquation.same({a, b})))
+            const bool same = t_state.blendEquation.same({a, b});
+            t_pipelineGeneration += same ? 0u : 1u;
+            if (!skip(same))
                 return g_real.BlendEquationSeparate(a, b);
             if (g_verify.on)
             {
@@ -260,7 +275,9 @@ namespace GSGL
         }
         void colorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a)
         {
-            if (!skip(t_state.colorMask.same({r, g, b, a})))
+            const bool same = t_state.colorMask.same({r, g, b, a});
+            t_pipelineGeneration += same ? 0u : 1u;
+            if (!skip(same))
                 return g_real.ColorMask(r, g, b, a);
             if (g_verify.on && g_verify.getBooleanv)
             {
@@ -415,6 +432,11 @@ namespace GSGL
     void SetStateCacheEnabled(bool enabled)
     {
         g_enabled.store(enabled, std::memory_order_relaxed);
+    }
+
+    uint64_t PipelineGeneration()
+    {
+        return t_pipelineGeneration;
     }
 
     PipelineState CurrentPipelineState()

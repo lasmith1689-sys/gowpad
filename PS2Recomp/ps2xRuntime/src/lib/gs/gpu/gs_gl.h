@@ -241,4 +241,5 @@ namespace GSGL
         GLboolean colorMask[4] = {}, depthMask = 0;
     };
     PipelineState CurrentPipelineState();
+    uint64_t PipelineGeneration(); // changes whenever a part of the pipeline state does (this thread)
 }

@@ -2740,14 +2740,43 @@ void main()
     // play. A line: variant key, blend on, 4 blend factors, 2 equations, colour mask bits, depth attachment.
     std::unordered_map<GLuint, uint32_t> programKeys; // draw program -> its variant key (stable across runs)
     std::unordered_set<std::string> knownPipelines, seenPipelines;
+    std::unordered_set<uint64_t> seenPipelineHashes; // per draw: (program, blend, mask, depth attachment) already seen
+    uint64_t lastPipelineGeneration = ~0ull;
+    bool lastPipelineDepth = false;
     std::FILE *pipelineOut = nullptr;
     bool drawTargetDepth = false; // the current draw's target has a depth attachment
     bool drawFirstPipeline = false;
     void notePipeline()
     {
+        static const bool record = [] { const char *v = std::getenv("PS2X_GS_PIPELINE_RECORD"); return !(v && *v == '0'); }();
+        if (!record)
+            return;
+        // the same pipeline as the previous draw (the common case): nothing to do (a counter read)
+        const uint64_t generation = GSGL::PipelineGeneration();
+        if (generation == lastPipelineGeneration && drawTargetDepth == lastPipelineDepth)
+            return;
+        lastPipelineGeneration = generation;
+        lastPipelineDepth = drawTargetDepth;
         const GSGL::PipelineState p = GSGL::CurrentPipelineState();
+        if (!p.known)
+            return;
+        // runs before every draw call: a 64-bit hash of the fields and a set of hashes (formatting a text line per draw
+        // doubled the GL thread's draw time, build 561); the line is only made for a combination not seen before
+        uint64_t hash = 1469598103934665603ull;
+        const auto mix = [&hash](uint64_t v) { hash = (hash ^ v) * 1099511628211ull; };
+        mix(p.program);
+        mix(p.blend ? 1u : 0u);
+        if (p.blend)
+            for (int i = 0; i < 4; ++i)
+                mix(p.blendFunc[i]);
+        if (p.blend)
+            mix(static_cast<uint64_t>(p.blendEquation[0]) << 32 | p.blendEquation[1]);
+        mix(static_cast<uint64_t>(p.colorMask[0] ? 1 : 0) | (p.colorMask[1] ? 2 : 0) | (p.colorMask[2] ? 4 : 0) | (p.colorMask[3] ? 8 : 0));
+        mix(drawTargetDepth ? 1u : 0u);
+        if (!seenPipelineHashes.insert(hash).second)
+            return;
         const auto key = programKeys.find(p.program);
-        if (!p.known || key == programKeys.end())
+        if (key == programKeys.end())
             return;
         char line[128];
         // (blend factors and equations only count with blending on)
