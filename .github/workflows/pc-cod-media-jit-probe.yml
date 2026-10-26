@@ -204,7 +204,12 @@ jobs:
               for name in line.split(':', 1)[0].split():
                   if re.fullmatch(r'include/[A-Za-z0-9_./-]+\.h', name):
                       targets.add(name)
-          assert {'include/dshow.h', 'include/mfobjects.h', 'include/mftransform.h'} <= targets
+          # dshow.h is a tracked umbrella header, not a standalone generated Make target.
+          dshow = root / 'wine/include/dshow.h'
+          assert dshow.is_file(), 'Missing tracked Wine DirectShow umbrella header'
+          required = {'include/mfobjects.h', 'include/mftransform.h'}
+          assert required <= targets, ('Missing actual generated media-header targets', sorted(required - targets))
+          print('Tracked dshow.h SHA256:', hashlib.sha256(dshow.read_bytes()).hexdigest())
           print('Building', len(targets), 'actual Wine generated-header targets.', flush=True)
           subprocess.run(['make', '-C', str(build), '-j3', *sorted(targets)], check=True)
           config = build / 'include/config.h'
