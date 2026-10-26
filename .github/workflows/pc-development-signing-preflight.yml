@@ -1,0 +1,92 @@
+name: PC runtime read-only development signing preflight
+'on':
+  workflow_dispatch: null
+  push:
+    branches: [codex/pc-games-runtime-probe-20261025]
+    paths: [.github/workflows/pc-development-signing-preflight.yml]
+permissions:
+  contents: read
+concurrency:
+  group: pc-development-signing-preflight
+  cancel-in-progress: false
+jobs:
+  read-only-signing-preflight:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - name: Check only aggregate development readiness through existing cloud credentials
+        shell: bash
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          try {
+            for (const name of ['ASC_KEY_ID', 'ASC_ISSUER_ID', 'ASC_KEY_P8']) {
+              if (!process.env[name]) throw new Error('Missing existing cloud credential');
+            }
+            const paths = [
+              '/v1/devices?fields[devices]=deviceClass,status&limit=200',
+              '/v1/certificates?fields[certificates]=certificateType,expirationDate&limit=200',
+              '/v1/profiles?fields[profiles]=profileType,profileState,expirationDate&limit=200',
+            ];
+            const now = Math.floor(Date.now() / 1000);
+            const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url');
+            const header = encode({alg: 'ES256', kid: process.env.ASC_KEY_ID, typ: 'JWT'});
+            const payload = encode({iss: process.env.ASC_ISSUER_ID, iat: now, exp: now + 120,
+              aud: 'appstoreconnect-v1', scope: paths.map(path => 'GET ' + path)});
+            let pem = process.env.ASC_KEY_P8.replace(/\r/g, '').trim();
+            if (!pem.includes('BEGIN PRIVATE KEY')) {
+              const raw = pem.replace(/\s/g, '');
+              pem = '-----BEGIN PRIVATE KEY-----\n' + raw.match(/.{1,64}/g).join('\n') + '\n-----END PRIVATE KEY-----\n';
+            }
+            const key = crypto.createPrivateKey(pem);
+            if (key.asymmetricKeyType !== 'ec' || key.asymmetricKeyDetails.namedCurve !== 'prime256v1') {
+              throw new Error('Unexpected signing key type');
+            }
+            const signature = crypto.sign('sha256', Buffer.from(header + '.' + payload),
+              {key, dsaEncoding: 'ieee-p1363'}).toString('base64url');
+            const token = header + '.' + payload + '.' + signature;
+            delete process.env.ASC_KEY_P8;
+            pem = '';
+            const results = await Promise.all(paths.map(async path => {
+              const response = await fetch('https://api.appstoreconnect.apple.com' + path, {
+                method: 'GET', headers: {Authorization: 'Bearer ' + token},
+                redirect: 'error', signal: AbortSignal.timeout(15000),
+              });
+              const endpoint = path.split('?')[0];
+              if (response.status !== 200) return {endpoint, httpStatus: response.status};
+              const body = await response.json();
+              if (!Array.isArray(body.data)) throw new Error('Unexpected API response');
+              const records = body.data.map(item => item.attributes || {});
+              const result = {endpoint, httpStatus: 200, hasMorePages: Boolean(body.links?.next)};
+              if (endpoint === '/v1/devices') {
+                result.enabledRegisteredIPhonePresent = records.some(item => item.deviceClass === 'IPHONE' && item.status === 'ENABLED');
+              } else if (endpoint === '/v1/certificates') {
+                result.unexpiredDevelopmentCertificatePresent = records.some(item =>
+                  ['DEVELOPMENT', 'IOS_DEVELOPMENT'].includes(item.certificateType) && Date.parse(item.expirationDate) > Date.now());
+              } else {
+                result.activeDevelopmentProfilePresent = records.some(item => item.profileType === 'IOS_APP_DEVELOPMENT' &&
+                  item.profileState === 'ACTIVE' && Date.parse(item.expirationDate) > Date.now());
+              }
+              return result;
+            }));
+            const report = {checkedAt: new Date().toISOString(), readOnly: true, results,
+              deviceIdentifiersOrNamesLogged: false, credentialsOrProfileContentExported: false,
+              accountMutationsPerformed: false, signingAttempted: false,
+              actualPhoneIdentityVerified: false, developmentSigningProved: false,
+              next: 'Resolve any development provisioning gap, then sign app/helper and test the actual phone. Continue current thread; no new thread required.'};
+            const text = JSON.stringify(report, null, 2);
+            console.log(text);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, '\nRead-only development readiness\n\n```json\n' + text + '\n```\n');
+            if (results.some(result => result.httpStatus !== 200)) process.exitCode = 1;
+          } catch {
+            console.error('Read-only development preflight could not complete; no credential details or response bodies are logged.');
+            process.exitCode = 1;
+          }
+          JS
+
