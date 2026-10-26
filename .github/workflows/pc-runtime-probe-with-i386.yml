@@ -1,0 +1,887 @@
+name: PC game runtime build with i386 and Dock
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-runtime-probe-with-i386.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-runtime-probe-with-i386
+  cancel-in-progress: false
+
+jobs:
+  source-build-probe:
+    name: Check cloud Xcode and runtime build inputs
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out pinned runtime source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: willfaust/Madeira
+          ref: e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          persist-credentials: false
+          submodules: false
+          path: runtime
+      - name: Verify cloud tools and cross-compiler
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhone SDK: $sdk_version"
+          test "${sdk_version%%.*}" -ge 26
+          xcrun clang --version | head -n 1
+          printf '#include <TargetConditionals.h>\nint probe(void) { return TARGET_OS_IPHONE; }\n' > "$RUNNER_TEMP/ios-sdk-probe.c"
+          xcrun clang -target arm64-apple-ios26.0 -isysroot "$sdk" -fsyntax-only "$RUNNER_TEMP/ios-sdk-probe.c"
+          printf 'Cloud Mac/Xcode iPhone SDK probe passed. No app has been built or signed.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'cache-context=%s-%s-%s\n' "$(xcodebuild -version | tr '\n ' '--')" "$sdk_version" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Build media decoding libraries from checked source
+        id: media
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          bash build/ffmpeg/build.sh || {
+            tail -n 80 build/ffmpeg/obj/configure.log 2>/dev/null || true
+            tail -n 80 build/ffmpeg/obj/make.log 2>/dev/null || true
+            exit 1
+          }
+          for lib in avformat avcodec swresample avutil; do
+            xcrun lipo -info "app/Madeira/lib$lib.a"
+          done
+      - name: Build native Windows API libraries from pinned source
+        id: nativewine
+        if: ${{ steps.media.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake bison flex pkg-config llvm
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$(brew --prefix llvm)/bin:$PATH"
+          cd runtime
+          git submodule update --init --depth 1 wine
+          mkdir -p toolchains
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+            -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz
+          printf '%s  %s\n' bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7 "$RUNNER_TEMP/llvm-mingw.tar.xz" | shasum -a 256 -c -
+          tar -xf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C toolchains
+          native_build_path="$PATH"
+          export PATH="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH"
+          mkdir -p wine/build-macos
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/wine-host-probe.c"
+          xcrun --sdk macosx clang "$RUNNER_TEMP/wine-host-probe.c" -o "$RUNNER_TEMP/wine-host-probe"
+          (cd wine/build-macos && CC="xcrun --sdk macosx clang" CXX="xcrun --sdk macosx clang++" \
+            ../configure --enable-archs=arm64ec --without-x --without-opengl --without-vulkan --disable-tests --enable-winegstreamer) || {
+              sed -n '1,280p' wine/build-macos/config.log
+              exit 1
+            }
+          python3 - <<'PY'
+          import re, subprocess
+          from pathlib import Path
+          makefile = Path('wine/build-macos/Makefile').read_text().replace('\\\n', ' ')
+          targets = set()
+          for line in makefile.splitlines():
+              if line.startswith(('\t', '#')) or ':' not in line:
+                  continue
+              for target in line.split(':', 1)[0].split():
+                  if re.fullmatch(r'include/[A-Za-z0-9_./-]+\.h', target):
+                      targets.add(target)
+          assert {'include/dwrite.h', 'include/dwrite_3.h', 'include/mfobjects.h', 'include/mftransform.h'} <= targets
+          print(f'Building {len(targets)} Wine headers with actual Makefile targets.')
+          result = subprocess.run(['make', '-C', 'wine/build-macos', '-j3', *sorted(targets)])
+          raise SystemExit(result.returncode)
+          PY
+          mkdir -p wine/build-arm64ec
+          ln -s "$PWD/wine/build-macos/include" wine/build-arm64ec/include
+          export PATH="$native_build_path"
+          mkdir -p research/freetype
+          git -C research/freetype init
+          git -C research/freetype remote add origin https://github.com/freetype/freetype.git
+          git -C research/freetype fetch --depth 1 origin 42608f77f20749dd6ddc9e0536788eaad70ea4b5
+          git -C research/freetype checkout --detach FETCH_HEAD
+          CC="$(xcrun --sdk iphoneos --find clang)" CXX="$(xcrun --sdk iphoneos --find clang++)" bash build/freetype-ios/build.sh
+          bash build/gnutls-ios/build.sh || {
+            find build/gnutls-ios/obj -name '*.log' -exec tail -n 15 {} \;
+            exit 1
+          }
+          # Upstream only refreshes a missing prebuilt wineserver archive.
+          # Create its base members from the pinned server source list first.
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          path = Path('build/wineserver/build.sh')
+          text = path.read_text()
+          start = text.index('# Copy the base library if we don')
+          end = text.index('CC_FLAGS=(', start)
+          text = text[:start] + text[end:]
+          sources = re.findall(r'\b([A-Za-z0-9_]+\.c)\b', Path('wine/server/Makefile.in').read_text())
+          bootstrap = 'BASE_SOURCES=(' + ' '.join(sources) + ')\n' + r'''
+          if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
+              replaced=" "
+              for entry in "${PATCHED_FILES[@]}"; do replaced="$replaced${entry##*:} "; done
+              for source in "${BASE_SOURCES[@]}"; do
+                  name="${source%.c}"
+                  [[ "$replaced" == *" $name.o "* ]] && continue
+                  compile_one "$WINE_SRC/server/$source" "$name"
+              done
+              xcrun ar rcs "$OBJ_DIR/libwineserver.a" "$OBJ_DIR"/*.o
+          fi
+          '''
+          anchor = 'echo "=== Building kill wrapper (without kill macro) ==="'
+          assert text.count(anchor) == 1
+          path.write_text(text.replace(anchor, bootstrap + '\n' + anchor))
+          PY
+          bash build/wineserver/build.sh
+          bash build/ntdll-unix/build.sh || {
+            find build/ntdll-unix/obj -name '*.err' -size +0 -print -exec tail -n 12 {} \;
+            exit 1
+          }
+          bash build/win32u-unix/build.sh || {
+            find build/win32u-unix/obj -name '*.err' -size +0 -print -exec tail -n 12 {} \;
+            exit 1
+          }
+          for lib in wineserver ntdll_unix win32u_unix; do xcrun lipo -info "app/Madeira/lib$lib.a"; done
+          bash build/stage-licenses.sh
+      - name: Build on-device pairing library from locked source
+        id: pairing
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          cd runtime
+          bash build/rppairing-ios/build.sh
+          xcrun lipo -info app/Madeira/libmadeira_rppairing.a
+      - name: Build CPU translation core from pinned submodule
+        id: fex
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake ninja ccache
+          cd runtime
+          git submodule update --init --depth 1 --recursive FEX
+          export CMAKE_BUILD_PARALLEL_LEVEL=3
+          cmake -S FEX -B FEX/build-ios -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
+            -DTUNE_CPU=cortex-a78
+          bash build/fex-ios/build.sh
+          cmake --build FEX/build-ios --target JemallocLibs
+          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore.a
+          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
+      - name: Restore LLVM libraries built by this source recipe
+        id: llvm-cache
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            runtime/toolchains/llvm-ios-build/include
+            runtime/toolchains/llvm-ios-build/lib
+          key: pc-runtime-llvm-d213c58b94c5311b836e4ca3-${{ runner.os }}-${{ runner.arch }}-${{ steps.tools.outputs.cache-context }}
+      - name: Build pinned LLVM shader compiler
+        id: llvm
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          mkdir -p toolchains/llvm-project
+          git -C toolchains/llvm-project init
+          git -C toolchains/llvm-project remote add origin https://github.com/llvm/llvm-project.git
+          git -C toolchains/llvm-project config core.sparseCheckout true
+          printf '/llvm/\n/cmake/\n/third-party/\n' > toolchains/llvm-project/.git/info/sparse-checkout
+          git -C toolchains/llvm-project -c protocol.version=2 fetch --depth 1 --filter=blob:none origin 8dfdcc7b7bf66834a761bd8de445840ef68e4d1a
+          git -C toolchains/llvm-project checkout --detach FETCH_HEAD
+          test "$(git -C toolchains/llvm-project rev-parse HEAD)" = 8dfdcc7b7bf66834a761bd8de445840ef68e4d1a
+          if [ "${{ steps.llvm-cache.outputs.cache-hit }}" != true ]; then
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF
+          cmake --build toolchains/llvm-host-build --target llvm-tblgen llvm-config --parallel 3
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DLLVM_HOST_TRIPLE=arm64-apple-ios17.0 -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios17.0 \
+            -DLLVM_TARGET_ARCH=host -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen"
+          cmake --build toolchains/llvm-ios-build --target LLVMPasses LLVMBitWriter --parallel 3
+          fi
+          for lib in LLVMCore LLVMPasses LLVMBitWriter; do xcrun lipo -info "toolchains/llvm-ios-build/lib/lib$lib.a"; done
+      - name: Preserve successfully built LLVM libraries for source-build retries
+        if: ${{ !cancelled() && steps.llvm.outcome == 'success' && steps.llvm-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            runtime/toolchains/llvm-ios-build/include
+            runtime/toolchains/llvm-ios-build/lib
+          key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+      - name: Build D3D9-D3D11 graphics bridge from pinned source
+        id: graphics
+        if: ${{ steps.nativewine.outcome == 'success' && steps.llvm.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          git submodule update --init --depth 1 --recursive dxmt
+          if ! xcrun --sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          mkdir -p build/dxmt-ios/shader-headers
+          for shader in air_msad air_samplepos air_tessellation; do
+            xcrun --sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+              -o "build/dxmt-ios/shader-headers/$shader.air" -c "dxmt/src/airconv/shaders/$shader.metal"
+            xxd -n "$shader" -i "build/dxmt-ios/shader-headers/$shader.air" "build/dxmt-ios/shader-headers/$shader.h"
+          done
+          # These PC games use D3D9/11 or OpenGL; the separate D3D12 converter is excluded.
+          export MADEIRA_ALLOW_NO_D3D12=1
+          bash build/dxmt-ios/build.sh || {
+            find build/dxmt-ios/obj -name '*.err' -size +0 -print -exec tail -n 15 {} \;
+            exit 1
+          }
+          xcrun libtool -static -o app/Madeira/libdxmt_combined.a \
+            build/dxmt-ios/libdxmt_unix.a toolchains/llvm-ios-build/lib/libLLVM*.a
+          xcrun lipo -info app/Madeira/libdxmt_combined.a
+      - name: Obtain unchanged Microsoft runtime files using upstream extractor
+        id: vcruntime
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install sevenzip
+          cd runtime
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('tools/unpack-burn-cabinets.py').write_text(r'''# Static extraction of CAB containers in a Microsoft-signed Burn installer.
+          # Never executes the installer or DLL payloads.
+          import hashlib
+          import json
+          import struct
+          import subprocess
+          import sys
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          
+          source, destination, sevenzip = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+          destination.mkdir(parents=True, exist_ok=True)
+          seen = set()
+          reports = []
+          def extract_containers(item):
+              data = item.read_bytes()
+              position = 0
+              outputs = []
+              while True:
+                  position = data.find(b'MSCF', position)
+                  if position < 0:
+                      break
+                  if position + 36 <= len(data):
+                      size = struct.unpack_from('<I', data, position + 8)[0]
+                      files_offset = struct.unpack_from('<I', data, position + 16)[0]
+                      folders, files = struct.unpack_from('<HH', data, position + 26)
+                      valid = (data[position + 24:position + 26] == b'\x03\x01'
+                               and 36 <= files_offset < size <= len(data) - position
+                               and folders > 0 and files > 0)
+                      if valid:
+                          payload = data[position:position + size]
+                          digest = hashlib.sha256(payload).hexdigest()
+                          if digest not in seen:
+                              if len(seen) >= 64:
+                                  raise SystemExit('Unexpected cabinet count')
+                              seen.add(digest)
+                              cabinet = destination / f'container-{len(seen)}.cab'
+                              output = destination / f'container-{len(seen)}'
+                              cabinet.write_bytes(payload)
+                              subprocess.run([sevenzip, 'x', str(cabinet), '-o' + str(output), '-y'],
+                                             check=True, stdout=subprocess.DEVNULL)
+                              outputs.append(output)
+                              reports.append({'source': item.name, 'offset': position,
+                                              'files': files, 'sha256': digest})
+                  position += 4
+              return outputs
+          
+          root_outputs = extract_containers(source)
+          manifests = [folder / '0' for folder in root_outputs if (folder / '0').is_file()]
+          if len(manifests) != 1:
+              raise SystemExit('Expected one embedded Burn manifest')
+          manifest = ET.fromstring(manifests[0].read_bytes())
+          selected = []
+          for node in manifest.iter():
+              path = node.attrib.get('FilePath', '').replace('\\', '/').lower()
+              if not (path.endswith('/cab1.cab') and
+                      ('/vcruntimeminimum_amd64/' in path or '/vcruntimeadditional_amd64/' in path)):
+                  continue
+              member = node.attrib['SourcePath']
+              if '/' in member or '\\' in member or member in ('.', '..'):
+                  raise SystemExit('Unexpected payload path')
+              matches = [folder / member for folder in root_outputs if (folder / member).is_file()]
+              if len(matches) != 1:
+                  raise SystemExit('Missing or ambiguous runtime cabinet')
+              selected.append(matches[0])
+          if len(selected) != 2:
+              raise SystemExit('Expected two x64 runtime cabinets')
+          for item in selected:
+              if not extract_containers(item):
+                  raise SystemExit('Runtime payload contains no cabinet')
+          print(json.dumps({'cabinets': reports}, indent=2))
+          ''')
+          path = Path('tools/fetch-vcruntime.sh')
+          text = path.read_text()
+          start = text.index('"$SEVENZIP" x "$TMP/VC_redist.x64.exe"')
+          end = text.index('WANTED=(', start)
+          text = text[:start] + 'python3 "$R/tools/unpack-burn-cabinets.py" "$TMP/VC_redist.x64.exe" "$TMP/cab_out" "$SEVENZIP"\n\n' + text[end:]
+          anchor = 'if command -v shasum >/dev/null 2>&1; then'
+          assert text.count(anchor) == 1
+          verification = 'printf "%s  %s\\n" cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b "$TMP/VC_redist.x64.exe" | shasum -a 256 -c -\n'
+          path.write_text(text.replace(anchor, verification + anchor))
+          PY
+          bash tools/fetch-vcruntime.sh
+          python3 tests/host/check-vcruntime.py --strict
+      - name: Verify and initialize exact source gitlinks
+        id: i386sources
+        if: ${{ steps.nativewine.outcome == 'success' && steps.graphics.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          test "$(git rev-parse HEAD)" = e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          pins = {
+              'wine': '9129e9684daaeae70da9435e7c6060e59392634e',
+              'dxmt': '128b297c6e9a00014408dc68b4c2c2373b5813de',
+              'madeira-dock': '72558e416a390f3669457930f09a389e54f49556',
+          }
+          for name, revision in pins.items():
+              row = subprocess.check_output(['git', 'ls-tree', 'HEAD', name], text=True).split()
+              assert row == ['160000', 'commit', revision, name], (name, row)
+          farm = Path('app/Madeira/i386-windows')
+          assert not [p for p in farm.iterdir() if p.name != '.gitkeep'], 'i386 farm was not empty'
+          assert not Path('app/Madeira/arm64ec-windows/dockhost.exe').exists()
+          Path('component-source-pins.json').write_text(json.dumps(pins, indent=2) + '\n')
+          PY
+          git submodule update --init --depth 1 --recursive wine dxmt madeira-dock
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          for name, revision in json.loads(Path('component-source-pins.json').read_text()).items():
+              actual = subprocess.check_output(['git', '-C', name, 'rev-parse', 'HEAD'], text=True).strip()
+              assert actual == revision, (name, actual)
+          status = subprocess.check_output(['git', 'submodule', 'status', '--recursive', 'wine', 'dxmt', 'madeira-dock'], text=True)
+          assert all(line.startswith(' ') for line in status.splitlines()), status
+          print(status)
+          PY
+      - name: Verify reused i386 cross-compiler and host build tools
+        id: i386tools
+        if: ${{ steps.i386sources.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Native Wine already downloaded, checked and extracted this exact archive.
+          printf '%s  %s\n' bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7 "$RUNNER_TEMP/llvm-mingw.tar.xz" | shasum -a 256 -c -
+          brew install meson ninja
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          bison --version | head -n 1
+          meson --version
+          cd runtime
+          tc="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
+          test -x "$tc/i686-w64-mingw32-clang"
+          test -x "$tc/x86_64-w64-mingw32-clang"
+          "$tc/i686-w64-mingw32-clang" --version | head -n 1
+          "$tc/x86_64-w64-mingw32-clang" --version | head -n 1
+          xcrun --sdk macosx metal --version
+          xcrun --sdk macosx --find metallib
+      - name: Build every policy-selected i386 Wine and DXMT module
+        id: i386
+        if: ${{ steps.i386tools.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          macsdk="$(xcrun --sdk macosx --show-sdk-path)"
+          macld="$(xcrun --sdk macosx --find ld)"
+          export MADEIRA_WINE_HOST_CC="xcrun --sdk macosx clang"
+          export MADEIRA_WINE_HOST_CXX="xcrun --sdk macosx clang++"
+          export MADEIRA_WINE_HOST_LDFLAGS="-isysroot $macsdk -fuse-ld=$macld"
+          # Bare compiler flags would also enter Meson's Windows host machine.
+          # Wine records the scoped native settings in its generated Makefile.
+          unset CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+          export SDKROOT="$macsdk"
+          export JOBS=3
+          unset SKIP_DXMT
+          cd runtime
+          # Native graphics already finished. Restore its native description on all exits.
+          native_file="$PWD/dxmt/build-osx.txt"
+          native_backup="$PWD/i386-native-build-osx.original.txt"
+          test ! -e "$native_backup"
+          cp "$native_file" "$native_backup"
+          trap 'cp "$native_backup" "$native_file"' EXIT
+          # Record the exact breadth set selected by upstream, without changing its policy.
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          path = Path('build/wine-i386/build.sh')
+          source = path.read_text()
+          anchor = 'echo "== ${#TARGETS[@]} i386 modules (skipped by policy: ${#SKIP[@]} names) =="'
+          assert source.count(anchor) == 1
+          addition = '\nprintf "%s\\n" "${TARGETS[@]}" > "$R/i386-selected-targets.txt"'
+          source = source.replace(anchor, anchor + addition)
+          configure = '(cd "$B" && ../configure --enable-archs=i386'
+          scoped = '(cd "$B" && CC="$MADEIRA_WINE_HOST_CC" CXX="$MADEIRA_WINE_HOST_CXX" LDFLAGS="$MADEIRA_WINE_HOST_LDFLAGS" ../configure --enable-archs=i386'
+          assert source.count(configure) == 1
+          path.write_text(source.replace(configure, scoped))
+          # The upstream native file names bare clang. The script prepends
+          # MinGW to PATH, so bind Meson's host tools explicitly to Apple clang.
+          native = Path('dxmt/build-osx.txt')
+          assert native.read_text().strip() == "[binaries]\nc = 'clang'\ncpp = 'clang++'"
+          compilers = [subprocess.check_output(['xcrun', '--sdk', 'macosx', '--find', name], text=True).strip() for name in ('clang', 'clang++')]
+          sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
+          linker = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--find', 'ld'], text=True).strip()
+          assert all(Path(name).is_absolute() and not any(c in name for c in "'\n\r") for name in compilers + [sdk, linker])
+          compile_args = ['-isysroot', sdk]
+          link_args = compile_args + ['-fuse-ld=' + linker]
+          description = "[binaries]\nc = '%s'\ncpp = '%s'\n\n[built-in options]\n" % tuple(compilers)
+          description += '\n'.join(key + ' = ' + repr(args) for key, args in [
+              ('c_args', compile_args), ('cpp_args', compile_args),
+              ('c_link_args', link_args), ('cpp_link_args', link_args),
+          ]) + '\n'
+          native.write_text(description)
+          PY
+          # No positional module selector and no SKIP_DXMT: this is the whole upstream farm.
+          bash build/wine-i386/build.sh || {
+            tail -n 100 wine/build-i386/madeira-i386-build.log 2>/dev/null || true
+            tail -n 80 wine/build-i386/config.log 2>/dev/null || true
+            tail -n 80 dxmt/build-pe-i386/meson-logs/meson-log.txt 2>/dev/null || true
+            exit 1
+          }
+      - name: Build Dock from its pinned source and run only host unit tests
+        id: dock
+        if: ${{ steps.i386tools.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          export HOST_CC="$(xcrun --sdk macosx --find clang)"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          bash build/madeira-dock/build.sh --check
+          test -s app/Madeira/arm64ec-windows/dockhost.exe
+          test -s app/Madeira/arm64ec-windows/dock-notices.txt
+      - name: Reject incomplete farms and inspect PE dependencies without executing them
+        id: i386inspect
+        if: ${{ steps.i386.outcome == 'success' && steps.dock.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          python3 - <<'PY'
+          import hashlib, json, re, struct
+          from pathlib import Path
+
+          class PE:
+              def __init__(self, path):
+                  self.path = path
+                  self.data = d = path.read_bytes()
+                  assert d[:2] == b'MZ', str(path)
+                  pe = struct.unpack_from('<I', d, 0x3c)[0]
+                  assert d[pe:pe + 4] == b'PE\0\0', str(path)
+                  self.machine, sections = struct.unpack_from('<HH', d, pe + 4)
+                  optional_size = struct.unpack_from('<H', d, pe + 20)[0]
+                  optional = pe + 24
+                  self.magic = struct.unpack_from('<H', d, optional)[0]
+                  assert self.magic in (0x10b, 0x20b), str(path)
+                  self.image_base = struct.unpack_from('<I' if self.magic == 0x10b else '<Q', d, optional + (28 if self.magic == 0x10b else 24))[0]
+                  directory_start = optional + (96 if self.magic == 0x10b else 112)
+                  count = struct.unpack_from('<I', d, directory_start - 4)[0]
+                  self.directories = [struct.unpack_from('<II', d, directory_start + i * 8) for i in range(min(count, 16))]
+                  self.sections = []
+                  for i in range(sections):
+                      off = optional + optional_size + i * 40
+                      name = d[off:off + 8].rstrip(b'\0').decode('ascii')
+                      virtual_size, rva, raw_size, raw = struct.unpack_from('<IIII', d, off + 8)
+                      assert raw + raw_size <= len(d), (path, name)
+                      self.sections.append((name, rva, virtual_size, raw, raw_size))
+
+              def offset(self, rva, size=1):
+                  for _, start, virtual_size, raw, raw_size in self.sections:
+                      if start <= rva and rva + size <= start + raw_size:
+                          return raw + rva - start
+                  raise ValueError(f'{self.path}: unmapped RVA {rva:x} size {size}')
+
+              def string(self, rva):
+                  off = self.offset(rva)
+                  end = self.data.index(b'\0', off, min(off + 4096, len(self.data)))
+                  return self.data[off:end].decode('ascii')
+
+              def imports(self, index):
+                  if index >= len(self.directories):
+                      return []
+                  rva, size = self.directories[index]
+                  if not rva:
+                      return []
+                  width, fmt = (20, '<5I') if index == 1 else (32, '<8I')
+                  result = []
+                  for i in range(size // width):
+                      fields = struct.unpack_from(fmt, self.data, self.offset(rva + i * width, width))
+                      if not any(fields):
+                          return result
+                      name = fields[3] if index == 1 else fields[1]
+                      if index == 13 and not fields[0] & 1:
+                          name -= self.image_base
+                      result.append(self.string(name).lower())
+                  raise ValueError(f'{self.path}: unterminated import descriptors')
+
+              def apisets(self):
+                  section = next(s for s in self.sections if s[0] == '.apiset')
+                  _, _, _, raw, length = section
+                  data = self.data[raw:raw + length]
+                  version, size, _, count, entries, _, _ = struct.unpack_from('<7I', data)
+                  assert version == 6 and size <= len(data) and count < 10000
+                  def name(off, length):
+                      assert off + length <= size and length % 2 == 0
+                      return data[off:off + length].decode('utf-16-le').lower()
+                  result = {}
+                  for i in range(count):
+                      _, off, length, _, values, value_count = struct.unpack_from('<6I', data, entries + i * 24)
+                      contract = name(off, length) + '.dll'
+                      hosts = []
+                      for j in range(value_count):
+                          _, _, _, host, host_length = struct.unpack_from('<5I', data, values + j * 20)
+                          if host_length:
+                              hosts.append(name(host, host_length))
+                      result[contract] = sorted(set(hosts))
+                  return result
+
+          farm = Path('app/Madeira/i386-windows')
+          selected = Path('i386-selected-targets.txt').read_text().splitlines()
+          assert selected and len(selected) == len(set(selected))
+          assert all(re.fullmatch(r'(dlls|programs)/[^/]+/i386-windows/[^/ :]+', p) for p in selected)
+          expected = {Path(p).name.lower() for p in selected}
+          assert len(expected) == len(selected), 'duplicate output names in breadth set'
+          dxmt = {'d3d9.dll', 'd3d9shim.dll', 'd3d9-emulated.dll', 'd3d11.dll', 'dxgi.dll', 'd3d10core.dll', 'winemetal.dll'}
+          assert not expected & dxmt
+          expected |= dxmt
+          files = [p for p in farm.iterdir() if p.name != '.gitkeep']
+          actual = {p.name.lower(): p for p in files}
+          assert len(actual) == len(files) and set(actual) == expected, {'missing': sorted(expected - set(actual)), 'extra': sorted(set(actual) - expected)}
+          assert {'ntdll.dll', 'kernel32.dll', 'kernelbase.dll', 'user32.dll', 'gdi32.dll', 'apisetschema.dll', 'msiexec.exe', 'fusion.dll'} <= set(actual)
+          images = {name: PE(path) for name, path in actual.items() if path.suffix.lower() != '.tlb'}
+          assert images and all(p.machine == 0x14c and p.magic == 0x10b for p in images.values()), 'non-i386/PE32 output in i386 farm'
+          apisets = images['apisetschema.dll'].apisets()
+          assert apisets, 'empty API-set schema'
+          missing = []
+          records = []
+          def resolve(module, available, schema):
+              if module in available:
+                  return [module]
+              hosts = schema.get(module, [])
+              if hosts and all(host in available for host in hosts):
+                  return hosts
+              return None
+          for name, pe in sorted(images.items()):
+              normal, delayed = pe.imports(1), pe.imports(13)
+              for kind, modules in [('normal', normal), ('delay', delayed)]:
+                  for module in modules:
+                      if resolve(module, images, apisets) is None:
+                          missing.append({'file': name, 'kind': kind, 'import': module})
+              records.append({'name': name, 'machine': hex(pe.machine), 'optional_magic': hex(pe.magic), 'sha256': hashlib.sha256(pe.data).hexdigest(), 'imports': normal, 'delay_imports': delayed})
+          # This is DLL-name closure of normal and delayed imports, including API sets.
+          # It does not claim exported-symbol, unix-call, loader or gameplay correctness.
+          dock = Path('app/Madeira/arm64ec-windows/dockhost.exe')
+          dock_pe = PE(dock)
+          assert dock_pe.machine == 0x8664 and dock_pe.magic == 0x20b
+          # Dock is a known x86-64 compile target. 0x8664 alone would not prove
+          # that another module lacks ARM64EC/ARM64X hybrid code.
+          farm64 = {p.name.lower(): p for p in dock.parent.iterdir() if p.is_file()}
+          api64 = PE(farm64['apisetschema.dll']).apisets()
+          dock_imports = dock_pe.imports(1) + dock_pe.imports(13)
+          dock_missing = [name for name in dock_imports if resolve(name, farm64, api64) is None]
+          notices = (dock.parent / 'dock-notices.txt').read_text()
+          for value in ('72558e416a390f3669457930f09a389e54f49556', 'LICENSE-EXCEPTION.md', 'GNU GENERAL PUBLIC LICENSE', 'MinGW-w64 runtime notice', 'LLVM runtime notice'):
+              assert value in notices, value
+          report = {'wine_targets': len(selected), 'dxmt_outputs': sorted(dxmt), 'i386_pe_count': len(images), 'non_pe_type_libraries': len(actual) - len(images), 'apiset_contracts': len(apisets), 'missing_dll_names': missing, 'files': records, 'dock': {'machine': hex(dock_pe.machine), 'sha256': hashlib.sha256(dock_pe.data).hexdigest(), 'imports': dock_imports, 'missing_dll_names': dock_missing, 'notices_sha256': hashlib.sha256(notices.encode()).hexdigest()}, 'scope': 'source-built PE components; normal and delayed DLL-name closure only; no app build or target execution'}
+          encoded = json.dumps(report, sort_keys=True, indent=2) + '\n'
+          Path('i386-component-report.json').write_text(encoded)
+          print(json.dumps({k: v for k, v in report.items() if k != 'files'}, sort_keys=True, indent=2))
+          print('component_report_sha256=' + hashlib.sha256(encoded.encode()).hexdigest())
+          assert not missing and not dock_missing, 'unresolved DLL names: component gate failed'
+          assert actual['d3d9.dll'].read_bytes() == actual['d3d9shim.dll'].read_bytes()
+          assert actual['d3d9.dll'].read_bytes() != actual['d3d9-emulated.dll'].read_bytes()
+          # Bind every checked output, including type libraries and notices, to packaging.
+          bundle_files = {str(path.relative_to(Path('app/Madeira'))): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(files + [dock, dock.parent / 'dock-notices.txt'])}
+          manifest = {'source': 'e3a88fddb8daed1f5ac28a45dcb4663d65192629', 'files': bundle_files, 'componentReportSha256': hashlib.sha256(encoded.encode()).hexdigest(), 'i386PeCount': len(images)}
+          Path('i386-bundle-manifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
+          print('PASS: whole policy-selected i386 farm, seven DXMT files, Dock and notices; PE identities and DLL-name closure checked.')
+          PY
+      - name: Inventory actual source-build prerequisites
+        id: runtimeinputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          test "$(git rev-parse HEAD)" = e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          required = [
+              "FEX/build-ios/FEXCore/Source/libFEXCore.a",
+              "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a",
+              "FEX/build-ios/FEXCore/Source/libJemallocLibs.a",
+              "FEX/build-ios/External/fmt/libfmt.a",
+              "FEX/build-ios/External/cephes/libcephes_128bit.a",
+              "FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a",
+              "FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a",
+              "app/Madeira/libwineserver.a",
+              "app/Madeira/libntdll_unix.a",
+              "app/Madeira/libwin32u_unix.a",
+              "app/Madeira/libdxmt_combined.a",
+              "app/Madeira/libavformat.a",
+              "app/Madeira/libavcodec.a",
+              "app/Madeira/libswresample.a",
+              "app/Madeira/libavutil.a",
+              "app/Madeira/libmadeira_rppairing.a",
+              "app/Madeira/x86_64-vcruntime",
+              "app/Madeira/i386-windows/ntdll.dll",
+              "app/Madeira/i386-windows/kernel32.dll",
+              "app/Madeira/i386-windows/msiexec.exe",
+              "app/Madeira/i386-windows/fusion.dll",
+              "app/Madeira/i386-windows/d3d9.dll",
+              "app/Madeira/i386-windows/d3d9shim.dll",
+              "app/Madeira/i386-windows/d3d9-emulated.dll",
+              "app/Madeira/i386-windows/d3d11.dll",
+              "app/Madeira/i386-windows/dxgi.dll",
+              "app/Madeira/i386-windows/d3d10core.dll",
+              "app/Madeira/i386-windows/winemetal.dll",
+              "app/Madeira/arm64ec-windows/dockhost.exe",
+              "app/Madeira/arm64ec-windows/dock-notices.txt",
+              "i386-bundle-manifest.json",
+              "i386-component-report.json",
+          ]
+          missing = [path for path in required if not Path(path).exists()]
+          outcomes = {"media": "${{ steps.media.outcome }}", "pairing": "${{ steps.pairing.outcome }}",
+                      "fex": "${{ steps.fex.outcome }}", "nativewine": "${{ steps.nativewine.outcome }}",
+                      "llvm": "${{ steps.llvm.outcome }}", "graphics": "${{ steps.graphics.outcome }}",
+                      "vcruntime": "${{ steps.vcruntime.outcome }}",
+                      "i386sources": "${{ steps.i386sources.outcome }}", "i386tools": "${{ steps.i386tools.outcome }}",
+                      "i386": "${{ steps.i386.outcome }}", "dock": "${{ steps.dock.outcome }}",
+                      "i386inspect": "${{ steps.i386inspect.outcome }}"}
+          report = {"source": "e3a88fddb8daed1f5ac28a45dcb4663d65192629",
+                    "cloud_sdk_checked": True, "missing_build_inputs": missing,
+                    "dependency_step_outcomes": outcomes,
+                    "game_files_supplied": False, "signing_attempted": False,
+                    "iphone_gameplay_verified": False}
+          print(json.dumps(report, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+              stream.write("\nRuntime source-build input check\n\n")
+              stream.write("Missing inputs: " + str(len(missing)) + "\n")
+              for path in missing:
+                  stream.write("- " + path + "\n")
+              stream.write("\nThis is a build prerequisite probe, not a playable game or signed IPA.\n")
+          if missing or any(value != 'success' for value in outcomes.values()):
+              raise SystemExit("Native runtime dependency builds are required before the app can compile.")
+          PY
+          git submodule status
+          xcodebuild -list -project app/Madeira.xcodeproj -json > "$RUNNER_TEMP/runtime-project.json"
+      - name: Attempt unsigned runtime build only when inputs exist
+        id: unsignedapp
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project runtime/app/Madeira.xcodeproj -scheme Madeira -configuration Debug \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/pc-runtime-derived" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO build > "$RUNNER_TEMP/pc-runtime-build.log" 2>&1 || {
+              tail -n 100 "$RUNNER_TEMP/pc-runtime-build.log"
+              exit 1
+            }
+          printf '\nUnsigned runtime build passed. No game or device test has run.\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Package the new source build for private transfer to this PC
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install openssl@3
+          openssl="$(brew --prefix openssl@3)/bin/openssl"
+          app="$RUNNER_TEMP/pc-runtime-derived/Build/Products/Debug-iphoneos/Madeira.app"
+          package="$RUNNER_TEMP/pc-runtime-package"
+          transfer="$RUNNER_TEMP/pc-runtime-transfer"
+          test -f "$app/Madeira"
+          test ! -e "$package"
+          test ! -e "$transfer"
+          mkdir -p "$package/Payload" "$transfer"
+          ditto "$app" "$package/Payload/Madeira.app"
+          python3 - "$package/Payload/Madeira.app" <<'PY'
+          import pathlib, plistlib, re, subprocess, sys
+          root = pathlib.Path(sys.argv[1]).resolve()
+          # Personal Microsoft DLLs are staged on the PC separately.
+          for path in (root / 'x86_64-vcruntime').glob('*.dll'):
+              assert path.parent.resolve() == root / 'x86_64-vcruntime'
+              path.unlink()
+          for path in root.rglob('*'):
+              if path.is_symlink():
+                  assert path.resolve().is_relative_to(root), path
+              assert path.suffix not in ('.p8', '.mobileprovision'), path
+              assert path.name not in ('pairingFile.plist', 'loginusers.vdf', 'recipient-key.pem'), path
+          info = plistlib.loads((root / 'Info.plist').read_bytes())
+          executable = root / info['CFBundleExecutable']
+          assert executable.resolve().is_relative_to(root)
+          arch = subprocess.check_output(['xcrun', 'lipo', '-archs', str(executable)], text=True).strip()
+          assert arch == 'arm64', arch
+          build = subprocess.check_output(['xcrun', 'vtool', '-show-build', str(executable)], text=True)
+          assert re.search(r'\bplatform\s+IOS\b', build), build
+          print('Candidate executable:', arch, info['CFBundleIdentifier'])
+          print(build)
+          PY
+          ditto -c -k --keepParent "$package/Payload" "$package/runtime-unsigned.ipa"
+          python3 - "$package/runtime-unsigned.ipa" <<'PY'
+          import hashlib, json, pathlib, struct, sys, zipfile
+          ipa = pathlib.Path(sys.argv[1])
+          manifest_bytes = pathlib.Path('runtime/i386-bundle-manifest.json').read_bytes()
+          manifest = json.loads(manifest_bytes)
+          assert manifest['source'] == 'e3a88fddb8daed1f5ac28a45dcb4663d65192629'
+          assert hashlib.sha256(pathlib.Path('runtime/i386-component-report.json').read_bytes()).hexdigest() == manifest['componentReportSha256']
+          expected = manifest['files']
+          prefix = 'Payload/Madeira.app/'
+          required = {'ntdll.dll', 'kernel32.dll', 'msiexec.exe', 'fusion.dll', 'd3d9.dll', 'd3d9shim.dll', 'd3d9-emulated.dll', 'd3d11.dll', 'dxgi.dll', 'd3d10core.dll', 'winemetal.dll'}
+          i386_expected = {path[len('i386-windows/'):] for path in expected if path.startswith('i386-windows/')}
+          assert required <= i386_expected
+          assert {'arm64ec-windows/dockhost.exe', 'arm64ec-windows/dock-notices.txt'} <= set(expected)
+          with zipfile.ZipFile(ipa) as archive:
+              entries = archive.infolist()
+              names = [entry.filename for entry in entries]
+              assert len(names) == len(set(name.casefold() for name in names)), 'duplicate ZIP member names'
+              assert archive.testzip() is None, 'invalid ZIP CRC'
+              actual = {name[len(prefix + 'i386-windows/'):] for name in names if name.startswith(prefix + 'i386-windows/') and not name.endswith('/') and name != prefix + 'i386-windows/.gitkeep'}
+              assert actual == i386_expected, {'missing': sorted(i386_expected - actual), 'extra': sorted(actual - i386_expected)}
+              pe_count = 0
+              for path, digest in expected.items():
+                  relative = pathlib.PurePosixPath(path)
+                  assert not relative.is_absolute() and '..' not in relative.parts and '\\' not in path
+                  source = pathlib.Path('runtime/app/Madeira') / path
+                  assert source.resolve().is_relative_to(pathlib.Path('runtime/app/Madeira').resolve())
+                  assert hashlib.sha256(source.read_bytes()).hexdigest() == digest, ('source changed after component gate', path)
+                  data = archive.read(prefix + path)
+                  assert hashlib.sha256(data).hexdigest() == digest, ('ZIP differs from checked source output', path)
+                  if path.startswith('i386-windows/') and relative.suffix.lower() != '.tlb':
+                      assert data[:2] == b'MZ'
+                      pe = struct.unpack_from('<I', data, 0x3c)[0]
+                      assert data[pe:pe + 4] == b'PE\0\0'
+                      assert struct.unpack_from('<H', data, pe + 4)[0] == 0x14c
+                      assert struct.unpack_from('<H', data, pe + 24)[0] == 0x10b
+                      pe_count += 1
+                  elif path == 'arm64ec-windows/dockhost.exe':
+                      assert data[:2] == b'MZ'
+                      pe = struct.unpack_from('<I', data, 0x3c)[0]
+                      assert data[pe:pe + 4] == b'PE\0\0'
+                      assert struct.unpack_from('<H', data, pe + 4)[0] == 0x8664
+                      assert struct.unpack_from('<H', data, pe + 24)[0] == 0x20b
+              assert pe_count == manifest['i386PeCount'] and pe_count > 0
+          verification = {'i386FarmIncluded': True, 'dockHostIncluded': True, 'dockNoticesIncluded': True,
+                          'i386FarmFileCount': len(i386_expected), 'i386PeCount': pe_count,
+                          'componentManifestSha256': hashlib.sha256(manifest_bytes).hexdigest(),
+                          'componentReportSha256': manifest['componentReportSha256'],
+                          'zipCheckedBeforeEncryption': True, 'system32InstallerPathVerified': False}
+          (ipa.parent / 'i386-package-verification.json').write_text(json.dumps(verification, sort_keys=True, indent=2) + '\n')
+          print(json.dumps(verification, indent=2))
+          PY
+          cat > "$package/recipient-cert.pem" <<'CERT'
+          -----BEGIN CERTIFICATE-----
+          MIIEITCCAomgAwIBAgIUVof5rTcs4vtgvPYb36sruOYKwMMwDQYJKoZIhvcNAQEL
+          BQAwKjEoMCYGA1UEAwwfaVBob25lIFJ1bnRpbWUgUHJpdmF0ZSBUcmFuc2ZlcjAe
+          Fw0yNjEwMjYwMTAzMzhaFw0zNjEwMjMwMTAzMzhaMCoxKDAmBgNVBAMMH2lQaG9u
+          ZSBSdW50aW1lIFByaXZhdGUgVHJhbnNmZXIwggGiMA0GCSqGSIb3DQEBAQUAA4IB
+          jwAwggGKAoIBgQDLK2dh/BK1WvIHv6L/bwNN4iAw2g0ktEjtENVBH6Bt8qM/kP8i
+          Y/2TRJnTPQ50is7iBoO+70tSro0DgZ3Si5aOASv76u6UwlbqcxREOkCAHQ5M07XE
+          hvvM4TPACtHwV7AlGHE003G6LKg3eznH95dlByt+EQsEY/bS08cWiFJIhU5O/V9H
+          tvGow1q/w7azG7skPASUBmK2pjIYJ1KiFcIr+TUYh04Y4MRjBLeC4lQBaLzuJ3eu
+          s7ix2H+W1PZDwqL0ndKKaKmnTo/VUArJtx04HFojDLYsSnxVSnXdL/WR6z8PkcJ4
+          JPkG+SNrR3gf8Z8ef1JHOsxeDntUJR72a92SiSiR3/hd5Os9BXml0y6O7lFRX8AU
+          CDOcbhNhKbosiD0bvRTH1KnxGKegRCUPcWJpHklvfFd4fg5VrwagVYkb1VvBy2kq
+          lJAdO+2234lv0+2zgPSp3BADpWXZHYhfzLDPJEy3DZAGzDM27m/bqIyrs+6HUaJr
+          VB10HlsSgodr3g0CAwEAAaM/MD0wDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMC
+          BDAwHQYDVR0OBBYEFC1oNMrwkpDxf5NPn8lRcuL7x+5vMA0GCSqGSIb3DQEBCwUA
+          A4IBgQBKo5bIM3DJYLT05Vg/JamG0QD0D9kiY0Ym6Khohy1j5rNK1oSpCpoMnIvF
+          aSI3E7+0nv2TN/RfVx02FsGb79gg4mR+bv7nLLNlGmtcvC3qBEjH84dlcxeoAZcL
+          HPk5OLikMb9sd4ZkDW4rPhpPKgB4bSeaJinYolgdClQXJ29bt0LqVWSLUK87QGXg
+          SYVYxbSQd3ba7ipDTSHfi67jmifMuqFS/nt2II1NA0gXqrj/PUQvT/vz1jDO3OPb
+          nQ5k6VxnYgM2QRO2JZlZO7tn3Eg5TNjmGOv7D1YMxSRezd82rHrne8wB8a4Nhz7M
+          K27hyWZwmcRCC36AcKppw9XpDjilxClEQEhmPz4HfnhxIu3XXuvA1uvQIVGPDtPK
+          RYN/CBKkgmurO7WTyJDTeb0FKvxCx4uAgM/g6rBgHnZHLP70BSBSK29QVg2p5Jyn
+          5Vcrxdc7T7hYTzb9ypWGEp1jDqFo3+xLetR7/u2Ir+WlA4fC9ng/HVQDrtc5bdHf
+          fumtzpE=
+          -----END CERTIFICATE-----
+          CERT
+          "$openssl" cms -encrypt -binary -stream -aes-256-gcm \
+            -in "$package/runtime-unsigned.ipa" -out "$transfer/runtime.cms" -outform DER \
+            -recip "$package/recipient-cert.pem" -keyopt rsa_padding_mode:oaep \
+            -keyopt rsa_oaep_md:sha256 -keyopt rsa_mgf1_md:sha256
+          python3 - "$package/runtime-unsigned.ipa" "$transfer" <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys
+          ipa, output = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          def digest(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          component_package = json.loads((ipa.parent / 'i386-package-verification.json').read_text())
+          assert all(component_package[key] is True for key in ('i386FarmIncluded', 'dockHostIncluded', 'dockNoticesIncluded', 'zipCheckedBeforeEncryption'))
+          assert component_package['system32InstallerPathVerified'] is False
+          metadata = {
+              'source': 'e3a88fddb8daed1f5ac28a45dcb4663d65192629',
+              'workflowCommit': os.environ['GITHUB_SHA'], 'runId': os.environ['GITHUB_RUN_ID'],
+              'filename': 'runtime-unsigned.ipa', 'size': ipa.stat().st_size,
+              'sha256': digest(ipa), 'cipherSha256': digest(output / 'runtime.cms'),
+              'recipientCertificateSha256': '40b2d01b43f93ceadc15d7355d0eed38faa2a3c05529bde70faa5c7f40608919',
+              'cipher': 'CMS AES-256-GCM with RSA-OAEP-SHA256',
+              'xcode': subprocess.check_output(['xcodebuild', '-version'], text=True).strip(),
+              'sdk': subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], text=True).strip(),
+              'developerProvisioningPerformed': False, 'gameFilesSupplied': False,
+              'i386RuntimeIncluded': component_package['i386FarmIncluded'],
+              'steamDockIncluded': component_package['dockHostIncluded'],
+              'i386FarmIncluded': component_package['i386FarmIncluded'],
+              'dockHostIncluded': component_package['dockHostIncluded'],
+              'dockNoticesIncluded': component_package['dockNoticesIncluded'],
+              'componentPackaging': component_package,
+              'iphoneGameplayVerified': False, 'x64MicrosoftRuntimeIncluded': False,
+              'next': 'Decrypt and verify on the PC, run normal Windows Security checks, then development-sign and test on the physical iPhone. No new thread required.'
+          }
+          (output / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          assert {path.name for path in output.iterdir()} == {'runtime.cms', 'metadata.json'}
+          assert all(path.is_file() and not path.is_symlink() for path in output.iterdir())
+          print(json.dumps(metadata, indent=2))
+          PY
+      - name: Upload only encrypted personal build and metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pc-runtime-private-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/pc-runtime-transfer/runtime.cms
+            ${{ runner.temp }}/pc-runtime-transfer/metadata.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+
