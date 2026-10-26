@@ -16,17 +16,17 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 180
     steps:
-    - name: "Check out fixed Playport source"
-      uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+    - name: Check out fixed Playport source
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       with:
-        repository: "playportdev/playport"
-        ref: "412de5f8c0bdd26d84e0127eb5776ba992e3b152"
-        persist-credentials: "false"
-        submodules: "false"
-        path: "source"
-    - name: "Provision host tools and select native and iPhone SDKs"
-      id: "tools"
-      shell: "bash"
+        repository: playportdev/playport
+        ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+        persist-credentials: 'false'
+        submodules: 'false'
+        path: source
+    - name: Provision host tools and select native and iPhone SDKs
+      id: tools
+      shell: bash
       run: |
         set -euo pipefail
         brew install bash cmake ninja coreutils llvm@22
@@ -70,9 +70,9 @@ jobs:
         subprocess.run([tools['clang'],'--version'],check=True)
         PY
         brew list --versions bash cmake ninja coreutils llvm@22
-    - name: "Prepare exact DXMT and LLVM sources with complete ordered patches"
-      id: "sources"
-      shell: "bash"
+    - name: Prepare exact DXMT and LLVM sources with complete ordered patches
+      id: sources
+      shell: bash
       run: |
         set -euo pipefail
         cd source
@@ -143,9 +143,56 @@ jobs:
         print('Full DXMT 45+9 series and exact LLVM 15.0.7 verified. No independent Madeira build reused.')
         print('Unix headers are DXMT native/windows + pinned directx headers; Wine PE headers/import libraries are needed only by the later DXMT PE recipe.')
         PY
-    - name: "Build fresh LLVM 15 native headers and complete AIR host tools"
-      id: "host"
-      shell: "bash"
+    - name: Compute exact public LLVM component cache keys
+      id: cache_keys
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt/tmp"
+        python3 - <<'PY'
+        import hashlib,json,os,pathlib,subprocess
+        root=pathlib.Path('.work/cod-dxmt').resolve();t=json.loads((root/'tools.json').read_text())
+        def out(*a):return subprocess.check_output(a,text=True).strip()
+        def sdkhash(path):return hashlib.sha256((pathlib.Path(path)/'SDKSettings.json').read_bytes()).hexdigest()
+        helper="import hashlib,json,pathlib,struct,subprocess,sys\nroot=pathlib.Path(__file__).resolve().parent\nkind,hit=sys.argv[1:3]\nassert kind in ('host','ios') and hit in ('true','false',''),(kind,hit)\nidentity=json.loads((root/'cache-identity.json').read_text())[kind]\nnames=('llvm-as','llvm-dis','llvm-link','llc','opt','llvm-tblgen')\nmanifest=root/('llvm-host/include' if kind=='host' else 'llvm-ios/include')/'cod-dxmt-cache.json'\ndef sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()\ndef macho(data,platform,kind_expected,label):\n assert data[:4]==b'\\xcf\\xfa\\xed\\xfe',(label,'not thin Mach-O64')\n _,cpu,subtype,kind,ncmd,size,flags,reserved=struct.unpack_from('<8I',data)\n assert cpu==0x0100000c and kind==kind_expected,(label,cpu,kind)\n at=32;platforms=[]\n for _ in range(ncmd):\n  cmd,length=struct.unpack_from('<II',data,at)\n  assert length>=8 and at+length<=len(data),(label,at,length)\n  if cmd==0x32:platforms.append(struct.unpack_from('<3I',data,at+8))\n  at+=length\n assert len(platforms)==1 and platforms[0][0]==platform,(label,platforms)\n if platform==2:assert platforms[0][1]==18<<16,(label,platforms)\ndef members(path):\n data=path.read_bytes();assert data[:8]==b'!<arch>\\n',path\n at=8\n while at<len(data):\n  header=data[at:at+60];assert len(header)==60 and header[58:]==b'\\x60\\n',(path,at)\n  size=int(header[48:58]);name=header[:16].decode().strip();body=data[at+60:at+60+size]\n  assert len(body)==size,(path,at,size);at+=60+size+(size%2)\n  if name.startswith('#1/'):\n   count=int(name[3:]);name=body[:count].rstrip(b'\\0').decode();body=body[count:]\n  else:name=name.rstrip('/')\n  if name.startswith('__.SYMDEF') or name in ('','/'):continue\n  yield name,body\n assert at==len(data),(path,at,len(data))\nallowed=([root/'llvm-host/bin'/name for name in names]+[root/'llvm-host/include',root/'llvm-headers/include']\n         if kind=='host' else [root/'llvm-ios/include',*sorted((root/'llvm-ios/lib').glob('libLLVM*.a'))])\nactual={}\nfor path in allowed:\n assert path.exists() and not path.is_symlink(),path\n for item in sorted(path.rglob('*')) if path.is_dir() else [path]:\n  assert not item.is_symlink(),item\n  if item==manifest:continue\n  if item.is_file():\n   assert item.resolve().is_relative_to(root),item\n   actual[str(item.relative_to(root))]=sha(item)\nassert actual\nold=None\nif hit=='true':\n assert not manifest.is_symlink()\n old=json.loads(manifest.read_text())\n # Reject cache identity or digest mismatches before executing any restored tool.\n assert old.get('schema')==2 and old.get('identity')==identity and old.get('files')==actual,'Cache identity or file digest boundary mismatch'\ntargets=None\nif kind=='host':\n assert (root/'llvm-headers/include/llvm/IR/IntrinsicEnums.inc').is_file()\n for build in ('llvm-headers','llvm-host'):\n  assert '#define LLVM_ENABLE_ABI_BREAKING_CHECKS 1' in (root/build/'include/llvm/Config/abi-breaking.h').read_text()\n for name in names:\n  path=root/'llvm-host/bin'/name\n  macho(path.read_bytes(),1,2,name)\n  assert 'LLVM version 15.0.7' in subprocess.check_output([str(path),'--version'],text=True)\nelse:\n assert '#define LLVM_ENABLE_ABI_BREAKING_CHECKS 1' in (root/'llvm-ios/include/llvm/Config/abi-breaking.h').read_text()\n targets=old['targets'] if old else json.loads((root/'llvm-ios-targets.json').read_text())\n archives=sorted('lib/'+p.name for p in (root/'llvm-ios/lib').glob('*.a'))\n assert len(targets)>=30 and archives==targets,(archives,targets)\n total=0\n for archive in sorted((root/'llvm-ios/lib').glob('libLLVM*.a')):\n  rows=list(members(archive));assert rows,archive\n  for name,data in rows:macho(data,2,1,archive.name+'('+name+')');total+=1\n print('Validated all iOS LLVM archive members:',total)\nrecord={'schema':2,'identity':identity,'files':actual,'targets':targets}\nif hit=='true':\n assert not manifest.is_symlink()\n assert json.loads(manifest.read_text())==record,'Cache identity or file digest boundary mismatch'\n print('PASS: restored exact public LLVM '+kind+' cache verified; no build tree or SDK restored.')\nelse:\n manifest.write_text(json.dumps(record,sort_keys=True,indent=2))\n print('PASS: freshly built public LLVM '+kind+' cache eligible only after component validation.')\n"
+        (root/'cache-control.py').write_text(helper)
+        recipes={'host': 'a6dbf74bf13ccb00b82fa6d16ca8ccb32bdc94d2267dc76581233bd5c06632cf', 'ios': '2079c35733602c40977fe98498cbe4a88e75179c8b5c05400112b9bb92e57880'}
+        base={'schema':2,'llvm':'8dfdcc7b7bf66834a761bd8de445840ef68e4d1a',
+              'playport':'412de5f8c0bdd26d84e0127eb5776ba992e3b152',
+              'helper_sha256':hashlib.sha256(helper.encode()).hexdigest(),
+              'xcode':out('xcodebuild','-version'),'compiler':out(t['native']['clang'],'--version'),
+              'mac_sdk':sdkhash(t['macsdk']),'ios_sdk':sdkhash(t['sdk']),
+              'sdk_version':t['sdk_version'],'macsdk':t['macsdk'],'iossdk':t['sdk'],
+              'image_os':os.environ.get('ImageOS',''),'image_version':os.environ.get('ImageVersion',''),
+              'arch':out('uname','-m'),'workspace':str(root),'cmake':out('cmake','--version'),
+              'ninja':out('ninja','--version')}
+        assert base['image_os'] and base['image_version'],'Runner image identity required for exact cache keys'
+        identities={kind:{**base,'kind':kind,'recipe_sha256':digest} for kind,digest in recipes.items()}
+        (root/'cache-identity.json').write_text(json.dumps(identities,sort_keys=True,indent=2))
+        with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+         for kind,identity in identities.items():
+          digest=hashlib.sha256(json.dumps(identity,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+          output.write(kind+'=cod-dxmt-llvm15-'+kind+'-v2-'+digest+'\n')
+        print('Exact LLVM host/iOS cache identities:',json.dumps(identities,sort_keys=True))
+        PY
+    - name: Restore exact public LLVM host component
+      id: host_cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: |
+          source/.work/cod-dxmt/llvm-host/bin/llvm-as
+          source/.work/cod-dxmt/llvm-host/bin/llvm-dis
+          source/.work/cod-dxmt/llvm-host/bin/llvm-link
+          source/.work/cod-dxmt/llvm-host/bin/llc
+          source/.work/cod-dxmt/llvm-host/bin/opt
+          source/.work/cod-dxmt/llvm-host/bin/llvm-tblgen
+          source/.work/cod-dxmt/llvm-host/include
+          source/.work/cod-dxmt/llvm-headers/include
+        key: ${{ steps.cache_keys.outputs.host }}
+    - name: Build fresh LLVM 15 native headers and complete AIR host tools
+      id: host
+      shell: bash
       run: |
         set -euo pipefail
         cd source
@@ -180,30 +227,84 @@ jobs:
         assert (root/'llvm-headers/include/llvm/IR/IntrinsicEnums.inc').is_file()
         print('PASS: fresh native Mac LLVM15 headers/tools; assertions and ABI checks enabled.')
         PY
-    - name: "Assemble all pinned AIR helper modules with typed pointers"
-      id: "air"
-      shell: "bash"
+      if: ${{ steps.host_cache.outputs.cache-hit != 'true' }}
+    - name: Validate restricted public LLVM host cache payload
+      id: host_verify
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        python3 .work/cod-dxmt/cache-control.py host "${{ steps.host_cache.outputs.cache-hit }}"
+    - name: Save only successful public LLVM host component
+      id: host_save
+      if: ${{ !cancelled() && steps.host.outcome == 'success' && steps.host_verify.outcome == 'success' && steps.host_cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: |
+          source/.work/cod-dxmt/llvm-host/bin/llvm-as
+          source/.work/cod-dxmt/llvm-host/bin/llvm-dis
+          source/.work/cod-dxmt/llvm-host/bin/llvm-link
+          source/.work/cod-dxmt/llvm-host/bin/llc
+          source/.work/cod-dxmt/llvm-host/bin/opt
+          source/.work/cod-dxmt/llvm-host/bin/llvm-tblgen
+          source/.work/cod-dxmt/llvm-host/include
+          source/.work/cod-dxmt/llvm-headers/include
+        key: ${{ steps.cache_keys.outputs.host }}
+    - name: Assemble all pinned AIR helper modules with typed pointers
+      id: air
+      shell: bash
       run: |
         set -euo pipefail
         cd source
         export TMPDIR="$PWD/.work/cod-dxmt/tmp"
         python3 - <<'PY'
-        import hashlib,json,pathlib,subprocess
+        import hashlib,json,pathlib,re,subprocess
         repo=pathlib.Path.cwd();root=repo/'.work/cod-dxmt'
         (root/'air').mkdir();(root/'shader-headers').mkdir();report={}
+        assembler=str(root/'llvm-host/bin/llvm-as');disassembler=str(root/'llvm-host/bin/llvm-dis')
+        # LLVM15 llvm-as verifies modules by default; no AIR TargetMachine is required.
+        # https://github.com/llvm/llvm-project/blob/8dfdcc7b7bf66834a761bd8de445840ef68e4d1a/llvm/tools/llvm-as/llvm-as.cpp#L143-L152
+        invalid=root/'air/invalid-verifier-sanity.ll'
+        invalid.write_text('target triple = "air64-apple-macosx14.0.0"\n'
+         'define i32 @invalid_phi(i1 %c) {\nentry: br i1 %c, label %a, label %b\n'
+         'a: br label %join\nb: br label %join\njoin: %x = phi i32 [ 1, %a ]\nret i32 %x\n}\n')
+        negative=subprocess.run([assembler,'-opaque-pointers=0',str(invalid),'-o',str(root/'air/invalid.bc')],text=True,capture_output=True)
+        assert negative.returncode!=0 and 'assembly parsed, but does not verify as correct' in negative.stderr,negative.stderr
+        assert not (root/'air/invalid.bc').exists()
+        def identity(text):
+         result={key:re.search(r'^'+re.escape(key)+r'\s*=\s*"([^"]+)"',text,re.M).group(1)
+                 for key in ('source_filename','target datalayout','target triple')}
+         result['definitions']=sorted(re.findall(r'^define\b[^@\n]*@([^\s(]+)\(',text,re.M))
+         return result
         for name in ('air_msad','air_samplepos','air_tessellation'):
          source=repo/'build/air-helpers'/(name+'.ll');air=root/'air'/(name+'.air')
          subprocess.run([str(root/'llvm-host/bin/llvm-as'),'-opaque-pointers=0',str(source),'-o',str(air)],check=True)
-         subprocess.run([str(root/'llvm-host/bin/opt'),'-opaque-pointers=0','-verify','-disable-output',str(air)],check=True)
+         source_id=identity(source.read_text())
+         assert source_id['target triple']=='air64-apple-macosx14.0.0',source_id
+         dis=root/'air'/(name+'.roundtrip.ll')
+         subprocess.run([disassembler,'-opaque-pointers=0',str(air),'-o',str(dis)],check=True)
+         assert identity(dis.read_text())==source_id,(name,identity(dis.read_text()),source_id)
+         subprocess.run([assembler,'-opaque-pointers=0',str(dis),'-o',str(root/'air'/(name+'.roundtrip.bc'))],check=True)
+         # Embed the original pinned-source AIR, never the roundtrip or a substituted triple.
          subprocess.run(['xxd','-n',name,'-i',str(air),str(root/'shader-headers'/(name+'.h'))],check=True)
          report[name]={suffix:hashlib.sha256(path.read_bytes()).hexdigest() for suffix,path in
                        [('source',source),('air',air),('header',root/'shader-headers'/(name+'.h'))]}
+         report[name]['identity']=source_id
+        assert '*' in (root/'air/air_tessellation.roundtrip.ll').read_text(),'Expected typed pointer syntax absent'
         (root/'air-result.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
         print('PASS: only pinned helper IR assembled/verified. No title inputs or iOS code execution.')
         PY
-    - name: "Build every configured LLVM iOS static archive with matching ABI checks"
-      id: "ios"
-      shell: "bash"
+    - name: Restore exact public LLVM ios component
+      id: ios_cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: |
+          source/.work/cod-dxmt/llvm-ios/lib/libLLVM*.a
+          source/.work/cod-dxmt/llvm-ios/include
+        key: ${{ steps.cache_keys.outputs.ios }}
+    - name: Build every configured LLVM iOS static archive with matching ABI checks
+      id: ios
+      shell: bash
       run: |
         set -euo pipefail
         cd source
@@ -243,9 +344,26 @@ jobs:
         assert actual==targets,('Missing or unexpected LLVM archives',targets,actual)
         print('PASS: every configured LLVM iOS archive built; no target executable run.')
         PY
-    - name: "Compile all 23 matched DXMT Unix objects with a checked 150-slot boundary"
-      id: "dxmt"
-      shell: "bash"
+      if: ${{ steps.ios_cache.outputs.cache-hit != 'true' }}
+    - name: Validate restricted public LLVM ios cache payload
+      id: ios_verify
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        python3 .work/cod-dxmt/cache-control.py ios "${{ steps.ios_cache.outputs.cache-hit }}"
+    - name: Save only successful public LLVM ios component
+      id: ios_save
+      if: ${{ !cancelled() && steps.ios.outcome == 'success' && steps.ios_verify.outcome == 'success' && steps.ios_cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: |
+          source/.work/cod-dxmt/llvm-ios/lib/libLLVM*.a
+          source/.work/cod-dxmt/llvm-ios/include
+        key: ${{ steps.cache_keys.outputs.ios }}
+    - name: Compile all 23 matched DXMT Unix objects with a checked 150-slot boundary
+      id: dxmt
+      shell: bash
       run: |
         set -euo pipefail
         cd source
@@ -311,9 +429,9 @@ jobs:
         subprocess.run([t['ios']['ar'],'rcs',str(root/'libdxmt_unix.a'),*map(str,objects)],check=True)
         print('PASS: all 23 Unix objects compiled, including compiled 150-slot assertions for both call tables.')
         PY
-    - name: "Combine and inspect every iOS archive member and unresolved external"
-      id: "inspect"
-      shell: "bash"
+    - name: Combine and inspect every iOS archive member and unresolved external
+      id: inspect
+      shell: bash
       run: |
         set -euo pipefail
         cd source
@@ -378,13 +496,13 @@ jobs:
         subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
         print('PASS: complete matched DXMT Unix + LLVM15 archive; every payload is iOS ARM64; exact member multiset retained. Unresolved symbols inventoried, not a full app claim.')
         PY
-    - name: "Record bounded component status"
-      if: "${{ always() }}"
-      shell: "bash"
+    - name: Record bounded component status
+      if: ${{ always() }}
+      shell: bash
       run: |
         set -euo pipefail
         printf '%s\n' \
          'Source-only matched DXMT Unix + LLVM15 component gate; no PE side, final app link, signing or device test.' \
          'Tools: ${{ steps.tools.outcome }}; sources: ${{ steps.sources.outcome }}; native headers/AIR tools: ${{ steps.host.outcome }}; AIR: ${{ steps.air.outcome }}; all iOS LLVM archives: ${{ steps.ios.outcome }}; 23 Unix objects: ${{ steps.dxmt.outcome }}; archive inspection: ${{ steps.inspect.outcome }}.' \
-         'Fresh exact sources and complete patches; Xcode SDK stays in place; no independent Madeira library reuse, source-build cache or artifact uploads.' \
+         'Fresh exact sources and complete patches; Xcode SDK stays in place; no independent Madeira library reuse, only six public LLVM host binaries/generated headers and iOS LLVM libraries/headers cached; no SDK/source tree or runtime artifact uploads.' \
          'Next step after a pass: build DXMT PE from the same patched tree and matching Wine PE inputs, then full app closure in this thread. No new thread required.' >> "$GITHUB_STEP_SUMMARY"
