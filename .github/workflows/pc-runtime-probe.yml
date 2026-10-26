@@ -420,5 +420,107 @@ jobs:
               exit 1
             }
           printf '\nUnsigned runtime build passed. No game or device test has run.\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Package the new source build for private transfer to this PC
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install openssl@3
+          openssl="$(brew --prefix openssl@3)/bin/openssl"
+          app="$RUNNER_TEMP/pc-runtime-derived/Build/Products/Debug-iphoneos/Madeira.app"
+          package="$RUNNER_TEMP/pc-runtime-package"
+          transfer="$RUNNER_TEMP/pc-runtime-transfer"
+          test -f "$app/Madeira"
+          test ! -e "$package"
+          test ! -e "$transfer"
+          mkdir -p "$package/Payload" "$transfer"
+          ditto "$app" "$package/Payload/Madeira.app"
+          python3 - "$package/Payload/Madeira.app" <<'PY'
+          import pathlib, plistlib, re, subprocess, sys
+          root = pathlib.Path(sys.argv[1]).resolve()
+          # Personal Microsoft DLLs are staged on the PC separately.
+          for path in (root / 'x86_64-vcruntime').glob('*.dll'):
+              assert path.parent.resolve() == root / 'x86_64-vcruntime'
+              path.unlink()
+          for path in root.rglob('*'):
+              if path.is_symlink():
+                  assert path.resolve().is_relative_to(root), path
+              assert path.suffix not in ('.p8', '.mobileprovision'), path
+              assert path.name not in ('pairingFile.plist', 'loginusers.vdf', 'recipient-key.pem'), path
+          info = plistlib.loads((root / 'Info.plist').read_bytes())
+          executable = root / info['CFBundleExecutable']
+          assert executable.resolve().is_relative_to(root)
+          arch = subprocess.check_output(['xcrun', 'lipo', '-archs', str(executable)], text=True).strip()
+          assert arch == 'arm64', arch
+          build = subprocess.check_output(['xcrun', 'vtool', '-show-build', str(executable)], text=True)
+          assert re.search(r'\bplatform\s+IOS\b', build), build
+          print('Candidate executable:', arch, info['CFBundleIdentifier'])
+          print(build)
+          PY
+          ditto -c -k --keepParent "$package/Payload" "$package/runtime-unsigned.ipa"
+          cat > "$package/recipient-cert.pem" <<'CERT'
+          -----BEGIN CERTIFICATE-----
+          MIIEITCCAomgAwIBAgIUVof5rTcs4vtgvPYb36sruOYKwMMwDQYJKoZIhvcNAQEL
+          BQAwKjEoMCYGA1UEAwwfaVBob25lIFJ1bnRpbWUgUHJpdmF0ZSBUcmFuc2ZlcjAe
+          Fw0yNjEwMjYwMTAzMzhaFw0zNjEwMjMwMTAzMzhaMCoxKDAmBgNVBAMMH2lQaG9u
+          ZSBSdW50aW1lIFByaXZhdGUgVHJhbnNmZXIwggGiMA0GCSqGSIb3DQEBAQUAA4IB
+          jwAwggGKAoIBgQDLK2dh/BK1WvIHv6L/bwNN4iAw2g0ktEjtENVBH6Bt8qM/kP8i
+          Y/2TRJnTPQ50is7iBoO+70tSro0DgZ3Si5aOASv76u6UwlbqcxREOkCAHQ5M07XE
+          hvvM4TPACtHwV7AlGHE003G6LKg3eznH95dlByt+EQsEY/bS08cWiFJIhU5O/V9H
+          tvGow1q/w7azG7skPASUBmK2pjIYJ1KiFcIr+TUYh04Y4MRjBLeC4lQBaLzuJ3eu
+          s7ix2H+W1PZDwqL0ndKKaKmnTo/VUArJtx04HFojDLYsSnxVSnXdL/WR6z8PkcJ4
+          JPkG+SNrR3gf8Z8ef1JHOsxeDntUJR72a92SiSiR3/hd5Os9BXml0y6O7lFRX8AU
+          CDOcbhNhKbosiD0bvRTH1KnxGKegRCUPcWJpHklvfFd4fg5VrwagVYkb1VvBy2kq
+          lJAdO+2234lv0+2zgPSp3BADpWXZHYhfzLDPJEy3DZAGzDM27m/bqIyrs+6HUaJr
+          VB10HlsSgodr3g0CAwEAAaM/MD0wDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMC
+          BDAwHQYDVR0OBBYEFC1oNMrwkpDxf5NPn8lRcuL7x+5vMA0GCSqGSIb3DQEBCwUA
+          A4IBgQBKo5bIM3DJYLT05Vg/JamG0QD0D9kiY0Ym6Khohy1j5rNK1oSpCpoMnIvF
+          aSI3E7+0nv2TN/RfVx02FsGb79gg4mR+bv7nLLNlGmtcvC3qBEjH84dlcxeoAZcL
+          HPk5OLikMb9sd4ZkDW4rPhpPKgB4bSeaJinYolgdClQXJ29bt0LqVWSLUK87QGXg
+          SYVYxbSQd3ba7ipDTSHfi67jmifMuqFS/nt2II1NA0gXqrj/PUQvT/vz1jDO3OPb
+          nQ5k6VxnYgM2QRO2JZlZO7tn3Eg5TNjmGOv7D1YMxSRezd82rHrne8wB8a4Nhz7M
+          K27hyWZwmcRCC36AcKppw9XpDjilxClEQEhmPz4HfnhxIu3XXuvA1uvQIVGPDtPK
+          RYN/CBKkgmurO7WTyJDTeb0FKvxCx4uAgM/g6rBgHnZHLP70BSBSK29QVg2p5Jyn
+          5Vcrxdc7T7hYTzb9ypWGEp1jDqFo3+xLetR7/u2Ir+WlA4fC9ng/HVQDrtc5bdHf
+          fumtzpE=
+          -----END CERTIFICATE-----
+          CERT
+          "$openssl" cms -encrypt -binary -stream -aes-256-gcm \
+            -in "$package/runtime-unsigned.ipa" -out "$transfer/runtime.cms" -outform DER \
+            -recip "$package/recipient-cert.pem" -keyopt rsa_padding_mode:oaep \
+            -keyopt rsa_oaep_md:sha256 -keyopt rsa_mgf1_md:sha256
+          python3 - "$package/runtime-unsigned.ipa" "$transfer" <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys
+          ipa, output = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          def digest(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          metadata = {
+              'source': 'e3a88fddb8daed1f5ac28a45dcb4663d65192629',
+              'workflowCommit': os.environ['GITHUB_SHA'], 'runId': os.environ['GITHUB_RUN_ID'],
+              'filename': 'runtime-unsigned.ipa', 'size': ipa.stat().st_size,
+              'sha256': digest(ipa), 'cipherSha256': digest(output / 'runtime.cms'),
+              'recipientCertificateSha256': '40b2d01b43f93ceadc15d7355d0eed38faa2a3c05529bde70faa5c7f40608919',
+              'cipher': 'CMS AES-256-GCM with RSA-OAEP-SHA256',
+              'xcode': subprocess.check_output(['xcodebuild', '-version'], text=True).strip(),
+              'sdk': subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], text=True).strip(),
+              'developerProvisioningPerformed': False, 'gameFilesSupplied': False,
+              'iphoneGameplayVerified': False, 'x64MicrosoftRuntimeIncluded': False,
+              'next': 'Decrypt and verify on the PC, run normal Windows Security checks, then development-sign and test on the physical iPhone. No new thread required.'
+          }
+          (output / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          assert {path.name for path in output.iterdir()} == {'runtime.cms', 'metadata.json'}
+          assert all(path.is_file() and not path.is_symlink() for path in output.iterdir())
+          print(json.dumps(metadata, indent=2))
+          PY
+      - name: Upload only encrypted personal build and metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pc-runtime-private-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/pc-runtime-transfer/runtime.cms
+            ${{ runner.temp }}/pc-runtime-transfer/metadata.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
 
 
