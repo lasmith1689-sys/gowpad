@@ -1,0 +1,461 @@
+name: CoD matched Steam API Windows source build probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-cod-steamapi-pe-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-cod-steamapi-pe-probe
+  cancel-in-progress: false
+
+jobs:
+  steamapi-pe-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out immutable Playport source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: playportdev/playport
+          ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+          persist-credentials: "false"
+          submodules: "false"
+          path: source
+      - name: Record and verify native Mac compiler inputs
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install bash cmake ninja
+          cd source
+          mkdir -p .work/cod-steamapi-pe/tmp
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import json,pathlib,subprocess
+          root=pathlib.Path('.work/cod-steamapi-pe').resolve()
+          def out(*args):return subprocess.check_output(args,text=True).strip()
+          assert out('uname','-m')=='arm64'
+          tools={name:out('xcrun','--sdk','macosx','--find',name) for name in ('clang','clang++','ld','ar')}
+          tools.update(sdk=out('xcrun','--sdk','macosx','--show-sdk-path'),
+                       sdk_version=out('xcrun','--sdk','macosx','--show-sdk-version'),
+                       bash=out('brew','--prefix','bash')+'/bin/bash',xcode=out('xcodebuild','-version'))
+          assert all(not any(c.isspace() for c in value) for key,value in tools.items() if key!='xcode')
+          subprocess.run([tools['bash'],'-c','(( BASH_VERSINFO[0] >= 5 ))'],check=True)
+          subprocess.run([tools['clang'],'-isysroot',tools['sdk'],'-fuse-ld='+tools['ld'],
+                          '-x','c','-','-o',str(root/'native-link-probe')],
+                         input='int main(void) { return 0; }\n',text=True,check=True)
+          (root/'tools.json').write_text(json.dumps(tools,indent=2));print(json.dumps(tools,indent=2))
+          PY
+      - name: Prepare exact patched GBE and native build-tool sources
+        id: sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import hashlib,json,pathlib,re,subprocess
+          repo=pathlib.Path.cwd();root=repo/'.work/cod-steamapi-pe'
+          def out(*args):return subprocess.check_output(args,text=True).strip()
+          assert out('git','rev-parse','HEAD')=='412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+          pins={p[0]:p[1:3] for line in (repo/'pins.lock').read_text().splitlines()
+                if (p:=line.split()) and not line.startswith('#')}
+          assert pins['gbe']==['7103add7ca6ef3ef8353279219880068f2494fc8','https://github.com/Detanup01/gbe_fork.git']
+          assert pins['abseil-cpp']==['20250512.1','https://github.com/abseil/abseil-cpp.git']
+          def checkout(path,url,revision):
+              assert re.fullmatch(r'[0-9a-f]{40}',revision) and url.startswith('https://')
+              subprocess.run(['git','init',str(path)],check=True)
+              subprocess.run(['git','-C',str(path),'fetch','--depth=1',url,revision],check=True)
+              subprocess.run(['git','-C',str(path),'checkout','--detach','FETCH_HEAD'],check=True)
+              assert out('git','-C',str(path),'rev-parse','HEAD')==revision
+          gbe=root/'gbe';url=pins['gbe'][1]
+          checkout(gbe,url,pins['gbe'][0])
+          links={'third-party/common/linux':'79460394c02dba44e1f92e2d5359d84f0b7aaa54',
+                 'third-party/deps/common':'92a4a130262083c4e887155cbe6bcab99baf36ea'}
+          for path,revision in links.items():
+              assert out('git','-C',str(gbe),'ls-tree','HEAD',path).split()[:3]==['160000','commit',revision]
+          series=[line.strip() for line in (repo/'patches/gbe/series').read_text().splitlines()
+                  if line.strip() and not line.startswith('#')]
+          assert len(series)==6 and len(set(series))==6
+          record={'gbe_base':pins['gbe'][0],'gitlinks':links,'patches':[]}
+          for name in series:
+              assert pathlib.PurePosixPath(name).name==name
+              patch=repo/'patches/gbe'/name
+              record['patches'].append([name,hashlib.sha256(patch.read_bytes()).hexdigest()])
+              subprocess.run(['git','-C',str(gbe),'-c','user.name=GBE source probe','-c','user.email=probe@localhost',
+                              'am','--committer-date-is-author-date',str(patch)],check=True)
+          assert out('git','-C',str(gbe),'rev-parse','HEAD~6')==pins['gbe'][0]
+          for path,revision in links.items():checkout(gbe/path,url,revision)
+          linux=gbe/'third-party/common/linux';deps=gbe/'third-party/deps/common'
+          assert 'https://github.com/premake/premake-core/releases/tag/v5.0.0-beta8' in (linux/'premake/SOURCE.txt').read_text()
+          assert 'protobuf/releases/tag/v34.1' in (deps/'protobuf/SOURCE.txt').read_text()
+          # The annotated tag object and its commit are pinned; no signature claim is made.
+          premake=root/'premake-core'
+          subprocess.run(['git','init',str(premake)],check=True)
+          subprocess.run(['git','-C',str(premake),'fetch','--depth=1','https://github.com/premake/premake-core.git',
+                          'refs/tags/v5.0.0-beta8:refs/tags/v5.0.0-beta8'],check=True)
+          assert out('git','-C',str(premake),'rev-parse','v5.0.0-beta8^{tag}')=='974e64084aa7ceb06a432c3acd5e28cb6ee997e3'
+          assert out('git','-C',str(premake),'rev-parse','v5.0.0-beta8^{commit}')=='2ca338a25ed5f6e62d36c9cd70e5f313953c630d'
+          subprocess.run(['git','-C',str(premake),'checkout','--detach','v5.0.0-beta8'],check=True)
+          checkout(root/'abseil-cpp',pins['abseil-cpp'][1],'76bb24329e8bf5f39704eb10d21b9a80befa7c81')
+          archive=deps/'protobuf/protobuf.tar.gz'
+          blob=out('git','-C',str(deps),'ls-tree','HEAD','protobuf/protobuf.tar.gz').split()[2]
+          assert out('git','-C',str(deps),'hash-object','protobuf/protobuf.tar.gz')==blob
+          record.update(premake_commit='2ca338a25ed5f6e62d36c9cd70e5f313953c630d',
+                        premake_tag_object='974e64084aa7ceb06a432c3acd5e28cb6ee997e3',premake_tag_signature_verified=False,
+                        abseil_commit='76bb24329e8bf5f39704eb10d21b9a80befa7c81',
+                        protobuf_git_blob=blob,protobuf_archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
+          (root/'sources.json').write_text(json.dumps(record,indent=2));print(json.dumps(record,indent=2))
+          PY
+      - name: Source-build Premake beta8 as native Mac ARM64
+        id: premake
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import difflib,hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path('.work/cod-steamapi-pe').resolve();t=json.loads((root/'tools.json').read_text())
+          source=root/'premake-core';original=(source/'Bootstrap.mak').read_text()
+          # Only the osx recipe's Linux CPU-count expression is replaced by a bounded job count.
+          before='./build/bootstrap/premake_bootstrap --arch=$(PLATFORM) --to=build/bootstrap $(PREMAKE_OPTS) gmake\n\t$(MAKE) -C build/bootstrap -j`getconf _NPROCESSORS_ONLN` config=$(CONFIG)'
+          assert original.count(before)==1
+          adapted=original.replace(before,before.replace('-j`getconf _NPROCESSORS_ONLN`','-j3'))
+          adapter=root/'Bootstrap-macos.mak';adapter.write_text(adapted)
+          print(''.join(difflib.unified_diff(original.splitlines(True),adapted.splitlines(True),fromfile='pinned Bootstrap.mak',tofile='Mac bounded-job adapter')))
+          env=dict(os.environ)
+          for key in ('CC','CXX','OBJC','AR','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT','TOOLCHAINS'):env.pop(key,None)
+          env['SDKROOT']=t['sdk']
+          cc=t['clang']+' -isysroot '+t['sdk']+' -fuse-ld='+t['ld']
+          cxx=t['clang++']+' -isysroot '+t['sdk']+' -fuse-ld='+t['ld']
+          subprocess.run(['make','-f',str(adapter),'osx','PLATFORM=AARCH64','CONFIG=release',
+                          'CC='+cc,'CXX='+cxx,'AR='+t['ar']],cwd=source,env=env,check=True)
+          binary=source/'bin/release/premake5'
+          assert binary.is_file() and not binary.is_symlink()
+          # Native Mach-O and version execution are gated in the final native-tool/codegen step.
+          (root/'premake-build.json').write_text(json.dumps({'bootstrapSourceSha256':hashlib.sha256(original.encode()).hexdigest(),
+              'bootstrapAdapterSha256':hashlib.sha256(adapted.encode()).hexdigest(),'binarySha256':hashlib.sha256(binary.read_bytes()).hexdigest()},indent=2))
+          PY
+      - name: Build native protoc from the pinned embedded source archive
+        id: protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,shutil,subprocess,tarfile
+          root=pathlib.Path('.work/cod-steamapi-pe').resolve();t=json.loads((root/'tools.json').read_text())
+          def safe_extract(archive,destination):
+              assert not destination.exists(),destination
+              destination.mkdir(parents=True)
+              with tarfile.open(archive,'r:gz') as source:
+                  entries=source.getmembers();assert 0<len(entries)<=50000
+                  names=set();total=0
+                  for member in entries:
+                      path=pathlib.PurePosixPath(member.name)
+                      assert not path.is_absolute() and '..' not in path.parts and '\\' not in member.name
+                      assert path.parts and path.parts[0]=='protobuf' and ':' not in member.name
+                      assert member.name not in names,'duplicate archive member'
+                      names.add(member.name)
+                      assert not member.issym() and not member.islnk() and (member.isdir() or member.isfile()),member.name
+                      assert 0<=member.size<=128*1024**2
+                      total+=member.size;assert total<=1024**3
+                      target=destination.joinpath(*path.parts)
+                      assert target.resolve().is_relative_to(destination.resolve())
+                  for member in entries:
+                      target=destination.joinpath(*pathlib.PurePosixPath(member.name).parts)
+                      if member.isdir():target.mkdir(parents=True,exist_ok=True)
+                      else:
+                          target.parent.mkdir(parents=True,exist_ok=True)
+                          assert not target.exists(),target
+                          with source.extractfile(member) as reader,target.open('xb') as writer:shutil.copyfileobj(reader,writer)
+          archive=root/'gbe/third-party/deps/common/protobuf/protobuf.tar.gz'
+          extracted=root/'host-protoc';safe_extract(archive,extracted);source=extracted/'protobuf'
+          dependencies=(source/'cmake/dependencies.cmake').read_text()
+          assert re.search(r'^set\(abseil-cpp-version "20250512\.1"\)',dependencies,re.M)
+          assert 'set(protobuf_VERSION_STRING "7.34.1")' in (source/'CMakeLists.txt').read_text()
+          assert (source/'third_party/utf8_range/CMakeLists.txt').is_file(),'Embedded utf8_range source is required'
+          env=dict(os.environ)
+          for key in ('CC','CXX','OBJC','AR','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT','TOOLCHAINS'):env.pop(key,None)
+          subprocess.run(['cmake','-G','Ninja','-S',str(source),'-B',str(extracted/'build'),
+              '-DCMAKE_BUILD_TYPE=Release','-DCMAKE_C_COMPILER='+t['clang'],'-DCMAKE_CXX_COMPILER='+t['clang++'],
+              '-DCMAKE_OSX_SYSROOT='+t['sdk'],'-DCMAKE_OSX_ARCHITECTURES=arm64',
+              '-DCMAKE_EXE_LINKER_FLAGS=-isysroot '+t['sdk']+' -fuse-ld='+t['ld'],
+              '-Dprotobuf_BUILD_TESTS=OFF','-Dprotobuf_FORCE_FETCH_DEPENDENCIES=ON',
+              '-DFETCHCONTENT_SOURCE_DIR_ABSL='+str(root/'abseil-cpp'),'-DFETCHCONTENT_FULLY_DISCONNECTED=ON',
+              '-Dprotobuf_WITH_ZLIB=OFF'],env=env,check=True)
+          subprocess.run(['ninja','-C',str(extracted/'build'),'-j3','protoc'],env=env,check=True)
+          print('Exact embedded protobuf source and disconnected Abseil compiled for this Mac; no Windows dependency graph built.')
+          PY
+      - name: Gate native tools and generate the actual GBE protocol sources
+        id: codegen
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import hashlib,json,pathlib,struct,subprocess
+          root=pathlib.Path('.work/cod-steamapi-pe').resolve();gbe=root/'gbe'
+          def macho(data):
+              assert data[:4]==b'\xcf\xfa\xed\xfe','Expected thin native Mach-O64'
+              _,cpu,subtype,kind,ncmd,size,flags,reserved=struct.unpack_from('<8I',data)
+              assert cpu==0x0100000c and kind==2,(cpu,kind)
+              at=32;platforms=[]
+              for _ in range(ncmd):
+                  command,length=struct.unpack_from('<II',data,at)
+                  assert length>=8 and at+length<=len(data)
+                  if command==0x32:platforms.append(struct.unpack_from('<I',data,at+8)[0])
+                  at+=length
+              assert platforms==[1],platforms
+          premake=root/'premake-core/bin/release/premake5';protoc=root/'host-protoc/build/protoc'
+          macho(premake.read_bytes());macho(protoc.read_bytes())
+          premake_version=subprocess.check_output([str(premake),'--version'],text=True).strip()
+          assert '5.0.0-beta8' in premake_version,premake_version
+          protoc_version=subprocess.check_output([str(protoc),'--version'],text=True).strip()
+          assert protoc_version=='libprotoc 34.1',protoc_version
+          output=root/'codegen';output.mkdir();(output/'tf2').mkdir()
+          include=root/'host-protoc/protobuf/src';tf2=sorted((gbe/'dll/gc_tf2').glob('*.proto'));assert tf2
+          groups=[([gbe/'dll'/'gc_steam/steammessages.proto'],[gbe/'dll/gc_steam'],output),
+                  (tf2,[gbe/'dll/gc_steam',gbe/'dll/gc_tf2'],output/'tf2'),
+                  ([gbe/'dll/net.proto'],[gbe/'dll'],output)]
+          expected=set();inputs={}
+          for sources,paths,destination in groups:
+              args=[str(protoc),'-I'+str(include),*('-I'+str(path) for path in paths),
+                    '--cpp_out='+str(destination),*map(str,sources)]
+              subprocess.run(args,cwd=gbe,check=True)
+              for source in sources:
+                  assert source.is_file()
+                  inputs[str(source.relative_to(gbe))]=hashlib.sha256(source.read_bytes()).hexdigest()
+                  for extension in ('.pb.cc','.pb.h'):
+                      name=str((destination/(source.stem+extension)).relative_to(output))
+                      assert name not in expected,name
+                      expected.add(name)
+          actual={str(path.relative_to(output)) for path in output.rglob('*') if path.is_file()}
+          assert actual==expected,(actual,expected)
+          generated={name:hashlib.sha256((output/name).read_bytes()).hexdigest() for name in sorted(actual)}
+          assert all((output/name).stat().st_size>0 for name in actual)
+          result={'nativeBuildToolsOnly':True,'windowsDllsBuilt':False,'gameOrAccountInputUsed':False,
+                  'premakeVersion':premake_version,'protocVersion':protoc_version,'inputs':inputs,'generated':generated,
+                  'premakeSha256':hashlib.sha256(premake.read_bytes()).hexdigest(),
+                  'protocSha256':hashlib.sha256(protoc.read_bytes()).hexdigest()}
+          (root/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+          for tree in (gbe,gbe/'third-party/common/linux',gbe/'third-party/deps/common',root/'premake-core',root/'abseil-cpp'):
+              subprocess.run(['git','-C',str(tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
+          subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
+          print('PASS: native ARM64 Mac source-built tools and actual GBE protocol code generation only; no Windows DLL or runtime compatibility claim.')
+          PY
+      - name: Verify Mac extractor and exact Windows cross-compiler with both standard CRT links
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install coreutils sevenzip make
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          root="$PWD/.work/cod-steamapi-pe"
+          mkdir -p "$root/inputs"
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL --retry 3 \
+            -o "$root/inputs/llvm-mingw.tar.xz" \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz
+          printf '%s  %s\n' 52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3 "$root/inputs/llvm-mingw.tar.xz" | shasum -a 256 -c -
+          tar -xf "$root/inputs/llvm-mingw.tar.xz" -C "$root/inputs"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,shutil,subprocess
+          root=pathlib.Path('.work/cod-steamapi-pe').resolve();t=json.loads((root/'tools.json').read_text())
+          def out(*args):return subprocess.check_output(args,text=True).strip()
+          t['extractor']=out('brew','--prefix','sevenzip')+'/bin/7zz'
+          t['gnu_path']=out('brew','--prefix','coreutils')+'/libexec/gnubin:'+out('brew','--prefix','make')+'/libexec/gnubin'
+          mingw=root/'inputs/llvm-mingw-20260922-ucrt-macos-universal'
+          assert mingw.is_dir()
+          print(out(str(mingw/'bin/clang'),'--version'))
+          t['mingw']=str(mingw)
+          assert pathlib.Path(t['extractor']).is_file()
+          print(out(t['extractor'],'i'))
+          env=dict(os.environ)
+          for key in ('CC','CXX','OBJC','AR','AS','RANLIB','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT','TOOLCHAINS','MACOSX_DEPLOYMENT_TARGET','IPHONEOS_DEPLOYMENT_TARGET'):env.pop(key,None)
+          env['PATH']=t['gnu_path']+os.pathsep+env.get('PATH','')
+          t['make']=shutil.which('make',path=env['PATH']);assert t['make']
+          assert 'GNU Make' in out(t['make'],'--version')
+          source='#include <vector>\nextern "C" __declspec(dllexport) int crt_probe(int n) { volatile char stack[32768]; stack[n & 32767]=42; std::vector<int> v{1,2,3}; return stack[n & 32767]+v.at(n%3); }\n'
+          probes=[]
+          for compiler,arch in [('x86_64-w64-mingw32-clang++','x86_64'),('i686-w64-mingw32-clang++','i386')]:
+              output=root/('crt-probe-'+arch+'.dll')
+              subprocess.run([str(mingw/'bin'/compiler),'-shared','-static','-O0','-x','c++','-',
+                              '-Wl,--no-insert-timestamp','-o',str(output)],input=source,text=True,env=env,check=True)
+              headers=out(str(mingw/'bin/llvm-readobj'),'--file-headers',str(output))
+              expected='IMAGE_FILE_MACHINE_AMD64' if arch=='x86_64' else 'IMAGE_FILE_MACHINE_I386'
+              assert expected in headers,headers
+              probes.append({'arch':arch,'sha256':hashlib.sha256(output.read_bytes()).hexdigest()})
+          result=subprocess.run(['python3','build/steamapi-vtables.py',str(mingw/'bin/clang++'),str(root/'gbe/sdk'),str(root/'vtables-early')],env=env,capture_output=True,text=True)
+          print(result.stdout);print(result.stderr)
+          assert result.returncode==0,'Original Steam interface vtable checker failed'
+          match=re.search(r'(\d+) interfaces match MSVC.*?(\d+) architectures',result.stdout)
+          assert match and int(match.group(1))>0 and int(match.group(2))==2,result.stdout
+          (root/'tools.json').write_text(json.dumps(t,indent=2))
+          (root/'cross-compiler-proof.json').write_text(json.dumps({'crtProbes':probes,'vtableProof':result.stdout,
+              'toolchainArchiveSha256':hashlib.sha256((root/'inputs/llvm-mingw.tar.xz').read_bytes()).hexdigest(),
+              'targetBinariesExecuted':False},indent=2))
+          PY
+      - name: Prepare the narrow Mac host adapter for the frozen deps and api stages
+        id: adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import difflib,hashlib,json,pathlib,shlex,shutil,subprocess
+          repo=pathlib.Path.cwd();root=repo/'.work/cod-steamapi-pe';t=json.loads((root/'tools.json').read_text())
+          adapter=root/'adapter';(adapter/'stages').mkdir(parents=True)
+          values={'PLAYPORT_REPO':str(repo),'PLAYPORT_BUILD':str(root),'LLVM_MINGW':t['mingw'],
+                  'JOBS':'3','GBE_EXTRACTOR':t['extractor']}
+          (adapter/'env.sh').write_text('\n'.join('export '+key+'='+shlex.quote(value) for key,value in values.items())+'\n')
+          shutil.copy2(repo/'build/lib.sh',adapter/'lib.sh')
+          shutil.copy2(repo/'build/steamapi-vtables.py',adapter/'steamapi-vtables.py')
+          (root/'tools').mkdir()
+          shutil.copy2(root/'premake-core/bin/release/premake5',root/'tools/premake5')
+          original=(repo/'build/stages/steamapi.sh').read_text();adapted=original
+          assert 'DEPS="ssq zlib mbedtls curl protobuf opus portaudio sdl"' in adapted
+          before='$(command -v 7za)';assert adapted.count(before)==2
+          adapted=adapted.replace(before,'$GBE_EXTRACTOR')
+          before='(cd "$ROOT/pe" && sha256sum */*.dll)';assert adapted.count(before)==1
+          adapted=adapted.replace(before,'if [[ " $STAGES " == *" api "* ]]; then '+before+'; fi')
+          script=adapter/'stages/steamapi.sh';script.write_text(adapted)
+          subprocess.run([t['bash'],'-n',str(script)],check=True)
+          # Only Mac 7zz selection and the deps-only footer are adapted. All target recipes, arch tuples and libraries stay frozen.
+          print(''.join(difflib.unified_diff(original.splitlines(True),adapted.splitlines(True),fromfile='pinned steamapi.sh',tofile='Mac deps/api adapter')))
+          (root/'adapter-proof.json').write_text(json.dumps({'originalSha256':hashlib.sha256(original.encode()).hexdigest(),
+              'adapterSha256':hashlib.sha256(adapted.encode()).hexdigest(),
+              'nativePremakeSha256':hashlib.sha256((root/'tools/premake5').read_bytes()).hexdigest()},indent=2))
+          PY
+      - name: Build all eight frozen dependency groups for both Windows architectures
+        id: deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess
+          root=pathlib.Path('.work/cod-steamapi-pe').resolve();t=json.loads((root/'tools.json').read_text())
+          env=dict(os.environ)
+          for key in ('CC','CXX','OBJC','AR','AS','RANLIB','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT','TOOLCHAINS','MACOSX_DEPLOYMENT_TARGET','IPHONEOS_DEPLOYMENT_TARGET'):env.pop(key,None)
+          env['PATH']=t['gnu_path']+os.pathsep+env.get('PATH','')
+          try:subprocess.run([t['bash'],str(root/'adapter/stages/steamapi.sh'),str(root),'deps'],env=env,check=True)
+          finally:
+              for log in sorted(root.glob('deps-*.log')):print(log.name,log.read_text()[-10000:])
+          record={};readobj=str(pathlib.Path(t['mingw'])/'bin/llvm-readobj')
+          for bits,machine,triple in [('64','IMAGE_FILE_MACHINE_AMD64','x86_64'),('32','IMAGE_FILE_MACHINE_I386','i686')]:
+              record[bits]={}
+              for component in ('libssq','zlib','mbedtls','curl','protobuf','opus','portaudio','sdl'):
+                  base=root/'deps'/component;build=base/('build'+bits)
+                  systems=list(build.glob('CMakeFiles/*/CMakeSystem.cmake'))
+                  assert len(systems)==1 and 'CMAKE_SYSTEM_NAME "Windows"' in systems[0].read_text(),(component,bits,systems)
+                  compilers=list(build.glob('CMakeFiles/*/CMake*Compiler.cmake'));assert compilers,(component,bits)
+                  for compiler in compilers:
+                      content=compiler.read_text()
+                      if compiler.name in ('CMakeCCompiler.cmake','CMakeCXXCompiler.cmake'):
+                          assert str(pathlib.Path(t['mingw'])/'bin'/(triple+'-w64-mingw32-clang')) in content,(component,bits,compiler)
+                  libraries=sorted((base/('install'+bits)/'lib').glob('*.a'));assert libraries,(component,bits)
+                  rows=[]
+                  for archive in libraries:
+                      text=subprocess.check_output([readobj,'--file-headers',str(archive)],text=True)
+                      machines=re.findall(r'^\s*Machine:\s+(\S+)',text,re.M)
+                      assert machines and set(machines)=={machine},(archive,machines)
+                      rows.append({'file':str(archive.relative_to(root)),'sha256':hashlib.sha256(archive.read_bytes()).hexdigest(),'membersChecked':len(machines)})
+                  record[bits][component]=rows
+              cache=(root/'deps/protobuf'/('build'+bits)/'CMakeCache.txt').read_text()
+              assert 'FETCHCONTENT_SOURCE_DIR_ABSL:PATH='+str(root/'abseil-cpp') in cache
+              assert 'FETCHCONTENT_FULLY_DISCONNECTED:BOOL=ON' in cache
+          (root/'dependencies-proof.json').write_text(json.dumps(record,indent=2));print(json.dumps(record,indent=2))
+          PY
+      - name: Build both full api_regular DLLs with original ABI and host-authentication patches
+        id: api
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path('.work/cod-steamapi-pe').resolve();t=json.loads((root/'tools.json').read_text())
+          env=dict(os.environ)
+          for key in ('CC','CXX','OBJC','AR','AS','RANLIB','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT','TOOLCHAINS','MACOSX_DEPLOYMENT_TARGET','IPHONEOS_DEPLOYMENT_TARGET'):env.pop(key,None)
+          env['PATH']=t['gnu_path']+os.pathsep+env.get('PATH','')
+          try:subprocess.run([t['bash'],str(root/'adapter/stages/steamapi.sh'),str(root),'api'],env=env,check=True)
+          finally:
+              for pattern in ('make-api-*.log','premake.log'):
+                  for log in sorted(root.glob(pattern)):print(log.name,log.read_text()[-10000:])
+          generated=root/'gbe/proto_gen/win';native=root/'codegen'
+          expected={str(path.relative_to(native)):hashlib.sha256(path.read_bytes()).hexdigest() for path in native.rglob('*') if path.is_file()}
+          actual={str(path.relative_to(generated)):hashlib.sha256(path.read_bytes()).hexdigest() for path in generated.rglob('*') if path.is_file()}
+          assert actual==expected,'api stage did not use the exact matching native protoc outputs'
+          print('PASS: both full regular DLLs built; original vtable checker reran; original six patches and host authentication bridge retained. No DLL executed.')
+          PY
+      - name: Audit real Windows DLL headers complete exports imports and reproducible release settings
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
+          python3 - <<'PY'
+          import hashlib,json,pathlib,re,struct,subprocess
+          root=pathlib.Path('.work/cod-steamapi-pe').resolve();t=json.loads((root/'tools.json').read_text())
+          tool=str(pathlib.Path(t['mingw'])/'bin/llvm-readobj')
+          expected={'x86_64-windows/steam_api64.dll':(0x8664,0x20b),'i386-windows/steam_api.dll':(0x14c,0x10b)}
+          assert {str(path.relative_to(root/'pe')) for path in (root/'pe').rglob('*') if path.is_file()}==set(expected)
+          system={'advapi32.dll','bcrypt.dll','comctl32.dll','comdlg32.dll','dbghelp.dll','dwmapi.dll','gdi32.dll',
+                  'imm32.dll','iphlpapi.dll','kernel32.dll','msvcrt.dll','ntdll.dll','ole32.dll','oleaut32.dll',
+                  'opengl32.dll','secur32.dll','setupapi.dll','shell32.dll','shlwapi.dll','ucrtbase.dll','user32.dll',
+                  'userenv.dll','version.dll','winmm.dll','wldap32.dll','ws2_32.dll','xinput1_3.dll'}
+          result={}
+          for relative,(machine,magic) in expected.items():
+              path=root/'pe'/relative;data=path.read_bytes();assert data[:2]==b'MZ'
+              at=struct.unpack_from('<I',data,0x3c)[0];assert data[at:at+4]==b'PE\0\0'
+              actual_machine,sections,stamp,ptr,count,optional_size,characteristics=struct.unpack_from('<HHIIIHH',data,at+4)
+              assert actual_machine==machine and characteristics&0x2000 and struct.unpack_from('<H',data,at+24)[0]==magic
+              assert stamp==0,'Link must retain --no-insert-timestamp'
+              assert b'Wine builtin DLL' not in data[:4096] and b'Wine placeholder DLL' not in data[:4096]
+              for prefix in (str(root).encode(),str(pathlib.Path.cwd()).encode(),str(pathlib.Path.home()).encode()):
+                  assert prefix not in data,(relative,'Current runner build path embedded')
+              text=subprocess.check_output([tool,'--coff-imports','--coff-exports','--sections',str(path)],text=True)
+              exports=set(re.findall(r'Export\s*\{[^}]*?\bName:\s*(\S+)',text,re.S))
+              assert len(exports)>=1000 and {'SteamAPI_Init','SteamAPI_RunCallbacks','SteamInternal_CreateInterface'}<=exports,(relative,len(exports))
+              imports=[]
+              for block in re.findall(r'(?:DelayImport|Import)\s*\{([^}]+)\}',text,re.S):
+                  name=re.search(r'\bName:\s*(\S+)',block).group(1)
+                  assert name.lower() in system or re.fullmatch(r'api-ms-win-crt-[a-z0-9-]+\.dll',name.lower()),(relative,'Unexpected non-system runtime dependency',name)
+                  imports.append({'dll':name,'symbols':re.findall(r'^\s*Symbol:\s+(.+)',block,re.M)})
+              assert imports
+              assert not re.search(r'^\s*Name:\s+\.debug_',text,re.M),'Frozen release symbols=Off must be retained'
+              result[relative]={'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),'machine':hex(machine),
+                  'coffTimestamp':stamp,'exports':sorted(exports),'imports':imports,'noPostBuildStripPerformed':True}
+          for tree in (root/'gbe',root/'gbe/third-party/common/linux',root/'gbe/third-party/deps/common',root/'premake-core',root/'abseil-cpp'):
+              subprocess.run(['git','-C',str(tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
+          subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
+          report={'windowsDllsBuilt':True,'phoneOrGameExecuted':False,'hostOwnershipOrAuthenticationTested':False,
+                  'scope':'source-built regular DLL components only; imported DLL/symbol inventory is not closure against the later complete Wine/app bundle',
+                  'dlls':result}
+          (root/'steamapi-pe-result.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
+          PY
+      - name: Record bounded Windows component outcomes
+        if: "${{ always() }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Full matched GBE source component probe: own native Premake/protoc prerequisites, all eight dependency groups for x86/x64, and original api_regular DLLs.' \
+            'Native tools/codegen ${{ steps.codegen.outcome }}; exact cross-compiler/vtables ${{ steps.toolchain.outcome }}; Mac adapter ${{ steps.adapter.outcome }}; both dependency graphs ${{ steps.deps.outcome }}; both DLLs ${{ steps.api.outcome }}; PE audit ${{ steps.inspect.outcome }}.' \
+            'No runtime/artifact/cache upload, SDK export, account/game input, authentication action, target execution or phone compatibility claim.' \
+            'Next after a pass: inspect the exact DLL results and integrate only with matching Playport source/app ownership and authentication checks; verify final bundle imports/resources before later device tests. Continue in the current thread; no new thread required.' >> "$GITHUB_STEP_SUMMARY"
