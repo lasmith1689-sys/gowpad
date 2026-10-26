@@ -59,43 +59,14 @@ jobs:
           for lib in avformat avcodec swresample avutil; do
             xcrun lipo -info "app/Madeira/lib$lib.a"
           done
-      - name: Build on-device pairing library from locked source
-        id: pairing
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup target add aarch64-apple-ios
-          cd runtime
-          bash build/rppairing-ios/build.sh
-          xcrun lipo -info app/Madeira/libmadeira_rppairing.a
-      - name: Build CPU translation core from pinned submodule
-        id: fex
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          brew install cmake ninja ccache
-          cd runtime
-          git submodule update --init --depth 1 --recursive FEX
-          export CMAKE_BUILD_PARALLEL_LEVEL=3
-          cmake -S FEX -B FEX/build-ios -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_FEX_LINUX_TESTS=OFF \
-            -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
-            -DTUNE_CPU=cortex-a78
-          bash build/fex-ios/build.sh
-          cmake --build FEX/build-ios --target JemallocLibs
-          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore.a
-          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
       - name: Build native Windows API libraries from pinned source
         id: nativewine
+        if: ${{ steps.media.outcome == 'success' }}
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          brew install bison flex pkg-config llvm
+          brew install cmake bison flex pkg-config llvm
           export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$(brew --prefix llvm)/bin:$PATH"
           cd runtime
           git submodule update --init --depth 1 wine
@@ -118,10 +89,18 @@ jobs:
           python3 - <<'PY'
           import re, subprocess
           from pathlib import Path
-          source = Path('wine/include/Makefile.in').read_text()
-          targets = sorted(set('include/' + item[:-4] + '.h'
-                               for item in re.findall(r'[A-Za-z0-9_./]+\.idl', source)))
-          subprocess.run(['make', '-C', 'wine/build-macos', '-j3', *targets], check=True)
+          makefile = Path('wine/build-macos/Makefile').read_text().replace('\\\n', ' ')
+          targets = set()
+          for line in makefile.splitlines():
+              if line.startswith(('\t', '#')) or ':' not in line:
+                  continue
+              for target in line.split(':', 1)[0].split():
+                  if re.fullmatch(r'include/[A-Za-z0-9_./-]+\.h', target):
+                      targets.add(target)
+          assert {'include/dwrite.h', 'include/dwrite_3.h', 'include/mfobjects.h', 'include/mftransform.h'} <= targets
+          print(f'Building {len(targets)} Wine headers with actual Makefile targets.')
+          result = subprocess.run(['make', '-C', 'wine/build-macos', '-j3', *sorted(targets)])
+          raise SystemExit(result.returncode)
           PY
           mkdir -p wine/build-arm64ec
           ln -s "$PWD/wine/build-macos/include" wine/build-arm64ec/include
@@ -174,6 +153,38 @@ jobs:
           }
           for lib in wineserver ntdll_unix win32u_unix; do xcrun lipo -info "app/Madeira/lib$lib.a"; done
           bash build/stage-licenses.sh
+      - name: Build on-device pairing library from locked source
+        id: pairing
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          cd runtime
+          bash build/rppairing-ios/build.sh
+          xcrun lipo -info app/Madeira/libmadeira_rppairing.a
+      - name: Build CPU translation core from pinned submodule
+        id: fex
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake ninja ccache
+          cd runtime
+          git submodule update --init --depth 1 --recursive FEX
+          export CMAKE_BUILD_PARALLEL_LEVEL=3
+          cmake -S FEX -B FEX/build-ios -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
+            -DTUNE_CPU=cortex-a78
+          bash build/fex-ios/build.sh
+          cmake --build FEX/build-ios --target JemallocLibs
+          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore.a
+          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
       - name: Restore LLVM libraries built by this source recipe
         id: llvm-cache
         if: ${{ steps.nativewine.outcome == 'success' }}
