@@ -88,6 +88,19 @@ namespace ps2_perf
     };
     inline Hitch hitch;
     inline std::atomic<uint32_t> longestFlipGapUs{0}; // this window's longest gap between game frames (guestEntry)
+    // GOW-Port: GS GL-thread progress, for the EE clock hold (EeScheduler, GOW_VBLANK_CATCHUP): chunks queued and not
+    // finished, and when the GL thread last finished one. Work pending with no progress for a while = a host stall.
+    inline std::atomic<int64_t> glPendingChunks{0};
+    inline std::atomic<uint64_t> glProgressNanos{0};
+    inline bool glStalled(uint64_t thresholdNanos)
+    {
+        if (glPendingChunks.load(std::memory_order_acquire) <= 0)
+            return false;
+        const uint64_t last = glProgressNanos.load(std::memory_order_acquire);
+        const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()); // (the same clock as nowNanos below)
+        return last != 0u && now > last && now - last > thresholdNanos;
+    }
     // GS GL thread: what a slow draw inside the current queued op did (first use of a program, texture decodes...),
     // attached to that op's hitch note and cleared after it
     inline thread_local std::string slowDrawDetail;

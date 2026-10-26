@@ -3789,6 +3789,11 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
     Impl::GpuSpan gpuSpan(d, Impl::GpuPresent);
     d.reportGlError("present");
     ++d.presentCount;
+    // GOW_TEST_HITCH_MS=<ms> (tests): the GL thread stalls that long every 600 presents, to check how the game clock
+    // rides out a hitch (gow-speed lines)
+    static const int testHitchMs = [] { const char *v = std::getenv("GOW_TEST_HITCH_MS"); return v ? std::atoi(v) : 0; }();
+    if (testHitchMs > 0 && d.presentCount % 600 == 300)
+        std::this_thread::sleep_for(std::chrono::milliseconds(testHitchMs));
     d.dumpAfterSkip = false;
     d.frameBatch = 0;
     d.reportStats();

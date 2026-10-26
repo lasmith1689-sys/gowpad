@@ -1906,6 +1906,20 @@ void EeScheduler::processPendingEvents()
     applyPendingPreemption();
 }
 
+// GOW-Port: GOW_VBLANK_CATCHUP (processDueDeadlines): EE clock hold over GS stalls + paced VBlank catch-up. iOS default on.
+static bool vblankPacedCatchUp()
+{
+    static const bool on = [] {
+        const char *v = std::getenv("GOW_VBLANK_CATCHUP");
+#if defined(PS2X_IOS)
+        return !(v && *v == '0');
+#else
+        return v && *v == '1';
+#endif
+    }();
+    return on;
+}
+
 void EeScheduler::processDueDeadlines()
 {
     for (;;)
@@ -1982,6 +1996,40 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // GOW-Port: EE clock hold (with the paced catch-up below, GOW_VBLANK_CATCHUP; iOS default). A host stall
+                // of the GS GL thread (work queued, none finished for GOW_VBLANK_HOLD_MS, default 50) left the game
+                // waiting for its frame while guest time ran on; the game then measured one long frame, capped it at
+                // 4 fields and the rest of the stall was lost (speed 0.79 on the iPhone). While such a stall lasts this
+                // field does not start: the guest stops at its first cycle, its clock (EE timers, IOP) holds, the game
+                // sees a normal frame, and the catch-up replays the held time afterwards. At most GOW_VBLANK_HOLD_MAX_MS
+                // (default 1000) per stall. The SPU2 output plays silence while held.
+                if (vblankPacedCatchUp())
+                {
+                    static const uint64_t holdAfter = [] { const char *v = std::getenv("GOW_VBLANK_HOLD_MS"); return v ? std::strtoull(v, nullptr, 10) : 50ull; }() * 1000000ull;
+                    static const auto holdMax = std::chrono::milliseconds([] { const char *v = std::getenv("GOW_VBLANK_HOLD_MAX_MS"); return v ? std::atol(v) : 1000L; }());
+                    static std::chrono::steady_clock::time_point holdStart{};
+                    static uint64_t holds = 0;
+                    const auto now = std::chrono::steady_clock::now();
+                    if (ps2_perf::glStalled(holdAfter))
+                    {
+                        if (holdStart == std::chrono::steady_clock::time_point{})
+                        {
+                            holdStart = now;
+                            ++holds;
+                        }
+                        if (now - holdStart < holdMax)
+                        {
+                            scheduleEvent(scheduled.deadlineCycle, now + std::chrono::milliseconds(2), scheduled.event);
+                            continue;
+                        }
+                    }
+                    else if (holdStart != std::chrono::steady_clock::time_point{})
+                    {
+                        std::fprintf(stderr, "[vblank-hold] #%llu held the EE clock %.0f ms over a GS stall\n", static_cast<unsigned long long>(holds),
+                                     std::chrono::duration<double, std::milli>(now - holdStart).count());
+                        holdStart = {};
+                    }
+                }
                 // GOW-Port: GOW_VBLANK_DIAG=1 prints the guest VBlank rate and how far the host deadline lags
                 // behind the wall clock (a lag means VBlanks are cycle-paced and can run faster than 60 Hz).
                 static const bool vblankDiag = std::getenv("GOW_VBLANK_DIAG") != nullptr;
@@ -2000,30 +2048,44 @@ void EeScheduler::processDueDeadlines()
                         windowStart = wall;
                     }
                 }
-                // GOW-Port: GOW_VBLANK_MAX_LAG=<fields> (iOS default 2, elsewhere off): the next field's host deadline
-                // follows this one's, so after a stall every missed field came back to back and the game ran fast in
-                // bursts (jerky menus reading > 90 fps on the iPhone). Further behind than that, the grid restarts one
-                // field before now: the missed fields are dropped (the game steps by its own clock) instead.
-                static const long maxLagFields = [] {
-                    const char *v = std::getenv("GOW_VBLANK_MAX_LAG");
-#if defined(PS2X_IOS)
-                    return v ? std::atol(v) : 2L;
-#else
-                    return v ? std::atol(v) : 0L;
-#endif
-                }();
-                auto hostBase = scheduled.hostDeadline;
+                // GOW-Port: after a stall the fields' host deadlines are in the past. By default (the PC) the next field
+                // follows this one's deadline, so every missed field comes back to back: the game catches up in a burst
+                // (jerky menus reading > 90 fps on the iPhone). GOW_VBLANK_CATCHUP=1 (iOS default) paces the catch-up:
+                // the fields stay on their unbroken 60 Hz grid (the anchor), but one is never due sooner than
+                // GOW_VBLANK_CATCHUP_RATE (default 0.6) of a field after the previous one, so the game runs at most
+                // 1.67x until it is back on the grid (time held over a GS stall, above, is replayed this way; speed
+                // averages 1.00). More than GOW_VBLANK_MAX_DEBT_MS (default 1000, a load) behind, the grid restarts at
+                // now. GOW_VBLANK_MAX_LAG=<fields> instead drops whatever is further behind (no catch-up).
+                static const long maxLagFields = [] { const char *v = std::getenv("GOW_VBLANK_MAX_LAG"); return v ? std::atol(v) : 0L; }();
+                static const double catchUpRate = [] { const char *v = std::getenv("GOW_VBLANK_CATCHUP_RATE"); return v ? std::atof(v) : 0.6; }();
+                static const auto maxDebt = std::chrono::milliseconds([] { const char *v = std::getenv("GOW_VBLANK_MAX_DEBT_MS"); return v ? std::atol(v) : 1000L; }());
+                static std::chrono::steady_clock::time_point anchor{}; // this field's place on the unbroken grid
+                const auto now = std::chrono::steady_clock::now();
+                auto hostBase = scheduled.hostDeadline;   // where the VBlank end and the pacing points are laid out from
+                auto nextField = hostBase + kVBlankPeriod; // the next field's host deadline
                 if (maxLagFields > 0)
                 {
-                    const auto now = std::chrono::steady_clock::now();
                     if (now - hostBase > kVBlankPeriod * maxLagFields)
                         hostBase = now - kVBlankPeriod;
+                    nextField = hostBase + kVBlankPeriod;
                 }
+                else if (vblankPacedCatchUp())
+                {
+                    if (anchor == std::chrono::steady_clock::time_point{})
+                        anchor = scheduled.hostDeadline;
+                    anchor += kVBlankPeriod;
+                    if (now - anchor > maxDebt)
+                        anchor = now; // too far behind (a load): the missed time is not replayed
+                    const auto soonest = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(kVBlankPeriod * catchUpRate);
+                    nextField = std::max(anchor, soonest);
+                    hostBase = std::max(nextField - kVBlankPeriod, now - kVBlankPeriod);
+                }
+                const auto fieldSpan = nextField - hostBase; // one field, or less while catching up
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              hostBase + kVBlankDuration,
+                              hostBase + std::min<std::chrono::steady_clock::duration>(kVBlankDuration, fieldSpan / 2),
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              hostBase + kVBlankPeriod,
+                              nextField,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
                 // GOW-Port: pacing points on the VBlank grid (cycle and host deadline in lockstep, no-op event). The
                 // guest clock may not run ahead of the wall clock by more than 1/16 field inside a frame: recompiled
@@ -2032,7 +2094,7 @@ void EeScheduler::processDueDeadlines()
                 // frame step (>= 1 field) ran 3 % fast at 60 fps (docs/performance.md, game speed).
                 for (uint64_t k = 1; k < kPaceSteps; ++k)
                     scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles * k / kPaceSteps,
-                                  hostBase + kVBlankPeriod * k / kPaceSteps,
+                                  hostBase + fieldSpan * k / kPaceSteps,
                                   EeEvent{EeEventType::ExternalWake, 0xFFFFFFFFu, ~0ull});
             }
             processEvent(scheduled.event);

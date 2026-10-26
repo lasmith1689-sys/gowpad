@@ -262,6 +262,9 @@ void GSThreadedBackend::PublishLocked()
                       { return m_stop || m_pending.size() < m_queueChunkLimit; });
         m_pending.push_back(std::move(m_open));
         ++m_published;
+        // (the EE clock hold's stall signal, ps2_perf::glStalled: an idle GL thread's clock starts at the first new chunk)
+        if (ps2_perf::glPendingChunks.fetch_add(1, std::memory_order_acq_rel) == 0)
+            ps2_perf::glProgressNanos.store(ps2_perf::nowNanos(), std::memory_order_release);
         if (!m_spare.empty())
         {
             next = std::move(m_spare.back());
@@ -331,6 +334,8 @@ void GSThreadedBackend::WorkerLoop()
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             ++m_completed;
+            ps2_perf::glProgressNanos.store(ps2_perf::nowNanos(), std::memory_order_release);
+            ps2_perf::glPendingChunks.fetch_sub(1, std::memory_order_acq_rel);
             if (m_spare.size() < 64u)
                 m_spare.push_back(std::move(chunk));
         }
