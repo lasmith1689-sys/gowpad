@@ -168,6 +168,7 @@ jobs:
         spec=importlib.util.spec_from_file_location('mechanics',helper);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
         env=dict(os.environ,DEVELOPER_DIR=t['developer'],TMPDIR=str(root/'tmp'),LC_ALL='C');env['PATH']=t['llvm']+os.pathsep+env.get('PATH','')
         invocations=[json.loads(line) for line in (root/'linker-invocations.jsonl').read_text().splitlines()]
+        print(json.dumps({'phase':'before-linker-guards','actualLinkerInvocations':invocations},indent=2),flush=True)
         assert len(invocations)>=2,'Toolset did not invoke the exact native linker adapter for both executables'
         for args in invocations:
             assert args[:2]==['-oso_prefix',str(root)+'/']
@@ -179,8 +180,9 @@ jobs:
         for product,entry,required in [('Playport-App','_main',{'@executable_path/Frameworks'}),
             ('PlayportJIT-Extension','_NSExtensionMain',{'@executable_path/Frameworks','@executable_path/../../Frameworks'})]:
             path=binary_directory/product;data=path.read_bytes();metadata=m.macho(data)
+            print(json.dumps({'phase':'before-image-guards','product':product,'parsedMachOMetadata':metadata,'actualLinkerInvocations':invocations,'requiredRpaths':sorted(required),'allowedRpaths':sorted(required|{'/usr/lib/swift'})},indent=2),flush=True)
             assert metadata['type']==2 and metadata['build'][1]==26<<16 and metadata['signaturePresent'] is False
-            assert required<=set(metadata['rpaths'])<=required|{'/usr/lib/swift'}
+            assert required<=set(metadata['rpaths'])<=required|{'/usr/lib/swift'},('Unexpected executable rpaths',product,metadata['rpaths'],sorted(required),sorted(required|{'/usr/lib/swift'}))
             assert all(name.startswith(('/System/Library/','/usr/lib/')) for name in metadata['dylibs'])
             text=subprocess.check_output([str(pathlib.Path(t['llvm'])/'llvm-nm'),'--defined-only','-n',str(path)],env=env,text=True)
             names={p[2]:int(p[0],16) for line in text.splitlines() if len(p:=line.split())==3}
