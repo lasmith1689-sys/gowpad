@@ -39,7 +39,7 @@ jobs:
         assert header[0]==0xfeedfacf and header[1]==0x100000c and header[3]==2\nresult=json.loads(run([binary]));assert\
         \ result['status']=='passed'\nassert result['wordPairCases']==146560 and result['unsupportedPolicies']==9\n\
         dylib=root/'libNativeScalar32.dylib'\nrun([clang,'-target','arm64-apple-ios26.0','-isysroot',ios,*common,'-ffreestanding',\n\
-        \     '-fno-stack-protector','-nostdlib','-dynamiclib','-Wl,-no_adhoc_codesign',\n     '-install_name','@rpath/libNativeScalar32.dylib',root/'scalar32.c','-o',dylib])\n\
+        \     '-fno-stack-protector','-nostdlib','-lSystem','-dynamiclib','-Wl,-no_adhoc_codesign',\n     '-install_name','@rpath/libNativeScalar32.dylib',root/'scalar32.c','-o',dylib])\n\
         image=dylib.read_bytes();magic,cpu,subtype,kind,count,size,flags,reserved=struct.unpack_from('<8I',image)\n\
         assert magic==0xfeedfacf and cpu==0x100000c and kind==6\nat=32;versions=[];signed=False\nfor _ in range(count):\n\
         \    command,length=struct.unpack_from('<II',image,at);assert length>=8 and at+length<=32+size\n    if command==0x32:versions.append(struct.unpack_from('<4I',image,at+8))\n\
