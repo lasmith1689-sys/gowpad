@@ -1,0 +1,367 @@
+name: CoD matched Wine PE and FEX source probe
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - codex/pc-games-runtime-probe-20261025
+    paths:
+    - .github/workflows/pc-cod-pe-fex-probe.yml
+permissions:
+  contents: read
+concurrency:
+  group: pc-cod-pe-fex-probe
+  cancel-in-progress: false
+jobs:
+  cod-pe-fex-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+    - name: Check out fixed Playport source
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: playportdev/playport
+        ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+        persist-credentials: 'false'
+        submodules: 'false'
+        path: source
+    - name: Provision bounded host tools and Xcode SDK paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        brew install cmake ninja make bison flex pkgconf llvm@22 gettext coreutils autoconf automake libtool
+        cd source
+        root="$PWD/.work/cod-pe-fex"
+        mkdir -p "$root/tmp" "$root/inputs"
+        export TMPDIR="$root/tmp"
+        python3 -m venv "$root/venv"
+        "$root/venv/bin/python" -m pip install pefile
+        "$root/venv/bin/python" - <<'PY'
+        import json,pathlib,shutil,subprocess
+        root=pathlib.Path('.work/cod-pe-fex').resolve()
+        assert subprocess.check_output(['uname','-m'],text=True).strip()=='arm64'
+        def out(*a):return subprocess.check_output(a,text=True).strip()
+        version=out('xcrun','--sdk','iphoneos','--show-sdk-version')
+        assert int(version.split('.')[0])>=26,version
+        free=shutil.disk_usage(root).free
+        assert free>=20*1024**3,'Need at least 20 GiB scratch disk for full Wine PE/FEX compilation'
+        record={
+         'iossdk':out('xcrun','--sdk','iphoneos','--show-sdk-path'),
+         'macsdk':out('xcrun','--sdk','macosx','--show-sdk-path'),
+         'macld':out('xcrun','--sdk','macosx','--find','ld'),
+         'llvm':out('brew','--prefix','llvm@22'), 'sdk_version':version,'disk_free_bytes':free,
+        }
+        (root/'tools.json').write_text(json.dumps(record,indent=2))
+        print(json.dumps(record,indent=2))
+        subprocess.run(['xcodebuild','-version'],check=True)
+        subprocess.run(['xcrun','--sdk','macosx','clang','-isysroot',record['macsdk'],
+         '-fuse-ld='+record['macld'],'-x','c','-','-o',str(root/'native-link-probe')],
+         input='int main(void) { return 0; }\n',text=True,check=True)
+        PY
+        brew list --versions cmake ninja make bison flex pkgconf llvm@22 gettext coreutils autoconf automake libtool
+    - name: Verify the official matching Mac PE compiler package
+      id: toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-pe-fex/tmp"
+        mkdir -p "$TMPDIR"
+        root="$PWD/.work/cod-pe-fex"
+        mkdir -p "$root/inputs"
+        # Official release API asset 581762292: digest independently read before this workflow was prepared.
+        # https://api.github.com/repos/mstorsjo/llvm-mingw/releases/assets/581762292
+        curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+          -o "$root/inputs/llvm-mingw.tar.xz" \
+          https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz
+        printf '%s  %s\n' 52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3 "$root/inputs/llvm-mingw.tar.xz" | shasum -a 256 -c -
+        tar -xf "$root/inputs/llvm-mingw.tar.xz" -C "$root/inputs"
+        mingw="$root/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+        "$mingw/bin/clang" --version
+        printf 'int configure_probe(void) { return 0; }\n' | \
+          "$mingw/bin/clang" --target=aarch64-windows-gnu -x c - -c -o "$root/configure-probe.obj"
+        "$mingw/bin/llvm-readobj" --file-headers "$root/configure-probe.obj" | grep -q 'Machine: IMAGE_FILE_MACHINE_ARM64 '
+        printf 'Matching 20260922 toolchain verified for configure/header probes. No ARM64EC CRT or production PE/FEX build is claimed.\n'
+    - name: Prepare exact PE source, FEX provenance and CRT source pins
+      id: sources
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-pe-fex"
+        export TMPDIR="$root/tmp"
+        "$root/venv/bin/python" - <<'PY'
+        import hashlib,json,pathlib,re,subprocess
+        repo=pathlib.Path.cwd(); root=repo/'.work/cod-pe-fex'
+        expected={
+         'madeira':('8c050d03f4d89096e1e2e2c8bb44479fffd86619','https://github.com/willfaust/Madeira.git'),
+         'wine':('455e3509b98a6919fd4ad1def4803e08c41c03b2','https://gitlab.winehq.org/wine/wine.git'),
+         'wine-port':('723d1bf5132768276cea9bc35ab59c83557bb5fb','https://github.com/willfaust/wine.git'),
+         'wine-valve':('750fd011356cfcb28125c96d295ddef0d9e66dac','https://github.com/ValveSoftware/wine.git'),
+         'fex':('3648ee97e8354bb2e6757da8bdb00c48439a561d','https://github.com/FEX-Emu/FEX.git'),
+         'fex-port':('0f8edf8f6383ae8085e0ffac511c789cdae97514','https://github.com/willfaust/FEX.git'),
+         'rpmalloc':('09142d726429416bfa7b459151515fe3ab7622dd','https://github.com/FEX-Emu/rpmalloc.git'),
+         'rpmalloc-port':('1f271c0c3202663801a0aec32bdb57e5241d6a0e','https://github.com/willfaust/rpmalloc.git'),
+        }
+        pins={p[0]:p[1:3] for line in (repo/'pins.lock').read_text().splitlines()
+              if (p:=line.split()) and not line.startswith('#')}
+        for name,value in expected.items():assert pins[name]==list(value),(name,pins[name])
+        assert pins['gstreamer']==['1.28.7','https://gstreamer.freedesktop.org/data/pkg/ios']
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()=='412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+        rows={}
+        for component,count in [('wine-port',57),('wine-valve',132),('wine-pe',42),('fex-port',63),('fex',40),('rpmalloc-port',16),('rpmalloc',3)]:
+         names=[l.strip() for l in (repo/'patches'/component/'series').read_text().splitlines() if l.strip() and not l.startswith('#')]
+         assert len(names)==count and len(set(names))==count,component
+         rows[component]=[]
+         for name in names:
+          assert pathlib.PurePosixPath(name).name==name,name
+          path=repo/'patches'/component/name
+          digest=hashlib.sha256(path.read_bytes()).hexdigest()
+          rows[component].append([name,digest]);print('patch',component,name,digest,flush=True)
+        def checkout(name,revision,url):
+         assert re.fullmatch(r'[0-9a-f]{40}',revision) and url.startswith('https://'),(name,revision,url)
+         target=root/name; target.parent.mkdir(parents=True,exist_ok=True)
+         subprocess.run(['git','init',str(target)],check=True)
+         subprocess.run(['git','-C',str(target),'fetch','--depth=1',url,revision],check=True)
+         subprocess.run(['git','-C',str(target),'checkout','--detach','FETCH_HEAD'],check=True)
+         assert subprocess.check_output(['git','-C',str(target),'rev-parse','HEAD'],text=True).strip()==revision
+         return target
+        m=checkout('madeira',*expected['madeira'])
+        # The published PE recipe uses pristine frozen Madeira build/madeira_cfg.h.
+        for path,key in [('wine','wine-port'),('FEX','fex-port')]:
+         actual=subprocess.check_output(['git','-C',str(m),'ls-tree','HEAD',path],text=True).split()[2]
+         assert actual==expected[key][0],(path,actual)
+        fport=checkout('fex-port-provenance',*expected['fex-port'])
+        assert subprocess.check_output(['git','-C',str(fport),'ls-tree','HEAD','External/rpmalloc'],text=True).split()[2]==expected['rpmalloc-port'][0]
+        # This tree intentionally has wine-pe, not the native archive tree's wine-unix series.
+        w=checkout('pe/wine',*expected['wine'])
+        for component in ('wine-port','wine-valve','wine-pe'):
+         paths=[str(repo/'patches'/component/name) for name,_ in rows[component]]
+         subprocess.run(['git','-C',str(w),'-c','user.name=CoD PE source probe','-c','user.email=probe@localhost',
+                         'am','--committer-date-is-author-date',*paths],check=True)
+        assert subprocess.check_output(['git','-C',str(w),'rev-parse','HEAD~231'],text=True).strip()==expected['wine'][0]
+        (root/'pe/build').symlink_to(m/'build',target_is_directory=True)
+        crt=checkout('mingw-w64','57b595039040eaa15bece85b7cc71d952281b269','https://github.com/mingw-w64/mingw-w64.git')
+        assert (crt/'mingw-w64-crt/configure').is_file()
+        (root/'sources.json').write_text(json.dumps({'pins':expected,'patches':rows,'crt':'57b595039040eaa15bece85b7cc71d952281b269'},indent=2))
+        print('PE/FEX/CRT source pins and complete applicable patch series verified. No independent Madeira outputs reused.')
+        PY
+    - name: Inspect and rebuild exact EC-capable CRT, then link a real C++ probe DLL
+      id: crt
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-pe-fex"
+        mingw="$root/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+        export TMPDIR="$root/tmp"
+        export PATH="$mingw/bin:$(brew --prefix make)/libexec/gnubin:$PATH"
+        unset CC CXX OBJC CFLAGS CXXFLAGS CPPFLAGS LDFLAGS SDKROOT
+        "$mingw/bin/clang" --version
+        mkdir -p "$root/crt-build"
+        # Upstream Makefile.am installs ARM64 libraries under <prefix>/lib.
+        # Match llvm-mingw's per-target prefix so the rebuilt CRT is actually used.
+        # Inventory actual package symbols before the documented in-place EC CRT rebuild.
+        "$mingw/bin/llvm-nm" --defined-only -j "$mingw/aarch64-w64-mingw32/lib/libmingw32.a" > "$root/crt-before-symbols.txt"
+        (cd "$root/crt-build" && \
+         "$root/mingw-w64/mingw-w64-crt/configure" \
+         --prefix="$mingw/aarch64-w64-mingw32" --host=aarch64-w64-mingw32 \
+         --disable-lib32 --disable-lib64 --enable-libarm64 --enable-arm64x \
+         --with-default-msvcrt=ucrt --enable-cfguard --enable-silent-rules)
+        make -C "$root/crt-build" -j3
+        make -C "$root/crt-build" install
+        "$root/venv/bin/python" - <<'PY'
+        import hashlib,pathlib,re,shutil,subprocess
+        root=pathlib.Path('.work/cod-pe-fex').resolve()
+        m=root/'inputs/llvm-mingw-20260922-ucrt-macos-universal'
+        resource=pathlib.Path(subprocess.check_output([str(m/'bin/clang'),'--print-resource-dir'],text=True).strip())
+        builtins=resource/'lib/windows/libclang_rt.builtins-aarch64.a'
+        assert builtins.is_file(),builtins
+        lib=m/'aarch64-w64-mingw32/lib'
+        for name in ('libgcc.a','libgcc_eh.a','libgcc_s.a'):
+         shutil.copy2(builtins,lib/name)
+         print('Matching builtins alias:',name,hashlib.sha256((lib/name).read_bytes()).hexdigest())
+        for name in ('libc++.a','libc++abi.a','libunwind.a','libmingwex.a','libmingw32.a','libucrt.a','libmsvcrt.a'):
+         assert (lib/name).is_file(),name
+        before=(root/'crt-before-symbols.txt').read_text()
+        after=subprocess.check_output([str(m/'bin/llvm-nm'),'--defined-only','-j',str(lib/'libmingw32.a')],text=True)
+        (root/'crt-after-symbols.txt').write_text(after)
+        print('CRT symbols before/after:',len(before.splitlines()),len(after.splitlines()))
+        print('CRT EC/dispatch symbols:',[s for s in after.splitlines() if s.startswith('#') or 'arm64x' in s][:80])
+        probe=root/'ec-crt-probe.cpp'
+        probe.write_text('#include <string>\n#include <vector>\n#include <cstdlib>\n'
+         '__declspec(noinline) static int stack_probe(int n) { volatile unsigned char v[32768]; '
+         'for (int i=0;i<32768;++i) v[i]=(unsigned char)(n+i); return v[n & 32767]; }\n'
+         'extern "C" __declspec(dllexport) int crt_probe(const char *s) { '
+         'std::string text(s); std::vector<long long> values(64,::strtoll(text.c_str(),nullptr,10)); '
+         'return stack_probe((int)values[0]); }\n')
+        output=root/'ec-crt-probe.dll'
+        command=[str(m/'bin/aarch64-w64-mingw32-clang++'),'--target=arm64ec-windows-gnu',
+         '-fuse-ld=lld','-stdlib=libc++','-std=c++20','-fno-exceptions','-O2','-shared','-static','-Wl,--no-insert-timestamp',
+         str(probe),'-o',str(output),'-Wl,--start-group','-lc++','-lc++abi','-lunwind','-lgcc',
+         '-lmingwex','-lmingw32','-lucrt','-lmsvcrt','-Wl,--end-group']
+        subprocess.run(command,check=True)
+        headers=subprocess.check_output([str(m/'bin/llvm-readobj'),'--file-headers','--coff-load-config',str(output)],text=True)
+        print(headers)
+        assert 'IMAGE_FILE_MACHINE_ARM64EC' in headers,'Real EC C++/stack/CRT link did not produce ARM64EC'
+        print('PASS: exact-source ARM64X CRT and same-package builtins/C++ runtime linked a real ARM64EC probe DLL. DLL not executed.')
+        PY
+    - name: Create a reviewable Mac-only adapter for the published PE/FEX recipes
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-pe-fex"
+        export TMPDIR="$root/tmp"
+        "$root/venv/bin/python" - <<'PY'
+        import difflib,hashlib,json,pathlib,shlex,shutil,subprocess
+        repo=pathlib.Path.cwd();root=repo/'.work/cod-pe-fex';tools=json.loads((root/'tools.json').read_text())
+        a=root/'adapter';(a/'stages').mkdir(parents=True)
+        shutil.copy2(repo/'build/lib.sh',a/'lib.sh')
+        values={'PLAYPORT_REPO':str(repo),'PLAYPORT_BUILD':str(root),'PLAYPORT_RUN':str(root),
+         'LLVM_MINGW':str(root/'inputs/llvm-mingw-20260922-ucrt-macos-universal'),
+         'IOSSDK':tools['iossdk'],'MACSDK':tools['macsdk'],'DARWIN_SDK':str(pathlib.Path(tools['iossdk']).parents[5])}
+        (a/'env.sh').write_text('\n'.join(k+'='+shlex.quote(v) for k,v in values.items())+'\nexport '+ ' '.join(values)+'\n')
+        for name in ('wine-pe-manifest.py','wine-pe-strip.py'):
+         shutil.copy2(repo/'build/stages'/name,a/'stages'/name)
+        # This verified component fetch supplies headers for configure; no GStreamer binary is executed.
+        gst=(repo/'build/stages/gstreamer.sh').read_text()
+        assert 'SHA256=2b1233ba3d1f8166bfa85f664709ee5ff36b81e82b9652a1d3e79c1783da9584' in gst
+        assert gst.count('curl -fsSL')==1
+        gst=gst.replace('curl -fsSL',"curl --proto '=https' --tlsv1.2 -fsSL")
+        (a/'stages/gstreamer.sh').write_text(gst)
+        original=(repo/'build/stages/wine-pe.sh').read_text();pe=original
+        old='--enable-win64 --without-x --without-freetype --without-mingw --disable-tests'
+        assert pe.count(old)==1
+        pe=pe.replace(old,'--enable-archs=none --without-x --without-freetype --disable-tests')
+        native_configure='../configure --enable-archs=none --without-x --without-freetype --disable-tests'
+        assert pe.count(native_configure)==1
+        # Scope native Apple compiler/linker flags to the native-tools configure command only.
+        native_environment={
+         'CC':'xcrun --sdk macosx clang','CXX':'xcrun --sdk macosx clang++',
+         'OBJC':'xcrun --sdk macosx clang -x objective-c',
+         'LDFLAGS':'-isysroot '+tools['macsdk']+' -fuse-ld='+tools['macld'],
+        }
+        prefix=' '.join(k+'='+shlex.quote(v) for k,v in native_environment.items())
+        pe=pe.replace(native_configure,prefix+' '+native_configure)
+        for old_tool,tool in [('/usr/bin/llvm-ar','ar'),('/usr/bin/llvm-ranlib','ranlib'),('/usr/bin/llvm-strip','strip')]:
+         replacement=subprocess.check_output(['xcrun','--sdk','macosx','--find',tool],text=True).strip()
+         assert old_tool in pe,old_tool
+         pe=pe.replace(old_tool,replacement)
+        # Native Mac SDK and Apple linker; Windows links retain their own lld flags.
+        pe=pe.replace('LDFLAGS="-fuse-ld=lld" CROSSLDFLAGS=',
+                      'LDFLAGS="-fuse-ld='+tools['macld']+'" CROSSLDFLAGS=')
+        old='--with-mingw="$M/bin/clang" --enable-archs="$2" $3'
+        assert pe.count(old)==1
+        pe=pe.replace(old,'--with-mingw="$M/bin/clang" --enable-archs="$2" --disable-tests $3')
+        (a/'stages/wine-pe.sh').write_text(pe)
+        fex=(repo/'build/stages/fex.sh').read_text()
+        (a/'stages/fex.sh').write_text(fex)
+        for name in ('wine-pe.sh','gstreamer.sh','fex.sh'):
+         path=a/'stages'/name
+         subprocess.run(['bash','-n',str(path)],check=True)
+         print('Host recipe:',name,'original SHA256',hashlib.sha256((repo/'build/stages'/name).read_bytes()).hexdigest(),
+               'adapted SHA256',hashlib.sha256(path.read_bytes()).hexdigest())
+        print(''.join(difflib.unified_diff(original.splitlines(True),pe.splitlines(True),fromfile='pinned wine-pe.sh',tofile='Mac host adapter')))
+        print('No runtime source pin or runtime source patch changed by the host adapter.')
+        PY
+    - name: Build and machine-check complete production PE sets from matched Wine source
+      id: pe
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-pe-fex"
+        export TMPDIR="$root/tmp"
+        export PATH="$root/venv/bin:$(brew --prefix make)/libexec/gnubin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$(brew --prefix gettext)/bin:$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix llvm@22)/bin:$PATH"
+        unset CC CXX OBJC CFLAGS CXXFLAGS CPPFLAGS LDFLAGS SDKROOT
+        export JOBS=3
+        OUT="$root/pe" bash "$root/adapter/stages/wine-pe.sh"
+        "$root/venv/bin/python" "$root/adapter/stages/wine-pe-strip.py" "$root/pe/wine" "$root/pe/staged" \
+         "$root/inputs/llvm-mingw-20260922-ucrt-macos-universal/bin/llvm-strip"
+    - name: Build both pinned FEX CPU modules and verify the submodule closure
+      id: fex
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-pe-fex"
+        export TMPDIR="$root/tmp"
+        export PATH="$root/venv/bin:$(brew --prefix make)/libexec/gnubin:$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+        unset CC CXX OBJC CFLAGS CXXFLAGS CPPFLAGS LDFLAGS SDKROOT
+        export JOBS=3
+        bash "$root/adapter/stages/fex.sh" "$root"
+        "$root/venv/bin/python" - <<'PY'
+        import json,pathlib,subprocess
+        root=pathlib.Path('.work/cod-pe-fex').resolve();f=root/'fex'
+        expected={'FEX':'3648ee97e8354bb2e6757da8bdb00c48439a561d','rpmalloc':'09142d726429416bfa7b459151515fe3ab7622dd'}
+        for tree,key,count in [(f,'FEX',103),(f/'External/rpmalloc','rpmalloc',19)]:
+         base=subprocess.check_output(['git','-C',str(tree),'rev-parse',f'HEAD~{count}'],text=True).strip()
+         assert base==expected[key],(key,base)
+         subprocess.run(['git','-C',str(tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
+        print(subprocess.check_output(['git','-C',str(f),'submodule','status','--recursive'],text=True))
+        print('FEX and rpmalloc complete patch sequences verified against their exact bases.')
+        PY
+    - name: Inspect all PE sets and both CPU modules without executing Windows code
+      id: inspect
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-pe-fex"
+        export TMPDIR="$root/tmp"
+        "$root/venv/bin/python" - <<'PY'
+        import hashlib,json,pathlib,re,subprocess,pefile
+        root=pathlib.Path('.work/cod-pe-fex').resolve();m=root/'inputs/llvm-mingw-20260922-ucrt-macos-universal'
+        readobj=m/'bin/llvm-readobj';result={}
+        required={
+         'i386':{'ntdll.dll','kernel32.dll','kernelbase.dll','user32.dll','gdi32.dll','win32u.dll','opengl32.dll'},
+         'aarch64':{'ntdll.dll','wow64.dll','wow64win.dll'},
+         'arm64ec':{'ntdll.dll','kernel32.dll','kernelbase.dll','user32.dll','opengl32.dll'},
+        }
+        for arch,need in required.items():
+         tree='build-arm64ec' if arch=='arm64ec' else 'build-macos'
+         output=subprocess.check_output([str(root/'venv/bin/python'),str(root/'adapter/stages/wine-pe-manifest.py'),
+                                         str(root/'pe/staged'/tree),arch+'-windows',str(readobj)],text=True)
+         (root/f'final-manifest-{arch}.tsv').write_text(output)
+         rows=[line.split('\t') for line in output.splitlines() if line.strip()]
+         production=[r for r in rows if r[0].startswith(('dlls/','programs/')) and '/tests/' not in r[0] and '/winetest/' not in r[0]]
+         names={pathlib.PurePosixPath(r[0]).name.lower() for r in production}
+         assert need<=names,(arch,sorted(need-names))
+         assert not any('.debug_' in section.Name.decode(errors='ignore')
+                        for r in production if r[3] in ('pe','pe-data')
+                        for section in pefile.PE(str(root/'pe/staged'/tree/r[0]),fast_load=True).sections)
+         result[arch]={'production_rows':len(production),'manifest_sha256':hashlib.sha256(output.encode()).hexdigest(),
+                       'required_present':sorted(need)}
+         print('Complete configured production set:',arch,json.dumps(result[arch]))
+        for mode,relative,machine in (
+         ('arm64ec','build-arm64ec/Bin/libarm64ecfex.dll','ARM64EC'),
+         ('wow64','build-wow64/Bin/libwow64fex.dll','ARM64'),
+        ):
+         path=root/'fex'/relative
+         head=subprocess.check_output([str(readobj),'--file-headers',str(path)],text=True)
+         assert 'Machine: IMAGE_FILE_MACHINE_'+machine+' ' in head,(mode,head)
+         image=pefile.PE(str(path));imports={e.dll.decode().lower() for e in getattr(image,'DIRECTORY_ENTRY_IMPORT',[])}
+         exports={e.name.decode() for e in getattr(image,'DIRECTORY_ENTRY_EXPORT',[]).symbols if e.name} if hasattr(image,'DIRECTORY_ENTRY_EXPORT') else set()
+         if mode=='wow64':
+          assert imports=={'ntdll.dll','wow64.dll'},imports
+          assert {'BTCpuProcessInit','BTCpuThreadInit','BTCpuSimulate'}<=exports,exports
+         result[mode+'-fex']={'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'machine':machine,
+                              'imports':sorted(imports),'exports':sorted(exports)}
+         print('CPU module:',mode,json.dumps(result[mode+'-fex']))
+        (root/'result.json').write_text(json.dumps(result,indent=2))
+        subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
+        print('PASS: complete configured Wine PE production sets and both matching FEX CPU modules compiled and inspected. No Windows module executed; app assembly remains outstanding.')
+        PY
+    - name: Write source-only component result
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        printf '%s\n' \
+         'Matched Wine PE/FEX component build only; no app link, signing, device or gameplay test.' \
+         'Toolchain: ${{ steps.toolchain.outcome }}; sources: ${{ steps.sources.outcome }}; real EC CRT/C++ link: ${{ steps.crt.outcome }}; production PE: ${{ steps.pe.outcome }}; both CPU modules: ${{ steps.fex.outcome }}; inspection: ${{ steps.inspect.outcome }}.' \
+         'PE uses verified 20260922 LLVM 23.1.2; host inspection uses LLVM 22; DXMT LLVM 15 is separate and not built here.' \
+         'The pinned GStreamer 1.28.7 component is fetched only for configure headers, with its published SHA256; no runtime IPA is fetched.' \
+         'Complete configured production sets are claimed only after every PE/FEX/inspection gate passes. No source-build cache, SDK or runtime artifacts uploaded.' \
+         'Next step after a pass: match these outputs with the native Wine/display/Mesa assembly and verify a real unsigned app link in the current thread. No new thread required.' >> "$GITHUB_STEP_SUMMARY"
+
