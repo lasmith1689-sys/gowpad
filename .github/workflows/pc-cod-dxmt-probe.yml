@@ -1,0 +1,390 @@
+name: CoD matched DXMT Unix and LLVM 15 source probe
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - codex/pc-games-runtime-probe-20261025
+    paths:
+    - .github/workflows/pc-cod-dxmt-probe.yml
+permissions:
+  contents: read
+concurrency:
+  group: pc-cod-dxmt-probe
+  cancel-in-progress: false
+jobs:
+  cod-dxmt-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+    - name: "Check out fixed Playport source"
+      uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+      with:
+        repository: "playportdev/playport"
+        ref: "412de5f8c0bdd26d84e0127eb5776ba992e3b152"
+        persist-credentials: "false"
+        submodules: "false"
+        path: "source"
+    - name: "Provision host tools and select native and iPhone SDKs"
+      id: "tools"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        brew install bash cmake ninja coreutils llvm@22
+        cd source
+        root="$PWD/.work/cod-dxmt"
+        mkdir -p "$root/tmp"
+        export TMPDIR="$root/tmp"
+        python3 - <<'PY'
+        import json,pathlib,shutil,subprocess
+        root=pathlib.Path('.work/cod-dxmt').resolve()
+        def out(*args):return subprocess.check_output(args,text=True).strip()
+        assert out('uname','-m')=='arm64'
+        sdk=out('xcrun','--sdk','iphoneos','--show-sdk-path')
+        version=out('xcrun','--sdk','iphoneos','--show-sdk-version')
+        assert int(version.split('.')[0])>=26,version
+        tools={n:out('xcrun','--sdk','iphoneos','--find',n)
+               for n in ('clang','clang++','ar','ranlib','ld','libtool')}
+        native={n:out('xcrun','--sdk','macosx','--find',n) for n in ('clang','clang++','ld')}
+        candidates=[pathlib.Path(sdk)/'usr/include/c++/v1',
+                    pathlib.Path(tools['clang++']).resolve().parent.parent/'include/c++/v1']
+        cxx=next((p for p in candidates if (p/'vector').is_file()),None)
+        assert cxx is not None,('Missing matching Xcode vector header',candidates)
+        free=shutil.disk_usage(root).free
+        assert free>=20*1024**3,'Need 20 GiB scratch for fresh LLVM host/iOS archives'
+        record={'sdk':sdk,'sdk_version':version,'cxx':str(cxx),'ios':tools,'native':native,
+                'macsdk':out('xcrun','--sdk','macosx','--show-sdk-path'),
+                'bash':out('brew','--prefix','bash')+'/bin/bash',
+                'llvm':out('brew','--prefix','llvm@22'),'disk_free_bytes':free}
+        (root/'tools.json').write_text(json.dumps(record,indent=2))
+        print(json.dumps(record,indent=2))
+        subprocess.run([record['bash'],'-c','(( BASH_VERSINFO[0] >= 5 ))'],check=True)
+        subprocess.run([native['clang'],'-isysroot',record['macsdk'],'-fuse-ld='+native['ld'],
+                        '-x','c','-','-o',str(root/'native-link-probe')],
+                       input='int main(void) { return 0; }\n',text=True,check=True)
+        subprocess.run([tools['clang++'],'-target','arm64-apple-ios18.0','-isysroot',sdk,
+                        '-nostdinc++','-isystem',str(cxx),'-stdlib=libc++','-std=c++20',
+                        '-x','c++','-','-fsyntax-only'],
+                       input='#include <vector>\nint probe() { std::vector<int> v; return v.size(); }\n',
+                       text=True,check=True)
+        subprocess.run(['xcodebuild','-version'],check=True)
+        subprocess.run([tools['clang'],'--version'],check=True)
+        PY
+        brew list --versions bash cmake ninja coreutils llvm@22
+    - name: "Prepare exact DXMT and LLVM sources with complete ordered patches"
+      id: "sources"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt/tmp"
+        python3 - <<'PY'
+        import hashlib,json,pathlib,re,shutil,subprocess
+        repo=pathlib.Path.cwd();root=repo/'.work/cod-dxmt'
+        pins={p[0]:p[1:3] for line in (repo/'pins.lock').read_text().splitlines()
+              if (p:=line.split()) and not line.startswith('#')}
+        expected={
+         'madeira':('8c050d03f4d89096e1e2e2c8bb44479fffd86619','https://github.com/willfaust/Madeira.git'),
+         'dxmt':('68af85e96196e1cf9f50de9fe24c70f03a1db4a7','https://github.com/3Shain/dxmt.git'),
+         'dxmt-port':('ca8a2516d819e7e1f366981825ad1f0d26f80fdd','https://github.com/willfaust/dxmt.git'),
+         'wine':('455e3509b98a6919fd4ad1def4803e08c41c03b2','https://gitlab.winehq.org/wine/wine.git'),
+         'wine-port':('723d1bf5132768276cea9bc35ab59c83557bb5fb','https://github.com/willfaust/wine.git'),
+         'wine-valve':('750fd011356cfcb28125c96d295ddef0d9e66dac','https://github.com/ValveSoftware/wine.git'),
+        }
+        for name,value in expected.items():assert pins[name]==list(value),(name,pins[name])
+        assert pins['llvm-project']==['llvmorg-15.0.7','https://github.com/llvm/llvm-project.git']
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()=='412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+        assert subprocess.check_output(['git','ls-tree','HEAD','upstream/madeira'],text=True).split()[2]==expected['madeira'][0]
+        def checkout(name,revision,url,sparse=False):
+         assert re.fullmatch(r'[0-9a-f]{40}',revision) and url.startswith('https://'),(name,revision,url)
+         tree=root/name
+         subprocess.run(['git','init',str(tree)],check=True)
+         if sparse:
+          subprocess.run(['git','-C',str(tree),'config','core.sparseCheckout','true'],check=True)
+          (tree/'.git/info/sparse-checkout').write_text('/llvm/\n/cmake/\n/third-party/\n')
+         subprocess.run(['git','-C',str(tree),'remote','add','origin',url],check=True)
+         subprocess.run(['git','-C',str(tree),'-c','protocol.version=2','fetch','--depth=1','--filter=blob:none','origin',revision],check=True)
+         subprocess.run(['git','-C',str(tree),'checkout','--detach','FETCH_HEAD'],check=True)
+         assert subprocess.check_output(['git','-C',str(tree),'rev-parse','HEAD'],text=True).strip()==revision
+         return tree
+        madeira=checkout('madeira',*expected['madeira'])
+        assert subprocess.check_output(['git','-C',str(madeira),'ls-tree','HEAD','research/dxmt'],text=True).split()[2]==expected['dxmt-port'][0]
+        assert subprocess.check_output(['git','-C',str(madeira),'ls-tree','HEAD','wine'],text=True).split()[2]==expected['wine-port'][0]
+        d=checkout('dxmt',*expected['dxmt'])
+        record={'pins':expected,'series':{},'llvm':'8dfdcc7b7bf66834a761bd8de445840ef68e4d1a'}
+        for component,count in [('dxmt-port',45),('dxmt',9)]:
+         names=[l.strip() for l in (repo/'patches'/component/'series').read_text().splitlines()
+                if l.strip() and not l.startswith('#')]
+         assert len(names)==count and len(set(names))==count,(component,len(names))
+         record['series'][component]=[]
+         for name in names:
+          assert pathlib.PurePosixPath(name).name==name,name
+          patch=repo/'patches'/component/name;digest=hashlib.sha256(patch.read_bytes()).hexdigest()
+          print('patch',component,name,digest,flush=True);record['series'][component].append([name,digest])
+          subprocess.run(['git','-C',str(d),'-c','user.name=CoD DXMT probe','-c','user.email=probe@localhost',
+                          'am','--committer-date-is-author-date',str(patch)],check=True)
+        assert subprocess.check_output(['git','-C',str(d),'rev-parse','HEAD~54'],text=True).strip()==expected['dxmt'][0]
+        # Only this source-header submodule is used by all 23 Unix units; no NVAPI library is fetched.
+        want='9df86f2341616ef1888ae59919feaa6d4fad693d'
+        assert subprocess.check_output(['git','-C',str(d),'ls-tree','HEAD','include/native/directx'],text=True).split()[2]==want
+        subprocess.run(['git','-C',str(d),'submodule','update','--init','--depth=1','include/native/directx'],check=True)
+        assert subprocess.check_output(['git','-C',str(d/'include/native/directx'),'rev-parse','HEAD'],text=True).strip()==want
+        record['directx_headers']=want
+        for source,dest in [('research/remote-metal','remote-metal'),('build','build')]:
+         shutil.copytree(madeira/source,root/dest)
+        for file in ('research/remote-metal/protocol.h','build/madeira_cfg.h'):
+         source=madeira/file;dest=root/('remote-metal/protocol.h' if file.startswith('research/') else file)
+         assert source.read_bytes()==dest.read_bytes()
+         print('Frozen Madeira input',file,hashlib.sha256(source.read_bytes()).hexdigest())
+        llvm=checkout('llvm-project',record['llvm'],'https://github.com/llvm/llvm-project.git',True)
+        top=(llvm/'llvm/CMakeLists.txt').read_text()
+        for key,value in [('MAJOR','15'),('MINOR','0'),('PATCH','7')]:
+         assert re.search(r'set\(LLVM_VERSION_'+key+r'\s+'+value+r'\)',top),(key,value)
+        (root/'sources.json').write_text(json.dumps(record,indent=2))
+        print('Full DXMT 45+9 series and exact LLVM 15.0.7 verified. No independent Madeira build reused.')
+        print('Unix headers are DXMT native/windows + pinned directx headers; Wine PE headers/import libraries are needed only by the later DXMT PE recipe.')
+        PY
+    - name: "Build fresh LLVM 15 native headers and complete AIR host tools"
+      id: "host"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt/tmp"
+        python3 - <<'PY'
+        import json,os,pathlib,subprocess
+        root=pathlib.Path('.work/cod-dxmt').resolve();t=json.loads((root/'tools.json').read_text())
+        env=dict(os.environ)
+        for key in ('CC','CXX','OBJC','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT'):env.pop(key,None)
+        cmake=['cmake','-G','Ninja','-S',str(root/'llvm-project/llvm'),
+         '-DCMAKE_BUILD_TYPE=Release','-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
+         '-DCMAKE_C_COMPILER='+t['native']['clang'],'-DCMAKE_CXX_COMPILER='+t['native']['clang++'],
+         '-DCMAKE_OSX_SYSROOT='+t['macsdk'],'-DCMAKE_OSX_ARCHITECTURES=arm64',
+         '-DCMAKE_CXX_FLAGS=-include cstdint',
+         '-DCMAKE_EXE_LINKER_FLAGS=-isysroot '+t['macsdk']+' -fuse-ld='+t['native']['ld'],
+         '-DCMAKE_SHARED_LINKER_FLAGS=-isysroot '+t['macsdk']+' -fuse-ld='+t['native']['ld'],
+         '-DLLVM_ENABLE_ASSERTIONS=ON','-DLLVM_ABI_BREAKING_CHECKS=WITH_ASSERTS',
+         '-DLLVM_ENABLE_ZSTD=OFF','-DLLVM_ENABLE_ZLIB=OFF','-DLLVM_ENABLE_TERMINFO=OFF','-DLLVM_ENABLE_LIBXML2=OFF',
+         '-DLLVM_INCLUDE_TESTS=OFF','-DLLVM_INCLUDE_BENCHMARKS=OFF','-DLLVM_INCLUDE_EXAMPLES=OFF']
+        subprocess.run(cmake+['-B',str(root/'llvm-headers'),'-DLLVM_TARGETS_TO_BUILD=','-DLLVM_BUILD_TOOLS=OFF'],env=env,check=True)
+        subprocess.run(['ninja','-C',str(root/'llvm-headers'),'-j3','intrinsics_gen'],env=env,check=True)
+        subprocess.run(cmake+['-B',str(root/'llvm-host'),'-DLLVM_TARGETS_TO_BUILD=X86'],env=env,check=True)
+        host_tools=['llvm-as','llvm-dis','llvm-link','llc','opt','llvm-tblgen']
+        subprocess.run(['ninja','-C',str(root/'llvm-host'),'-j3',*host_tools],env=env,check=True)
+        for name in host_tools:
+         path=root/'llvm-host/bin'/name;version=subprocess.check_output([str(path),'--version'],text=True)
+         assert 'LLVM version 15.0.7' in version,(name,version)
+         print('Native source tool',name,version.splitlines()[0])
+        for name in ('llvm-headers','llvm-host'):
+         abi=(root/name/'include/llvm/Config/abi-breaking.h').read_text()
+         assert '#define LLVM_ENABLE_ABI_BREAKING_CHECKS 1' in abi,(name,abi)
+        assert (root/'llvm-headers/include/llvm/IR/IntrinsicEnums.inc').is_file()
+        print('PASS: fresh native Mac LLVM15 headers/tools; assertions and ABI checks enabled.')
+        PY
+    - name: "Assemble all pinned AIR helper modules with typed pointers"
+      id: "air"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt/tmp"
+        python3 - <<'PY'
+        import hashlib,json,pathlib,subprocess
+        repo=pathlib.Path.cwd();root=repo/'.work/cod-dxmt'
+        (root/'air').mkdir();(root/'shader-headers').mkdir();report={}
+        for name in ('air_msad','air_samplepos','air_tessellation'):
+         source=repo/'build/air-helpers'/(name+'.ll');air=root/'air'/(name+'.air')
+         subprocess.run([str(root/'llvm-host/bin/llvm-as'),'-opaque-pointers=0',str(source),'-o',str(air)],check=True)
+         subprocess.run([str(root/'llvm-host/bin/opt'),'-opaque-pointers=0','-verify','-disable-output',str(air)],check=True)
+         subprocess.run(['xxd','-n',name,'-i',str(air),str(root/'shader-headers'/(name+'.h'))],check=True)
+         report[name]={suffix:hashlib.sha256(path.read_bytes()).hexdigest() for suffix,path in
+                       [('source',source),('air',air),('header',root/'shader-headers'/(name+'.h'))]}
+        (root/'air-result.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
+        print('PASS: only pinned helper IR assembled/verified. No title inputs or iOS code execution.')
+        PY
+    - name: "Build every configured LLVM iOS static archive with matching ABI checks"
+      id: "ios"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt/tmp"
+        python3 - <<'PY'
+        import json,os,pathlib,re,subprocess
+        root=pathlib.Path('.work/cod-dxmt').resolve();t=json.loads((root/'tools.json').read_text())
+        build=root/'llvm-ios';env=dict(os.environ)
+        for key in ('CC','CXX','OBJC','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT'):env.pop(key,None)
+        target='arm64-apple-ios18.0'
+        maps='-ffile-prefix-map='+str(root)+'=/cod-dxmt -ffile-prefix-map='+str(root/'llvm-project')+'=llvm-project'
+        subprocess.run(['cmake','-G','Ninja','-S',str(root/'llvm-project/llvm'),'-B',str(build),
+         '-DCMAKE_POLICY_VERSION_MINIMUM=3.5','-DCMAKE_BUILD_TYPE=Release',
+         '-DCMAKE_SYSTEM_NAME=iOS','-DCMAKE_SYSTEM_PROCESSOR=arm64','-DCMAKE_OSX_ARCHITECTURES=arm64',
+         '-DCMAKE_OSX_SYSROOT='+t['sdk'],'-DCMAKE_OSX_DEPLOYMENT_TARGET=18.0','-DCMAKE_MACOSX_BUNDLE=OFF',
+         '-DCMAKE_C_COMPILER='+t['ios']['clang'],'-DCMAKE_CXX_COMPILER='+t['ios']['clang++'],
+         '-DCMAKE_C_COMPILER_TARGET='+target,'-DCMAKE_CXX_COMPILER_TARGET='+target,'-DCMAKE_ASM_COMPILER_TARGET='+target,
+         '-DCMAKE_AR='+t['ios']['ar'],'-DCMAKE_RANLIB='+t['ios']['ranlib'],
+         '-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld='+t['ios']['ld'],'-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld='+t['ios']['ld'],
+         '-DCMAKE_C_FLAGS='+maps,'-DCMAKE_CXX_FLAGS='+maps+' -include cstdint -stdlib=libc++ -nostdinc++ -isystem '+t['cxx'],
+         '-DLLVM_HOST_TRIPLE='+target,'-DLLVM_TABLEGEN='+str(root/'llvm-host/bin/llvm-tblgen'),
+         '-DLLVM_TARGETS_TO_BUILD=','-DLLVM_ENABLE_ASSERTIONS=ON','-DLLVM_ABI_BREAKING_CHECKS=WITH_ASSERTS',
+         '-DLLVM_ENABLE_ZSTD=OFF','-DLLVM_ENABLE_ZLIB=OFF','-DLLVM_ENABLE_TERMINFO=OFF','-DLLVM_ENABLE_LIBXML2=OFF',
+         '-DLLVM_ENABLE_LIBEDIT=OFF','-DLLVM_ENABLE_LIBPFM=OFF','-DLLVM_ENABLE_FFI=OFF',
+         '-DLLVM_BUILD_TOOLS=OFF','-DLLVM_BUILD_UTILS=OFF','-DLLVM_INCLUDE_TOOLS=OFF','-DLLVM_INCLUDE_UTILS=OFF',
+         '-DLLVM_INCLUDE_TESTS=OFF','-DLLVM_INCLUDE_BENCHMARKS=OFF','-DLLVM_INCLUDE_EXAMPLES=OFF',
+         '-DLLVM_INCLUDE_DOCS=OFF','-DLLVM_INCLUDE_RUNTIMES=OFF'],env=env,check=True)
+        abi=(build/'include/llvm/Config/abi-breaking.h').read_text()
+        assert '#define LLVM_ENABLE_ABI_BREAKING_CHECKS 1' in abi,abi
+        listing=subprocess.check_output(['ninja','-C',str(build),'-t','targets','all'],text=True)
+        targets=sorted(set(re.findall(r'^lib/libLLVM[A-Za-z0-9]+\.a(?=:)',listing,re.M)))
+        assert len(targets)>=30,targets
+        (root/'llvm-ios-targets.json').write_text(json.dumps(targets,indent=2))
+        print('Full configured LLVM iOS archive target list:',json.dumps(targets),flush=True)
+        subprocess.run(['ninja','-C',str(build),'-j3',*targets],env=env,check=True)
+        actual=sorted(str(p.relative_to(build)) for p in (build/'lib').glob('*.a'))
+        assert actual==targets,('Missing or unexpected LLVM archives',targets,actual)
+        print('PASS: every configured LLVM iOS archive built; no target executable run.')
+        PY
+    - name: "Compile all 23 matched DXMT Unix objects with a checked 150-slot boundary"
+      id: "dxmt"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt/tmp"
+        python3 - <<'PY'
+        import difflib,hashlib,json,os,pathlib,re,shlex,shutil,subprocess
+        repo=pathlib.Path.cwd();root=repo/'.work/cod-dxmt';t=json.loads((root/'tools.json').read_text())
+        d=root/'dxmt';s=(d/'src/winemetal/unix/winemetal_unix.c').read_text()
+        def table(name):
+         body=re.search(r'const void \*\s*'+re.escape(name)+r'\[\]\s*=\s*\{(.*?)\};',s,re.S).group(1)
+         body=re.sub(r'/\*.*?\*/|//[^\n]*','',body,flags=re.S)
+         entries=[x.strip() for x in body.split(',') if x.strip()]
+         assert all(re.fullmatch(r'&[A-Za-z0-9_]+|NULL',x) for x in entries),entries
+         assert len(entries)==150,(name,len(entries))
+         return entries
+        primary=table('__wine_unix_call_funcs');wow64=table('__wine_unix_call_wow64_funcs')
+        assert primary[-4:]==['&_madeira_ir_convert','&_MTLDevice_newRenderPipelineStateVD',
+                             '&_MTLDevice_newGeometryEmulationPipelineState','&_madeira_ctl'],primary[-4:]
+        names=(d/'src/winemetal/wmt_api_names.h').read_text()
+        assert re.search(r'#define WMT_API_COUNT\s+150\b',names)
+        calls={int(n) for n in re.findall(r'UNIX_CALL\(\s*(\d+)\s*,',(d/'src/winemetal/winemetal_thunks.c').read_text())}
+        assert max(calls)==149 and {146,147,148,149}<=calls,calls
+        (root/'slot-boundary.json').write_text(json.dumps({'primary':primary,'wow64':wow64,'max_pe_slot':max(calls)},indent=2))
+        wrapper=root/'unix-source';wrapper.mkdir()
+        original=d/'src/winemetal/unix/winemetal_unix.c'
+        (wrapper/'winemetal_unix.c').write_text('#include '+json.dumps(str(original))+'\n'
+         '_Static_assert(sizeof(__wine_unix_call_funcs)/sizeof(void*) == 150, "native slot count");\n'
+         '_Static_assert(sizeof(__wine_unix_call_wow64_funcs)/sizeof(void*) == 150, "wow64 slot count");\n')
+        (wrapper/'cache.c').symlink_to(d/'src/winemetal/unix/cache.c')
+        (root/'llvm-host-build').symlink_to(root/'llvm-headers',target_is_directory=True)
+        adapter=root/'adapter';(adapter/'stages').mkdir(parents=True)
+        shutil.copy2(repo/'build/lib.sh',adapter/'lib.sh')
+        values={'PLAYPORT_REPO':str(repo),'PLAYPORT_BUILD':str(root),'IOSSDK':t['sdk'],'LLVM_MINGW':'',
+                'DXMT_UNIX_SOURCE':str(wrapper)}
+        (adapter/'env.sh').write_text('\n'.join(k+'='+shlex.quote(v) for k,v in values.items())+
+                                     '\nexport '+' '.join(values)+'\n')
+        original_recipe=(repo/'build/stages/dxmt-base.sh').read_text();adapted=original_recipe
+        old='local cxx="-stdlib++-isystem $SDK/usr/include/c++/v1"'
+        assert adapted.count(old)==1
+        adapted=adapted.replace(old,'local cxx="-stdlib=libc++ -nostdinc++ -isystem '+t['cxx']+'"')
+        old='-c "$D/src/winemetal/unix/$f.c"'
+        assert adapted.count(old)==1
+        adapted=adapted.replace(old,'-c "$DXMT_UNIX_SOURCE/$f.c"')
+        # Select Xcode compilers explicitly; native flags never leak into iOS target compilation.
+        adapted=adapted.replace('cc1 $f clang $common','cc1 $f '+shlex.quote(t['ios']['clang'])+' $common')
+        adapted=adapted.replace(' clang++ $common',' '+shlex.quote(t['ios']['clang++'])+' $common')
+        script=adapter/'stages/dxmt-base.sh';script.write_text(adapted)
+        subprocess.run([t['bash'],'-n',str(script)],check=True)
+        print('Pinned/adapted recipe SHA256',hashlib.sha256(original_recipe.encode()).hexdigest(),
+              hashlib.sha256(adapted.encode()).hexdigest(),flush=True)
+        print(''.join(difflib.unified_diff(original_recipe.splitlines(True),adapted.splitlines(True),
+                                         fromfile='pinned dxmt-base.sh',tofile='Mac Unix adapter')),flush=True)
+        env=dict(os.environ)
+        for key in ('CC','CXX','OBJC','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT'):env.pop(key,None)
+        env['PATH']=subprocess.check_output(['brew','--prefix','coreutils'],text=True).strip()+'/libexec/gnubin:'+env['PATH']
+        try:subprocess.run([t['bash'],str(script),str(root),'unix'],env=env,check=True)
+        finally:
+         for err in sorted((root/'obj').glob('*.err')):
+          text=err.read_text()
+          if 'error:' in text:print(err.name,text[-8000:],flush=True)
+        objects=sorted((root/'obj').glob('*.o'))
+        assert len(objects)==23,[p.name for p in objects]
+        subprocess.run([t['ios']['ar'],'rcs',str(root/'libdxmt_unix.a'),*map(str,objects)],check=True)
+        print('PASS: all 23 Unix objects compiled, including compiled 150-slot assertions for both call tables.')
+        PY
+    - name: "Combine and inspect every iOS archive member and unresolved external"
+      id: "inspect"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt/tmp"
+        python3 - <<'PY'
+        import collections,hashlib,json,os,pathlib,struct,subprocess
+        root=pathlib.Path('.work/cod-dxmt').resolve();t=json.loads((root/'tools.json').read_text())
+        objects=sorted((root/'obj').glob('*.o'));libs=sorted((root/'llvm-ios/lib').glob('*.a'))
+        output=root/'libdxmt_combined.a'
+        subprocess.run([t['ios']['libtool'],'-static','-no_warning_for_no_symbols','-o',str(output),
+                        *map(str,objects),*map(str,libs)],env={**os.environ,'ZERO_AR_DATE':'1'},check=True)
+        def members(path):
+         data=path.read_bytes();assert data[:8]==b'!<arch>\n',path
+         at=8
+         while at<len(data):
+          header=data[at:at+60];assert len(header)==60 and header[58:]==b'\x60\n',(path,at)
+          size=int(header[48:58]);name=header[:16].decode().strip();body=data[at+60:at+60+size]
+          assert len(body)==size,(path,at,size)
+          at+=60+size+(size%2)
+          if name.startswith('#1/'):
+           count=int(name[3:]);name=body[:count].rstrip(b'\0').decode();body=body[count:]
+          else:name=name.rstrip('/')
+          if name.startswith('__.SYMDEF') or name in ('','/'):continue
+          yield name,body
+         assert at==len(data),(path,at,len(data))
+        def inspect(name,data):
+         assert data[:4]==b'\xcf\xfa\xed\xfe',(name,'not thin Mach-O64')
+         _,cpu,subtype,kind,ncmd,size,flags,reserved=struct.unpack_from('<8I',data)
+         assert cpu==0x0100000c and kind==1,(name,cpu,kind)
+         at=32;platforms=[]
+         for _ in range(ncmd):
+          cmd,length=struct.unpack_from('<II',data,at)
+          assert length>=8 and at+length<=len(data),(name,at,length)
+          if cmd==0x32:
+           platform,minos,sdk,ntools=struct.unpack_from('<4I',data,at+8);platforms.append((platform,minos,sdk))
+          at+=length
+         assert len(platforms)==1 and platforms[0][0]==2 and platforms[0][1]==18<<16,(name,platforms)
+         return hashlib.sha256(data).hexdigest()
+        expected=collections.Counter();inventory={}
+        for obj in objects:expected[inspect(obj.name,obj.read_bytes())]+=1
+        for lib in libs:
+         rows=list(members(lib));assert rows,lib
+         inventory[lib.name]={'members':len(rows),'sha256':hashlib.sha256(lib.read_bytes()).hexdigest()}
+         for name,data in rows:expected[inspect(lib.name+'('+name+')',data)]+=1
+        combined=collections.Counter(inspect(name,data) for name,data in members(output))
+        assert combined==expected,('Combined archive lost or added object payloads',expected-combined,combined-expected)
+        nm=pathlib.Path(t['llvm'])/'bin/llvm-nm'
+        def symbols(option):
+         text=subprocess.check_output([str(nm),'--extern-only','--just-symbol-name',option,str(output)],text=True)
+         return {line.strip() for line in text.splitlines() if line.strip() and not line.endswith(':')}
+        defined=symbols('--defined-only');undefined=symbols('--undefined-only')
+        assert '_dxmt_winemetal_unix_call_funcs' in defined,'Missing native DXMT call table'
+        unresolved=sorted(undefined-defined)
+        (root/'unresolved-externals.txt').write_text('\n'.join(unresolved)+'\n')
+        result={'llvm_archives':inventory,'unix_objects':len(objects),'combined_members':sum(combined.values()),
+                'combined_sha256':hashlib.sha256(output.read_bytes()).hexdigest(),'combined_bytes':output.stat().st_size,
+                'platform':'ios','arch':'arm64','minos':'18.0','slots':150,
+                'unresolved_externals':unresolved,'scope':'archive component only; no final app link or target execution'}
+        (root/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+        for tree in ('dxmt','madeira','llvm-project'):
+         subprocess.run(['git','-C',str(root/tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
+        subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
+        print('PASS: complete matched DXMT Unix + LLVM15 archive; every payload is iOS ARM64; exact member multiset retained. Unresolved symbols inventoried, not a full app claim.')
+        PY
+    - name: "Record bounded component status"
+      if: "${{ always() }}"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        printf '%s\n' \
+         'Source-only matched DXMT Unix + LLVM15 component gate; no PE side, final app link, signing or device test.' \
+         'Tools: ${{ steps.tools.outcome }}; sources: ${{ steps.sources.outcome }}; native headers/AIR tools: ${{ steps.host.outcome }}; AIR: ${{ steps.air.outcome }}; all iOS LLVM archives: ${{ steps.ios.outcome }}; 23 Unix objects: ${{ steps.dxmt.outcome }}; archive inspection: ${{ steps.inspect.outcome }}.' \
+         'Fresh exact sources and complete patches; Xcode SDK stays in place; no independent Madeira library reuse, source-build cache or artifact uploads.' \
+         'Next step after a pass: build DXMT PE from the same patched tree and matching Wine PE inputs, then full app closure in this thread. No new thread required.' >> "$GITHUB_STEP_SUMMARY"
