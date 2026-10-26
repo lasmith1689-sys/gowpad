@@ -1,0 +1,317 @@
+name: PC KosmicKrisp source compile probe
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - codex/pc-games-runtime-probe-20261025
+    paths:
+    - .github/workflows/pc-kosmickrisp-probe.yml
+permissions:
+  contents: read
+concurrency:
+  group: pc-kosmickrisp-probe
+  cancel-in-progress: false
+jobs:
+  kosmickrisp-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+    - name: Check out pinned public source
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        repository: playportdev/playport
+        ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+        persist-credentials: 'false'
+        submodules: 'false'
+        path: source
+    - name: Provision LLVM 22 and host dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        brew install llvm@22 spirv-tools cmake ninja bison flex pkgconf
+        cd source
+        mkdir -p .work/kosmickrisp
+        python3 -m venv .work/kosmickrisp/venv
+        .work/kosmickrisp/venv/bin/python -m pip install meson mako pyyaml packaging ply setuptools
+        .work/kosmickrisp/venv/bin/python -m pip list --format=freeze
+        brew list --versions llvm@22 spirv-tools cmake ninja bison flex pkgconf
+        uname -m
+        xcodebuild -version
+    - name: Resolve Xcode SDKs and matching LLVM native files
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        .work/kosmickrisp/venv/bin/python - <<'PY'
+        import json, pathlib, subprocess
+        root = pathlib.Path('.work/kosmickrisp').resolve()
+        def out(*args):
+            return subprocess.check_output(args, text=True).strip()
+        sdk = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-path')
+        version = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-version')
+        assert int(version.split('.')[0]) >= 26, version
+        tools = {name: out('xcrun', '--sdk', 'iphoneos', '--find', name)
+                 for name in ('clang', 'clang++', 'ar', 'strip', 'install_name_tool', 'ld')}
+        for name, path in tools.items():
+            assert pathlib.Path(path).is_file(), (name, path)
+        # Xcode may keep libc++ headers in the toolchain rather than the SDK.
+        candidates = [pathlib.Path(sdk) / 'usr/include/c++/v1',
+                      pathlib.Path(tools['clang++']).resolve().parent.parent / 'include/c++/v1']
+        headers = next((p for p in candidates if (p / 'vector').is_file()), None)
+        assert headers is not None, 'No matching Xcode libc++ vector header: ' + str(candidates)
+        target = ['-target', 'arm64-apple-ios26.0', '-isysroot', sdk]
+        link = target + ['-fuse-ld=' + tools['ld']]
+        maps = ['-ffile-prefix-map=' + str(root) + '=/kosmickrisp-probe',
+                '-ffile-prefix-map=' + str(pathlib.Path.cwd()) + '=/source',
+                '-ffile-prefix-map=' + out('xcode-select', '-p') + '=/xcode']
+        c = ['/usr/bin/xcrun', '--sdk', 'iphoneos', 'clang'] + target + maps
+        cpp = ['/usr/bin/xcrun', '--sdk', 'iphoneos', 'clang++'] + target + maps
+        cpp += ['-stdlib=libc++', '-nostdinc++', '-isystem', str(headers)]
+        cross = '[binaries]\n'
+        for key, value in {'c': c, 'cpp': cpp, 'objc': c,
+                           'ar': [tools['ar']], 'strip': [tools['strip']],
+                           'pkg-config': ['false']}.items():
+            cross += key + ' = ' + repr(value) + '\n'
+        cross += '\n[built-in options]\n'
+        for key in ('c_link_args', 'cpp_link_args', 'objc_link_args'):
+            cross += key + ' = ' + repr(link) + '\n'
+        cross += "\n[properties]\nneeds_exe_wrapper = true\n\n[host_machine]\n"
+        cross += "system = 'darwin'\nsubsystem = 'ios'\nkernel = 'xnu'\n"
+        cross += "cpu_family = 'aarch64'\ncpu = 'arm64'\nendian = 'little'\n"
+        (root / 'ios.cross').write_text(cross)
+        # Keep native compilation/linking on the selected macOS SDK and Apple linker.
+        macsdk = out('xcrun', '--sdk', 'macosx', '--show-sdk-path')
+        macld = out('xcrun', '--sdk', 'macosx', '--find', 'ld')
+        llvm = pathlib.Path(out('brew', '--prefix', 'llvm@22'))
+        llvm_version = out(str(llvm / 'bin/llvm-config'), '--version')
+        assert llvm_version == '22.1.8', 'LLVM formula drift: ' + llvm_version
+        assert out(str(llvm / 'bin/llvm-config'), '--has-rtti') == 'YES'
+        assert (llvm / 'lib/clang/22/include/opencl-c.h').is_file()
+        assert (llvm / 'lib/clang/22/include/opencl-c-base.h').is_file()
+        spirv = pathlib.Path(out('brew', '--prefix', 'spirv-tools'))
+        rpaths = ['-Wl,-rpath,' + str(p) for p in (llvm / 'lib', root / 'prefix/lib', spirv / 'lib')]
+        native = '[binaries]\n'
+        for key, value in {
+            'c': ['/usr/bin/xcrun', '--sdk', 'macosx', 'clang'],
+            'cpp': ['/usr/bin/xcrun', '--sdk', 'macosx', 'clang++'],
+            'objc': ['/usr/bin/xcrun', '--sdk', 'macosx', 'clang'],
+            'ar': [out('xcrun', '--sdk', 'macosx', '--find', 'ar')],
+            'llvm-config': [str(llvm / 'bin/llvm-config')],
+        }.items():
+            native += key + ' = ' + repr(value) + '\n'
+        native += '\n[built-in options]\n'
+        for key in ('c_link_args', 'cpp_link_args', 'objc_link_args'):
+            native += key + ' = ' + repr(['-isysroot', macsdk, '-fuse-ld=' + macld] + rpaths) + '\n'
+        (root / 'host.native').write_text(native)
+        print('Selected LLVM:', llvm_version, llvm)
+        print('Selected native SDK/linker:', macsdk, macld)
+        (root / 'apple-tools.json').write_text(json.dumps({'sdk': sdk, 'version': version,
+                                                        'headers': str(headers), 'tools': tools, 'macsdk': macsdk, 'macld': macld, 'llvm': str(llvm), 'spirv': str(spirv)}))
+        print('iPhone SDK:', version, sdk)
+        print('Selected Xcode libc++ headers:', headers)
+        subprocess.run(['/usr/bin/xcrun', '--sdk', 'iphoneos', 'clang', '--version'], check=True)
+        subprocess.run(cpp + ['-x', 'c++', '-std=c++17', '-fsyntax-only', '-'],
+                       input='#include <vector>\nint probe() { std::vector<int> v; return v.size(); }\n',
+                       text=True, check=True)
+        subprocess.run(['/usr/bin/xcrun', '--sdk', 'macosx', 'clang', '-fuse-ld=' + macld, '-x', 'c', '-',
+                        '-o', str(root / 'native-link-probe')],
+                       input='int main(void) { return 0; }\n', text=True, check=True)
+        PY
+    - name: Fetch exact Mesa, complete patch series and translator inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        .work/kosmickrisp/venv/bin/python - <<'PY'
+        import hashlib, pathlib, subprocess
+        expected = 'b39d173ca9369c19fda2635be6655d308067e52d'
+        canonical = 'https://gitlab.freedesktop.org/mesa/mesa.git'
+        pin = next(line.split() for line in pathlib.Path('pins.lock').read_text().splitlines()
+                   if line.startswith('mesa '))
+        assert pin[1:3] == [expected, canonical], pin
+        assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == '412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+        series = pathlib.Path('patches/mesa/series').read_text().splitlines()
+        names = [line.strip() for line in series if line.strip() and not line.startswith('#')]
+        assert len(names) == 35 and len(set(names)) == 35, names
+        patches = []
+        for index, name in enumerate(names, 1):
+            assert pathlib.PurePosixPath(name).name == name and name.startswith(f'{index:04d}-'), name
+            patch = pathlib.Path('patches/mesa', name).resolve()
+            print('patch', index, name, hashlib.sha256(patch.read_bytes()).hexdigest(), flush=True)
+            patches.append(str(patch))
+        print('Playport source: 412de5f8c0bdd26d84e0127eb5776ba992e3b152', flush=True)
+        print('Mesa source:', expected, canonical, flush=True)
+        checker = pathlib.Path('build/check-macho-imports.py')
+        print('Pinned import checker SHA256:', hashlib.sha256(checker.read_bytes()).hexdigest(), flush=True)
+        tree = pathlib.Path('.work/kosmickrisp/mesa')
+        subprocess.run(['git', 'init', str(tree)], check=True)
+        def git(*args):
+            subprocess.run(['git', '-C', str(tree), *args], check=True)
+        git('fetch', '--depth=1', canonical, expected)
+        git('checkout', '--detach', expected)
+        git('-c', 'user.name=KosmicKrisp source probe', '-c', 'user.email=probe@localhost',
+            'am', '--committer-date-is-author-date', *patches)
+        base = subprocess.check_output(['git', '-C', str(tree), 'rev-parse', 'HEAD~35'], text=True).strip()
+        assert base == expected, base
+        git('diff', '--exit-code', 'HEAD')
+        git('log', '--format=%H %s', '-35', '--reverse')
+        subprocess.run(['git', 'diff', '--exit-code', 'HEAD'], check=True)
+        # The translator release must match LLVM's 22.1 major/minor ABI.
+        translator_pin = '567786558a00e8b7ec0457f1706504784e229150'  # v22.1.0
+        headers_pin = '9268f3057354a2cb65991ba5f38b16d81e803692'
+        for name, url, revision in (
+            ('translator', 'https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git', translator_pin),
+            ('spirv-headers', 'https://github.com/KhronosGroup/SPIRV-Headers.git', headers_pin),
+        ):
+            target = pathlib.Path('.work/kosmickrisp', name)
+            subprocess.run(['git', 'init', str(target)], check=True)
+            subprocess.run(['git', '-C', str(target), 'fetch', '--depth=1', url, revision], check=True)
+            subprocess.run(['git', '-C', str(target), 'checkout', '--detach', revision], check=True)
+            actual = subprocess.check_output(['git', '-C', str(target), 'rev-parse', 'HEAD'], text=True).strip()
+            assert actual == revision, (name, actual)
+            print('Pinned host dependency:', name, actual, flush=True)
+        assert pathlib.Path('.work/kosmickrisp/translator/spirv-headers-tag.conf').read_text().strip() == headers_pin
+        PY
+    - name: Build the matching native translator and check IR round trip
+      id: translator
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/kosmickrisp"
+        llvm="$(brew --prefix llvm@22)"
+        spirv="$(brew --prefix spirv-tools)"
+        macsdk="$(xcrun --sdk macosx --show-sdk-path)"
+        macld="$(xcrun --sdk macosx --find ld)"
+        cmake -S "$root/translator" -B "$root/translator-build" -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$root/prefix" \
+          -DCMAKE_C_COMPILER="$(xcrun --sdk macosx --find clang)" \
+          -DCMAKE_CXX_COMPILER="$(xcrun --sdk macosx --find clang++)" \
+          -DCMAKE_OSX_SYSROOT="$macsdk" -DCMAKE_LINKER="$macld" \
+          -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=$macld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=$macld" \
+          -DCMAKE_INSTALL_RPATH="$root/prefix/lib;$llvm/lib;$spirv/lib" \
+          -DCMAKE_PREFIX_PATH="$llvm;$spirv" -DLLVM_DIR="$llvm/lib/cmake/llvm" \
+          -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR="$root/spirv-headers" \
+          -DLLVM_SPIRV_BUILD_EXTERNAL=YES -DLLVM_BUILD_TOOLS=ON -DBUILD_SHARED_LIBS=ON \
+          -DLLVM_SPIRV_INCLUDE_TESTS=OFF -DCCACHE_ALLOWED=OFF \
+          -DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+        cmake --build "$root/translator-build" --parallel "$(sysctl -n hw.logicalcpu)"
+        cmake --install "$root/translator-build"
+        export PATH="$root/prefix/bin:$llvm/bin:$PATH"
+        export PKG_CONFIG_PATH="$root/prefix/lib/pkgconfig:$spirv/lib/pkgconfig:$llvm/lib/pkgconfig"
+        pkg-config --modversion LLVMSPIRVLib SPIRV-Tools
+        .work/kosmickrisp/venv/bin/python - <<'PY'
+        import pathlib, struct, subprocess
+        root = pathlib.Path('.work/kosmickrisp').resolve()
+        version = subprocess.check_output(['pkg-config', '--modversion', 'LLVMSPIRVLib'], text=True).strip()
+        parts = tuple(map(int, version.split('.')[:2]))
+        assert parts == (22, 1), 'Translator ABI mismatch: ' + version
+        source = root / 'roundtrip.ll'
+        source.write_text('target triple = "spir64-unknown-unknown"\ndefine spir_kernel void @probe() { ret void }\n')
+        subprocess.run(['llvm-as', str(source), '-o', str(root / 'roundtrip.bc')], check=True)
+        subprocess.run(['llvm-spirv', str(root / 'roundtrip.bc'), '-o', str(root / 'roundtrip.spv')], check=True)
+        assert struct.unpack('<I', (root / 'roundtrip.spv').read_bytes()[:4])[0] == 0x07230203
+        subprocess.run(['llvm-spirv', '-r', str(root / 'roundtrip.spv'), '-o', str(root / 'roundtrip-back.bc')], check=True)
+        print('PASS: native LLVM 22.1 / translator 22.1 IR-SPIRV round trip; no GPU executed.')
+        PY
+    - name: Build only the three Mac-native shader tools
+      id: hosttools
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/kosmickrisp"
+        llvm="$(brew --prefix llvm@22)"
+        spirv="$(brew --prefix spirv-tools)"
+        export PATH="$root/venv/bin:$root/prefix/bin:$llvm/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+        export PKG_CONFIG_PATH="$root/prefix/lib/pkgconfig:$spirv/lib/pkgconfig:$llvm/lib/pkgconfig"
+        meson setup "$root/host" "$root/mesa" --native-file "$root/host.native" \
+          -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false \
+          -Dgles1=disabled -Dgles2=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+          -Dzstd=disabled -Dbuildtype=release -Dwrap_mode=nofallback \
+          -Dgallium-rusticl=false -Dmicrosoft-clc=disabled \
+          -Dplatforms= -Dllvm=enabled -Dexpat=disabled -Dshared-llvm=enabled \
+          -Dmesa-clc-bundle-headers=enabled
+        ninja -C "$root/host" -j "$(sysctl -n hw.logicalcpu)" \
+          src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/kosmickrisp/clc/kk_clc
+        for binary in src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/kosmickrisp/clc/kk_clc; do
+          file "$root/host/$binary"
+          xcrun lipo -archs "$root/host/$binary"
+        done
+    - name: Cross-compile only the iOS KosmicKrisp driver
+      id: driver
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/kosmickrisp"
+        export PATH="$root/venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+        .work/kosmickrisp/venv/bin/python - <<'PY'
+        from pathlib import Path
+        root = Path('.work/kosmickrisp').resolve()
+        native = '[binaries]\n'
+        for name, relative in {
+            'mesa_clc': 'src/compiler/clc/mesa_clc',
+            'vtn_bindgen2': 'src/compiler/spirv/vtn_bindgen2',
+            'kk_clc': 'src/kosmickrisp/clc/kk_clc',
+        }.items():
+            path = root / 'host' / relative
+            assert path.is_file(), path
+            native += name + ' = ' + repr(str(path)) + '\n'
+        (root / 'host-tools.native').write_text(native)
+        PY
+        meson setup "$root/ios" "$root/mesa" --cross-file "$root/ios.cross" \
+          --native-file "$root/host.native" --native-file "$root/host-tools.native" \
+          -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false \
+          -Dgles1=disabled -Dgles2=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+          -Dzstd=disabled -Dbuildtype=release -Dwrap_mode=nofallback \
+          -Dgallium-rusticl=false -Dmicrosoft-clc=disabled \
+          -Dplatforms=macos -Dllvm=disabled -Dexpat=disabled \
+          -Dmesa-clc=system -Dprecomp-compiler=system
+        ninja -C "$root/ios" -j "$(sysctl -n hw.logicalcpu)" \
+          src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib
+    - name: Inspect iOS driver imports without loading it
+      id: inspect
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        export PATH="$(brew --prefix llvm@22)/bin:$PATH"
+        .work/kosmickrisp/venv/bin/python - <<'PY'
+        import hashlib, json, pathlib, shutil, subprocess
+        root = pathlib.Path('.work/kosmickrisp')
+        apple = json.loads((root / 'apple-tools.json').read_text())
+        output = root / 'out/KosmicKrisp'
+        output.parent.mkdir()
+        shutil.copy2(root / 'ios/src/kosmickrisp/vulkan/libvulkan_kosmickrisp.dylib', output)
+        subprocess.run([apple['tools']['install_name_tool'], '-id',
+                        '@rpath/KosmicKrisp.framework/KosmicKrisp', str(output)], check=True)
+        subprocess.run(['.work/kosmickrisp/venv/bin/python', 'build/check-macho-imports.py',
+                        '--sdk', apple['sdk'], '--platform', 'ios', '--minos', '26.0',
+                        '--exports', 'vk_icdGetInstanceProcAddr,vk_icdNegotiateLoaderICDInterfaceVersion,vk_icdGetPhysicalDeviceProcAddr,vkGetInstanceProcAddr,vkGetDeviceProcAddr',
+                        str(output)], check=True)
+        imports = subprocess.check_output(['llvm-objdump', '--macho', '--dylibs-used', str(output)], text=True)
+        print(imports)
+        assert not any(name in imports.lower() for name in ('moltenvk', 'llvm', 'llvmsprv', 'spirv-tools'))
+        data = output.read_bytes()
+        for value in (str(pathlib.Path.cwd()), str(pathlib.Path.home()), apple['sdk'], apple['macsdk'], apple['llvm']):
+            assert value.encode() not in data, 'Host path embedded in iOS driver'
+        assert b'MoltenVK' not in data
+        print('Driver SHA256:', hashlib.sha256(data).hexdigest())
+        subprocess.run(['git', 'diff', '--exit-code', 'HEAD'], check=True)
+        print('PASS: iOS arm64 driver built with native Mac shader generators; imports resolved; iOS library never loaded.')
+        PY
+    - name: Write source-only result
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        printf '%s\n' \
+          'KosmicKrisp component compile probe only; no app, signing, device or gameplay test.' \
+          'Playport 412de5f8c0bdd26d84e0127eb5776ba992e3b152; Mesa b39d173ca9369c19fda2635be6655d308067e52d plus all 35 patches.' \
+          'LLVM and Clang libraries 22.1.8; translator 22.1.0 pinned at 567786558a00e8b7ec0457f1706504784e229150; build compiler is selected Xcode clang. External libclc is not selected.' \
+          'Translator: ${{ steps.translator.outcome }}; host tools: ${{ steps.hosttools.outcome }}; iOS driver: ${{ steps.driver.outcome }}; imports: ${{ steps.inspect.outcome }}.' \
+          'Matching Wine/FEX/WoW64 and display integration remain outstanding; a driver compile is not CoD compatibility.' \
+          'Next step after a pass: assess the matching Wine/FEX source integration in the current thread. No new thread required.' \
+          'No SDK, source-build cache, runtime-library or IPA artifacts were uploaded.' >> "$GITHUB_STEP_SUMMARY"
+
