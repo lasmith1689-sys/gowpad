@@ -181,13 +181,17 @@ jobs:
         \  '/usr/lib/libobjc.A.dylib','/usr/lib/libSystem.B.dylib'}\nassert set(metadata['loads'])<=allowed and\
         \ {'/System/Library/Frameworks/Metal.framework/Metal',\n  '/System/Library/Frameworks/OpenGLES.framework/OpenGLES'}<=set(metadata['loads']),metadata\n\
         assert not metadata['installIds'] and not metadata['rpaths'] and metadata['signaturePresent'],metadata\n\
-        h=struct.unpack_from('<8I',executable);at=32;signatures=[];entries=[]\nfor _ in range(h[4]):\n    command,size=struct.unpack_from('<II',executable,at)\n\
-        \    if command==0x1d:signatures.append(struct.unpack_from('<II',executable,at+8))\n    if command==0x80000028:entries.append(command)\n\
-        \    at+=size\nassert len(signatures)==len(entries)==1\noffset,size=signatures[0];blob=executable[offset:offset+size]\n\
-        magic,length,count=struct.unpack_from('>III',blob);assert magic==0xfade0cc0 and length<=len(blob) and 1<=count<=8\n\
-        cdflags=[]\nfor i in range(count):\n    kind,off=struct.unpack_from('>II',blob,12+i*8)\n    assert kind!=0x10000,'A\
-        \ CMS certificate signature is not allowed in this console fixture'\n    if kind==0:\n        magic,cdlen,version,flags=struct.unpack_from('>IIII',blob,off)\n\
-        \        assert magic==0xfade0c02 and flags&2\n        if version>=0x20200:assert struct.unpack_from('>I',blob,off+48)[0]==0,'Unexpected\
+        h=struct.unpack_from('<8I',executable);at=32;signatures=[];entries=[];segments=[]\nfor _ in range(h[4]):\n\
+        \    command,size=struct.unpack_from('<II',executable,at)\n    if command==0x1d:signatures.append(struct.unpack_from('<II',executable,at+8))\n\
+        \    if command==0x80000028:entries.append(struct.unpack_from('<QQ',executable,at+8))\n    if command==0x19:\n\
+        \        vmaddr,vmsize,fileoff,filesize,maxprot,initprot,nsects,flags=struct.unpack_from('<QQQQiiII',executable,at+24)\n\
+        \        segments.append({'name':executable[at+8:at+24].split(b'\\0')[0].decode(),'vmaddr':vmaddr,\n   \
+        \       'fileoff':fileoff,'filesize':filesize,'initprot':initprot})\n    at+=size\nassert len(signatures)==len(entries)==1\n\
+        offset,size=signatures[0];blob=executable[offset:offset+size]\nmagic,length,count=struct.unpack_from('>III',blob);assert\
+        \ magic==0xfade0cc0 and length<=len(blob) and 1<=count<=8\ncdflags=[]\nfor i in range(count):\n    kind,off=struct.unpack_from('>II',blob,12+i*8)\n\
+        \    assert kind!=0x10000,'A CMS certificate signature is not allowed in this console fixture'\n    if kind==0:\n\
+        \        magic,cdlen,version,flags=struct.unpack_from('>IIII',blob,off)\n        assert magic==0xfade0c02\
+        \ and flags&2\n        if version>=0x20200:assert struct.unpack_from('>I',blob,off+48)[0]==0,'Unexpected\
         \ signing team'\n        cdflags.append(flags)\nassert len(cdflags)==1\nenv=dict(os.environ,DEVELOPER_DIR=plan['developer'])\n\
         def symbols(label,args):\n    p=subprocess.run([plan['tools']['nm'],*map(str,args)],env=env,capture_output=True,timeout=60)\n\
         \    (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)\n\
@@ -201,14 +205,22 @@ jobs:
         native=set(re.findall(r'(?<![A-Za-z0-9_])_gl[A-Za-z0-9_]+',tbd.read_text()))\nassert {'_glClear','_glGetError','_glReadPixels'}<=native\n\
         assert not defined&native,sorted(defined&native)\nimports=symbols('simulator-console-imports',['-u','-j',exe])\n\
         assert {'_MTLCreateSystemDefaultDevice','_glReadPixels'}<=imports\nassert not any(n.startswith(('_gl4es_','_initialize_gl4es','_close_gl4es','_set_get'))\
-        \ for n in imports)\nassert '_main' in symbols('simulator-console-defined',['-g','-U','-j',exe])\nfor row\
-        \ in compile_db:\n    command=row['command'];assert 'arm64-apple-ios26.0-simulator' in command\n    assert\
-        \ 'iPhoneSimulator' in command and '-arch arm64' in command\nfor name,row in plan['canonicalSourceHashes'].items():assert\
-        \ hashlib.sha256((source/name).read_bytes()).hexdigest()==row['sha256']\nfor name,digest in plan['pixelSourceHashes'].items():assert\
-        \ hashlib.sha256((root/name).read_bytes()).hexdigest()==digest\nresult={'sourcePin':plan['revision'],'archiveSha256':hashlib.sha256(data).hexdigest(),'archiveMembers':len(members),\n\
+        \ for n in imports)\nassert '_main' in symbols('simulator-console-all-defined',['-U','-j',exe])\nmain_inventory=subprocess.run([plan['tools']['nm'],'-n','-U',str(exe)],env=env,capture_output=True,timeout=60)\n\
+        (root/'simulator-main-inventory.stdout.txt').write_bytes(main_inventory.stdout)\n(root/'simulator-main-inventory.stderr.txt').write_bytes(main_inventory.stderr)\n\
+        assert main_inventory.returncode==0,main_inventory.stderr.decode(errors='replace')\nmain_lines=[line for\
+        \ line in main_inventory.stdout.decode().splitlines() if re.fullmatch(r'[0-9a-fA-F]+\\s+[tT]\\s+_main',line.strip())]\n\
+        entryoff,stacksize=entries[0]\nentry_segments=[s for s in segments if s['initprot']&4 and s['fileoff']<=entryoff<s['fileoff']+s['filesize']]\n\
+        assert len(entry_segments)==1,('Entry is not in one executable file-backed segment',entryoff,segments)\n\
+        entry_va=entry_segments[0]['vmaddr']+entryoff-entry_segments[0]['fileoff']\nprint(json.dumps({'actualMainSymbols':main_lines,'lcMainEntryoff':entryoff,'resolvedEntryVA':hex(entry_va),\n\
+        \  'executableSegment':entry_segments[0]},indent=2),flush=True)\nassert len(main_lines)==1 and int(main_lines[0].split()[0],16)==entry_va,('Actual\
+        \ main/LC_MAIN mismatch',main_lines,hex(entry_va))\nfor row in compile_db:\n    command=row['command'];assert\
+        \ 'arm64-apple-ios26.0-simulator' in command\n    assert 'iPhoneSimulator' in command and '-arch arm64'\
+        \ in command\nfor name,row in plan['canonicalSourceHashes'].items():assert hashlib.sha256((source/name).read_bytes()).hexdigest()==row['sha256']\n\
+        for name,digest in plan['pixelSourceHashes'].items():assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest\n\
+        result={'sourcePin':plan['revision'],'archiveSha256':hashlib.sha256(data).hexdigest(),'archiveMembers':len(members),\n\
         \  'simulatorConsoleSha256':plan['simulatorConsoleSha256'],'metadata':metadata,'adHocCodeDirectoryFlags':cdflags,\n\
-        \  'desktopImports':sorted(desktop),'nativeOpenGLESCollisions':0,'imports':sorted(imports),\n  'deviceArchiveReused':False,'platform':7,'minimumVersion':'26.0','developmentIdentityUsed':False}\n\
-        (root/'simulator-build-proof.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))\n\
+        \  'desktopImports':sorted(desktop),'nativeOpenGLESCollisions':0,'imports':sorted(imports),\n  'mainSymbolLine':main_lines[0],'mainEntryVA':hex(entry_va),\n\
+        \  'deviceArchiveReused':False,'platform':7,'minimumVersion':'26.0','developmentIdentityUsed':False}\n(root/'simulator-build-proof.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))\n\
         \nPY\n"
     - name: Execute real EAGL cases and independently verify pixel regions
       id: pixels
