@@ -2890,7 +2890,12 @@ void main()
             g.UseProgram(prog);
             g.DrawArrays(kTriangles, 0, 3);
             seenPipelines.insert(line);
-            ++warmed;
+            // progress on the start-up log overlay (the first launch builds every pipeline: seconds on a phone)
+            if (++warmed % 25 == 0)
+            {
+                g.Finish();
+                std::fprintf(stderr, "[gs-hw] preparing graphics %d/%zu\n", warmed, lines.size());
+            }
         }
         g.Finish(); // every pipeline built before the game draws
         g.ColorMask(kTrue, kTrue, kTrue, kTrue);
