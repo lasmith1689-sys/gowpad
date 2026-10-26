@@ -34,6 +34,8 @@ rsync -a --include='*.cpp' --exclude='*' "$input/generated/ee/" "$runner/"
 cp "$input/generated/ee/"*.h "$work/src/ps2xRuntime/include/"
 cp "$root/game/overrides/gow_overrides.cpp" "$root/game/overrides/"*.h "$runner/"
 cp "$input/generated/iop/"*.cpp "$work/src/ps2xIOP/src/native/"
+# the GS draw pipelines recorded in PC runs, pre-warmed at start-up (gs_hw_backend prewarmPipelines); goes into game/
+cp "$root/game/gs_pipelines.txt" "$input/game/gs_pipelines.txt"
 echo "  $(find "$runner" -name '*.cpp' | wc -l | tr -d ' ') EE sources, $(ls "$input/generated/iop" | wc -l | tr -d ' ') IOP files," \
   "$(find "$input/generated/vu1" -name '*.cpp' | wc -l | tr -d ' ') VU1 files"
 

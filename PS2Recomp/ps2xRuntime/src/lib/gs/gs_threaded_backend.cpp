@@ -372,7 +372,7 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
                 {
                     static const char *const names[GlOpTiming::kOps] = {"mxcsr", "submit", "clut", "begintx", "upload", "texflush", "wvram", "sync",
                                                                          "present", "state", "verts", "vrun", "call", "pad", "?", "?"};
-                    char note[200];
+                    char note[320];
                     std::snprintf(note, sizeof(note), "%.0f ms in %s%s%s", spent * 1e-6, names[index],
                                   ps2_perf::slowDrawDetail.empty() ? "" : ": ", ps2_perf::slowDrawDetail.c_str());
                     ps2_perf::noteHitch(spent * 1e-6, note);

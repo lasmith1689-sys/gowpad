@@ -229,4 +229,16 @@ namespace GSGL
     void InstallStateCache(Api &api);
     void SetStateCacheEnabled(bool enabled);
     void ReportStateCacheVerify(); // PS2X_GS_STATE_CACHE_VERIFY=1: skipped calls checked / mismatches so far
+
+    // GOW-Port: the state a draw call runs with, from the cache's shadow (this thread's context): what Apple's GL builds a
+    // Metal pipeline for (program, blending, colour mask) plus the depth state. known = false if any part is unknown.
+    struct PipelineState
+    {
+        bool known = false;
+        GLuint program = 0, drawFramebuffer = 0;
+        bool blend = false, depthTest = false;
+        GLenum blendFunc[4] = {}, blendEquation[2] = {}, depthFunc = 0;
+        GLboolean colorMask[4] = {}, depthMask = 0;
+    };
+    PipelineState CurrentPipelineState();
 }

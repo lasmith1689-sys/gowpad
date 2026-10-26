@@ -417,6 +417,25 @@ namespace GSGL
         g_enabled.store(enabled, std::memory_order_relaxed);
     }
 
+    PipelineState CurrentPipelineState()
+    {
+        const State &s = t_state;
+        PipelineState p;
+        p.known = s.program.known && s.drawFb.known && s.caps[0].known && s.caps[1].known && s.blendFunc.known &&
+                  s.blendEquation.known && s.colorMask.known && s.depthMask.known && s.depthFunc.known;
+        p.program = s.program.value[0];
+        p.drawFramebuffer = s.drawFb.value[0];
+        p.blend = s.caps[0].value[0] != 0;
+        p.depthTest = s.caps[1].value[0] != 0;
+        for (int i = 0; i < 4; ++i)
+            p.blendFunc[i] = s.blendFunc.value[i], p.colorMask[i] = s.colorMask.value[i];
+        p.blendEquation[0] = s.blendEquation.value[0];
+        p.blendEquation[1] = s.blendEquation.value[1];
+        p.depthFunc = s.depthFunc.value[0];
+        p.depthMask = s.depthMask.value[0];
+        return p;
+    }
+
     void ReportStateCacheVerify()
     {
         if (g_verify.on)

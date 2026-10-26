@@ -1216,6 +1216,7 @@ void main()
             return false;
         }
         drawVariants[kUberVariant] = makeDrawVariant(program);
+        programKeys[program] = kUberVariant;
         {
             const char *setting = std::getenv("PS2X_GS_ASYNC_SHADERS");
 #if defined(PS2X_IOS)
@@ -1287,6 +1288,7 @@ void main()
         std::fprintf(stderr, "[gs-hw] render-target renderer ready, scale %.2f (%s)\n", scale,
                      reinterpret_cast<const char *>(g.GetString(kRenderer)));
         initialized = true;
+        prewarmPipelines(); // the recorded draw pipelines, before the game draws (no-op without PS2X_GS_PIPELINES*)
         return true;
     }
 
@@ -2522,17 +2524,22 @@ void main()
         cpuTiming.vertices += pending.size();
         ++cpuTiming.draws;
         const uint64_t decodesBefore = decodes, selfCopiesBefore = stats.selfCopies;
-        drawFirstProgram = false;
+        uint64_t partsBefore[4];
+        std::memcpy(partsBefore, cpuTiming.parts, sizeof(partsBefore));
+        drawFirstProgram = drawFirstPipeline = false;
         draw(pendingState, pending);
         const uint64_t spent = nanosSince(drawStart);
         cpuTiming.drawNanos += spent;
         // GOW-Port: a draw over 10 ms says what it did, for the readout's hitch line (gs_threaded_backend op timer)
         if (spent > 10000000u)
         {
-            char detail[160];
-            std::snprintf(detail, sizeof(detail), "draw %.0f ms, %zu verts%s%s%s", spent * 1e-6, pending.size(),
-                          drawFirstProgram ? ", first use of a shader" : "", decodes > decodesBefore ? ", texture decode" : "",
-                          stats.selfCopies > selfCopiesBefore ? ", target copy" : "");
+            char detail[240];
+            // the draw's phases (cpuMark: before the target bind, fixed state, texture setup, upload + draw calls)
+            const auto ms = [&](int part) { return (cpuTiming.parts[part] - partsBefore[part]) * 1e-6; };
+            std::snprintf(detail, sizeof(detail), "draw %.0f ms, %zu verts [setup %.0f state %.0f tex %.0f calls %.0f]%s%s%s%s",
+                          spent * 1e-6, pending.size(), ms(0), ms(1), ms(2), ms(3),
+                          drawFirstProgram ? ", first use of a shader" : "", drawFirstPipeline ? ", new pipeline" : "",
+                          decodes > decodesBefore ? ", texture decode" : "", stats.selfCopies > selfCopiesBefore ? ", target copy" : "");
             ps2_perf::slowDrawDetail = detail;
         }
         pending.clear();
@@ -2725,6 +2732,148 @@ void main()
     std::unordered_set<GLuint> usedPrograms; // draw programs drawn with so far (hitch readout)
     bool drawFirstProgram = false;           // the current draw used one for the first time
 
+    // GOW-Port: pipeline pre-warming. Apple's GL builds a Metal pipeline (compiled shader + blending + colour mask +
+    // attachment formats) the first time a draw needs that combination, inside the draw call: a 90 ms stall on the
+    // iPhone when a new effect first appeared. Every combination drawn is recorded (PS2X_GS_PIPELINES=<file>, iOS:
+    // Documents/gs_pipelines.txt; a bundled list from PC runs, PS2X_GS_PIPELINES_BUNDLED, is read too), and at start-up
+    // each recorded one is drawn once into a small target of the same formats, so the driver builds them all before
+    // play. A line: variant key, blend on, 4 blend factors, 2 equations, colour mask bits, depth attachment.
+    std::unordered_map<GLuint, uint32_t> programKeys; // draw program -> its variant key (stable across runs)
+    std::unordered_set<std::string> knownPipelines, seenPipelines;
+    std::FILE *pipelineOut = nullptr;
+    bool drawTargetDepth = false; // the current draw's target has a depth attachment
+    bool drawFirstPipeline = false;
+    void notePipeline()
+    {
+        const GSGL::PipelineState p = GSGL::CurrentPipelineState();
+        const auto key = programKeys.find(p.program);
+        if (!p.known || key == programKeys.end())
+            return;
+        char line[128];
+        // (blend factors and equations only count with blending on)
+        const auto blendValue = [&p](GLenum v) { return p.blend ? v : 0u; };
+        std::snprintf(line, sizeof(line), "%08x %d %x %x %x %x %x %x %x %d", key->second, p.blend ? 1 : 0, blendValue(p.blendFunc[0]),
+                      blendValue(p.blendFunc[1]), blendValue(p.blendFunc[2]), blendValue(p.blendFunc[3]), blendValue(p.blendEquation[0]),
+                      blendValue(p.blendEquation[1]),
+                      (p.colorMask[0] ? 1 : 0) | (p.colorMask[1] ? 2 : 0) | (p.colorMask[2] ? 4 : 0) | (p.colorMask[3] ? 8 : 0),
+                      drawTargetDepth ? 1 : 0);
+        if (!seenPipelines.insert(line).second)
+            return;
+        drawFirstPipeline = true;
+        if (pipelineOut && !knownPipelines.count(line))
+        {
+            std::fprintf(pipelineOut, "%s\n", line);
+            std::fflush(pipelineOut);
+            knownPipelines.insert(line);
+        }
+    }
+    void prewarmPipelines()
+    {
+        std::vector<std::string> lines;
+        const auto readList = [&](const char *path) {
+            if (!path || !*path)
+                return;
+            if (std::FILE *f = std::fopen(path, "r"))
+            {
+                char line[160];
+                while (std::fgets(line, sizeof(line), f))
+                {
+                    std::string text(line);
+                    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+                        text.pop_back();
+                    if (!text.empty() && text[0] != '#' && knownPipelines.insert(text).second)
+                        lines.push_back(text);
+                }
+                std::fclose(f);
+            }
+        };
+        readList(std::getenv("PS2X_GS_PIPELINES_BUNDLED"));
+        const char *learned = std::getenv("PS2X_GS_PIPELINES");
+        readList(learned);
+        if (learned && *learned)
+            pipelineOut = std::fopen(learned, "a");
+        if (lines.empty())
+            return;
+        const Api &g = gl();
+        const auto start = std::chrono::steady_clock::now();
+        // two small targets in the render targets' formats: RGBA8, and RGBA8 with a 32-bit float depth attachment
+        constexpr GLsizei kSize = 64;
+        GLuint color[2] = {0u, 0u}, depth = 0u, fbo[2] = {0u, 0u};
+        g.GenTextures(2, color);
+        for (GLuint texture : color)
+        {
+            g.BindTexture(kTexture2D, texture);
+            g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), kSize, kSize, 0, kRgba, kUnsignedByte, nullptr);
+            g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+            g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
+        }
+        g.GenTextures(1, &depth);
+        g.BindTexture(kTexture2D, depth);
+        g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kDepthComponent32F), kSize, kSize, 0, kDepthComponent, kFloat, nullptr);
+        g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+        g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
+        g.GenFramebuffers(2, fbo);
+        for (int i = 0; i < 2; ++i)
+        {
+            g.BindFramebuffer(kFramebuffer, fbo[i]);
+            g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, color[i], 0);
+            if (i == 1)
+                g.FramebufferTexture2D(kFramebuffer, kDepthAttachment, kTexture2D, depth, 0);
+        }
+        // three zero vertices in the draw program's vertex layout (nothing visible is drawn; the pipeline is built)
+        g.BindVertexArray(vao);
+        g.BindBuffer(kArrayBuffer, vbo);
+        const std::vector<HwVertex> zero(3);
+        g.BufferData(kArrayBuffer, static_cast<GLsizeiptr>(sizeof(HwVertex) * zero.size()), zero.data(), kStreamDraw);
+        drawStream.size = drawStream.used = 0; // the next upload re-specifies the stream buffer
+        g.Disable(kScissorTest);
+        g.Disable(kDepthTest);
+        g.Viewport(0, 0, kSize, kSize);
+        int warmed = 0, built = 0;
+        for (const std::string &line : lines)
+        {
+            unsigned variant = 0, blend = 0, f[4] = {}, eq[2] = {}, mask = 0, withDepth = 0;
+            if (std::sscanf(line.c_str(), "%x %u %x %x %x %x %x %x %x %u", &variant, &blend, &f[0], &f[1], &f[2], &f[3], &eq[0], &eq[1],
+                            &mask, &withDepth) != 10)
+                continue;
+            GLuint prog = 0;
+            if (const auto it = drawVariants.find(variant); it != drawVariants.end())
+                prog = it->second.program;
+            else
+            {
+                prog = buildVariantProgram(variant);
+                if (!prog)
+                    continue;
+                ++built;
+                programKeys[prog] = variant;
+                drawVariants[variant] = makeDrawVariant(prog);
+            }
+            g.BindFramebuffer(kFramebuffer, fbo[withDepth ? 1 : 0]);
+            if (blend)
+            {
+                g.Enable(kBlend);
+                g.BlendEquationSeparate(eq[0], eq[1]);
+                g.BlendFuncSeparate(f[0], f[1], f[2], f[3]);
+            }
+            else
+                g.Disable(kBlend);
+            g.ColorMask((mask & 1u) ? kTrue : kFalse, (mask & 2u) ? kTrue : kFalse, (mask & 4u) ? kTrue : kFalse, (mask & 8u) ? kTrue : kFalse);
+            g.UseProgram(prog);
+            g.DrawArrays(kTriangles, 0, 3);
+            seenPipelines.insert(line);
+            ++warmed;
+        }
+        g.Finish(); // every pipeline built before the game draws
+        g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+        g.Disable(kBlend);
+        g.BindFramebuffer(kFramebuffer, 0u);
+        g.DeleteFramebuffers(2, fbo);
+        g.DeleteTextures(2, color);
+        g.DeleteTextures(1, &depth);
+        std::fprintf(stderr, "[gs-hw] pre-warmed %d pipelines (%d shader variants built) in %.0f ms\n", warmed, built,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    }
+
     void startAsyncVariants()
     {
         async.worker = context.CreateWorker();
@@ -2843,6 +2992,8 @@ void main()
                 if (!linked)
                     std::fprintf(stderr, "[gs-hw] background variant %06x is not linked here: uber program\n", key);
             }
+            if (linked)
+                programKeys[prog] = key;
             drawVariants[key] = linked ? makeDrawVariant(prog) : drawVariants[kUberVariant];
         }
     }
@@ -2871,6 +3022,7 @@ void main()
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         if (!prog)
             return drawVariants[key] = drawVariants[kUberVariant];
+        programKeys[prog] = key;
         return drawVariants[key] = makeDrawVariant(prog);
     }
 
@@ -2934,6 +3086,7 @@ void main()
         if (usedPrograms.insert(v.program).second)
             drawFirstProgram = true; // (Apple's GL builds its Metal pipeline at a program's first draws)
         g.UseProgram(v.program);
+        notePipeline(); // the draw call follows: program, blending and masks are set by now
         for (int i = 0; i < kDrawUniforms; ++i)
         {
             const UniformValue &u = drawUniforms[i];
@@ -3032,6 +3185,7 @@ void main()
         }
         cpuMark(0);
         g.BindFramebuffer(kFramebuffer, rt.fbo);
+        drawTargetDepth = rt.depth != 0u; // (pipeline records: the attachment formats)
         g.Viewport(0, 0, rt.glW, rt.glH);
         g.Enable(kScissorTest);
         const int sx0 = c.scissor.x0, sy0 = c.scissor.y0;

@@ -117,6 +117,8 @@ namespace ps2_perf
     }
     inline void noteLongFrame(double ms)
     {
+        if (ms > 5000.0)
+            return; // the app suspended, or a load: not a stutter
         std::lock_guard<std::mutex> lock(hitch.mutex);
         const auto now = std::chrono::steady_clock::now();
         if (ms > hitch.frameMs || now - hitch.frameAt > std::chrono::seconds(30))
@@ -131,7 +133,7 @@ namespace ps2_perf
         const auto now = std::chrono::steady_clock::now();
         if (hitch.frameMs <= 0.0 && hitch.note.empty())
             return {};
-        char text[256];
+        char text[448];
         const double frameAgo = std::chrono::duration<double>(now - hitch.frameAt).count();
         const double noteAgo = std::chrono::duration<double>(now - hitch.noteAt).count();
         if (hitch.note.empty() || noteAgo > 30.0)
