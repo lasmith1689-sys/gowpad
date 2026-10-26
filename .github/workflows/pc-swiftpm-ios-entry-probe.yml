@@ -54,7 +54,7 @@ jobs:
         (leaf/'Package.swift').write_text('// swift-tools-version: 6.0\nimport PackageDescription\nlet package=Package(name:"LocalLeaf",platforms:[.iOS("26.0")],products:[.library(name:"LocalLeaf",targets:["Leaf"])],targets:[.target(name:"Leaf")])\n')
         (leaf/'Sources/Leaf/Leaf.swift').write_text('public func fixtureText() -> String { "Own-source CLI entry smoke" }\n')
         (package/'Package.swift').write_text('// swift-tools-version: 6.0\nimport PackageDescription\nlet package=Package(name:"RootPackage",platforms:[.iOS("26.0")],products:[.library(name:"Playport",targets:["EntryMain"]),.library(name:"PlayportJIT",targets:["EntryHelper","EntryPoint"])],dependencies:[.package(path:"../LocalLeaf")],targets:[.target(name:"EntryMain",dependencies:[.product(name:"LocalLeaf",package:"LocalLeaf")]),.target(name:"EntryHelper",linkerSettings:[.linkedFramework("Foundation"),.unsafeFlags(["-Xlinker","-ObjC"])]),.target(name:"EntryPoint",linkerSettings:[.linkedFramework("Foundation")])])\n')
-        (package/'Sources/EntryMain/Main.swift').write_text('import SwiftUI\nimport Leaf\n@main public struct EntrySmokeApp: App {\n public init() {}\n public var body: some Scene { WindowGroup { Text(fixtureText()) } }\n}\n')
+        (package/'Sources/EntryMain/PlayportApp.swift').write_text('import SwiftUI\nimport Leaf\n@main public struct EntrySmokeApp: App {\n public init() {}\n public var body: some Scene { WindowGroup { Text(fixtureText()) } }\n}\n')
         (package/'Sources/EntryHelper/Principal.swift').write_text('import Foundation\n@objc(EntrySmokePrincipal) public final class EntrySmokePrincipal: NSObject {\n @objc public func smokeValue() -> Int32 { 64 }\n}\n')
         (package/'Sources/EntryPoint/include/EntryPoint.h').write_text('int NSExtensionMain(int argc,char **argv);\n')
         (package/'Sources/EntryPoint/entry.c').write_text('#include <dlfcn.h>\n__attribute__((used,visibility("default"))) int NSExtensionMain(int argc,char **argv) {\n int (*foundation_main)(int,char **)=(int (*)(int,char **))dlsym(RTLD_NEXT,"NSExtensionMain");\n return foundation_main(argc,argv);\n}\n')
@@ -69,6 +69,7 @@ jobs:
         (root/'linker-observer.json').write_text(json.dumps({'unobservedSha256':hashlib.sha256(original.encode()).hexdigest(),
             'observedSha256':hashlib.sha256(wrapper.read_bytes()).hexdigest(),'originalExecCount':1,'argumentsChangedByObservation':False},indent=2))
         inventory={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for parent in (fixtures,builder,root/'tools',root/'work/native-linker') for p in parent.rglob('*') if p.is_file()}
+        assert not any(p.name.casefold()=='main.swift' for p in fixtures.rglob('*.swift')), 'Fixture must preserve library target inference'
         (root/'fixture-inventory.json').write_text(json.dumps(inventory,indent=2))
         PY
     - name: Embed frozen strict import checker without acquisition
