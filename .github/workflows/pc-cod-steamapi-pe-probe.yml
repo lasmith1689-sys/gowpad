@@ -288,7 +288,14 @@ jobs:
           assert 'GNU Make' in out(t['make'],'--version')
           source='#include <vector>\nextern "C" __declspec(dllexport) int crt_probe(int n) { volatile char stack[32768]; stack[n & 32767]=42; std::vector<int> v{1,2,3}; return stack[n & 32767]+v.at(n%3); }\n'
           probes=[]
+          t['runtime_archives']={}
           for compiler,arch in [('x86_64-w64-mingw32-clang++','x86_64'),('i686-w64-mingw32-clang++','i386')]:
+              t['runtime_archives'][arch]={}
+              for library in ('libc++.a','libunwind.a'):
+                  archive=pathlib.Path(out(str(mingw/'bin'/compiler),'-print-file-name='+library)).resolve(strict=True)
+                  assert archive.is_relative_to(mingw.resolve()) and archive.name==library
+                  t['runtime_archives'][arch][library]={'path':str(archive.relative_to(mingw.resolve())),
+                      'sha256':hashlib.sha256(archive.read_bytes()).hexdigest()}
               output=root/('crt-probe-'+arch+'.dll')
               subprocess.run([str(mingw/'bin'/compiler),'-shared','-static','-O0','-x','c++','-',
                               '-Wl,--no-insert-timestamp','-o',str(output)],input=source,text=True,env=env,check=True)
@@ -330,9 +337,11 @@ jobs:
           adapted=adapted.replace(before,'$GBE_EXTRACTOR')
           before='(cd "$ROOT/pe" && sha256sum */*.dll)';assert adapted.count(before)==1
           adapted=adapted.replace(before,'if [[ " $STAGES " == *" api "* ]]; then '+before+'; fi')
+          before='LDFLAGS=-Wl,--no-insert-timestamp > "$ROOT/make-api-$p.log"';assert adapted.count(before)==1
+          adapted=adapted.replace(before,'LDFLAGS="-Wl,--no-insert-timestamp -Wl,--verbose,-Map,$ROOT/link-api-$p.map" > "$ROOT/make-api-$p.log" 2>&1')
           script=adapter/'stages/steamapi.sh';script.write_text(adapted)
           subprocess.run([t['bash'],'-n',str(script)],check=True)
-          # Only Mac 7zz selection and the deps-only footer are adapted. All target recipes, arch tuples and libraries stay frozen.
+          # Only Mac 7zz, the deps-only footer and diagnostic linker verbose/map output are adapted; codegen/ABI stays frozen.
           print(''.join(difflib.unified_diff(original.splitlines(True),adapted.splitlines(True),fromfile='pinned steamapi.sh',tofile='Mac deps/api adapter')))
           (root/'adapter-proof.json').write_text(json.dumps({'originalSha256':hashlib.sha256(original.encode()).hexdigest(),
               'adapterSha256':hashlib.sha256(adapted.encode()).hexdigest(),
@@ -410,12 +419,75 @@ jobs:
           cd source
           export TMPDIR="$PWD/.work/cod-steamapi-pe/tmp"
           python3 - <<'PY'
-          import hashlib,json,pathlib,re,shutil,struct,subprocess
+          import hashlib,json,pathlib,re,shutil,struct,subprocess,tarfile
           root=pathlib.Path('.work/cod-steamapi-pe').resolve();t=json.loads((root/'tools.json').read_text())
           tool=str(pathlib.Path(t['mingw'])/'bin/llvm-readobj')
           strip=str(pathlib.Path(t['mingw'])/'bin/llvm-strip')
           # The verified 20260922 package supplies this tool. LLVM's COFF StripDebug removes discardable
-          # debug sections (llvmorg-23.1.2 llvm/lib/ObjCopy/COFF/COFFObjcopy.cpp); runtime strings receive no exception.
+          # debug sections (llvmorg-23.1.2 llvm/lib/ObjCopy/COFF/COFFObjcopy.cpp). Only the archive-bound CRT strings below are permitted.
+          CRT_PREFIX='/Users/runner/work/llvm-mingw/llvm-mingw/llvm-project/'
+          CRT_PATHS=['libcxxabi/src/'+name for name in ('private_typeinfo.cpp','cxa_personality.cpp','fallback_malloc.cpp',
+              'cxa_demangle.cpp','demangle/ItaniumDemangle.h','demangle/Utility.h')]
+          CRT_EXPECTED={'x86_64':CRT_PATHS,'i386':CRT_PATHS+['libunwind/src/DwarfInstructions.hpp','libunwind/src/DwarfParser.hpp']}
+          def archive_members(data):
+              assert data.startswith(b'!<arch>\n'),'Expected ordinary official CRT archive'
+              position=8;names=b'';result=[]
+              while position<len(data):
+                  header=data[position:position+60];assert len(header)==60 and header[58:]==b'`\n'
+                  size=int(header[48:58]);begin=position+60;end=begin+size;assert 0<=size and end<=len(data)
+                  name=header[:16].decode('ascii').rstrip();payload=data[begin:end]
+                  if name=='//':names=payload
+                  elif name not in ('/','/SYM64/'):
+                      if name.startswith('#1/'):
+                          length=int(name[3:]);assert 0<length<=len(payload)
+                          name=payload[:length].rstrip(b'\0').decode();payload=payload[length:]
+                      elif name.startswith('/'):
+                          offset=int(name[1:]);assert 0<=offset<len(names)
+                          endings=[end for end in (names.find(b'/\n',offset),names.find(b'\0',offset)) if end>=offset]
+                          assert endings;finish=min(endings)
+                          name=names[offset:finish].decode()
+                      else:name=name.removesuffix('/')
+                      assert name and '\n' not in name and '\r' not in name
+                      result.append((name,payload))
+                  position=end+(size&1)
+              assert position==len(data),'Invalid archive padding'
+              return result
+          def crt_providers(arch,mingw,records,package,link_log,link_map):
+              expected={CRT_PREFIX+name for name in CRT_EXPECTED[arch]};providers={name:[] for name in expected}
+              machine=0x8664 if arch=='x86_64' else 0x14c
+              for library,record in records.items():
+                  relative=pathlib.PurePosixPath(record['path']);assert not relative.is_absolute() and '..' not in relative.parts
+                  path=mingw.joinpath(*relative.parts);assert path.resolve().is_relative_to(mingw.resolve()) and path.name==library
+                  data=path.read_bytes();assert hashlib.sha256(data).hexdigest()==record['sha256'],'Compiler runtime archive changed since pre-build record'
+                  member=package.getmember(mingw.name+'/'+relative.as_posix());assert member.isfile() and member.size==len(data)
+                  assert package.extractfile(member).read()==data,'Installed runtime differs from checksum-verified official package'
+                  members=archive_members(data)
+                  for name,payload in members:
+                      for source in expected:
+                          value=source.encode()+b'\0'
+                          if value not in payload:continue
+                          assert struct.unpack_from('<H',payload)[0]==machine,'CRT source string is not in matching COFF payload'
+                          assert sum(n==name for n,_ in members)==1,'Ambiguous runtime archive member'
+                          identity=library+'('+name+')'
+                          if not re.search(re.escape(name)+r':\(\.rdata(?:\$[^)]*)?\)',link_map):continue
+                          assert 'Reading '+identity in link_log or 'Loaded '+identity in link_log,'No actual linker member diagnostic'
+                          providers[source].append({'archive':relative.as_posix(),'archiveSha256':record['sha256'],
+                              'member':name,'memberSha256':hashlib.sha256(payload).hexdigest(),'sourceOccurrencesInMember':payload.count(value)})
+              assert all(providers.values()),('Expected CRT string lacks an official selected archive provider',providers)
+              return providers
+          def accept_crt_paths(data,snapshot,arch,providers,project_prefixes):
+              assert all(prefix.encode() not in data for prefix in project_prefixes),'Current project/root path embedded'
+              expected={CRT_PREFIX+name for name in CRT_EXPECTED[arch]};observed={name:[] for name in expected}
+              rows=snapshot['sections'];rdata=rows.get('.rdata');assert rdata and not rdata['characteristics']&0xa0000000
+              for prefix in (b'/Users/runner',b'/home/runner'):
+                  for match in re.finditer(re.escape(prefix),data):
+                      offset=match.start();end=data.find(b'\0',offset,min(len(data),offset+256))
+                      assert end>offset and offset>0 and data[offset-1]==0,'Runner path is not a complete bounded source string'
+                      value=data[offset:end].decode('ascii');assert value in expected and providers.get(value),'Unrecognized/unproven runner source path'
+                      assert rdata['offset']<=offset and end<rdata['offset']+rdata['bytes'],'CRT path is outside read-only .rdata'
+                      observed[value].append(offset)
+              assert all(len(offsets)==1 for offsets in observed.values()),('CRT source identity/count differs from reviewed actual build',observed)
+              return [{'source':name,'offsets':observed[name],'providers':providers[name]} for name in sorted(expected)]
           def pe_snapshot(data):
               assert len(data)>=64 and data[:2]==b'MZ','Invalid DOS header'
               at=struct.unpack_from('<I',data,0x3c)[0]
@@ -488,8 +560,18 @@ jobs:
                   'imm32.dll','iphlpapi.dll','kernel32.dll','msvcrt.dll','ntdll.dll','ole32.dll','oleaut32.dll',
                   'opengl32.dll','secur32.dll','setupapi.dll','shell32.dll','shlwapi.dll','ucrtbase.dll','user32.dll',
                   'userenv.dll','version.dll','winmm.dll','wldap32.dll','ws2_32.dll','xinput1_3.dll'}
-          result={};remaining_paths=[]
+          mingw=pathlib.Path(t['mingw']).resolve();package_path=root/'inputs/llvm-mingw.tar.xz'
+          assert hashlib.sha256(package_path.read_bytes()).hexdigest()=='52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3'
+          package=tarfile.open(package_path,'r:xz')
+          assert set(t['runtime_archives'])==set(CRT_EXPECTED)
+          for path in root.rglob('*.a'):
+              assert path.name not in ('libc++.a','libunwind.a') or path.resolve().is_relative_to(mingw),'Ambiguous alternate compiler runtime input'
+          result={}
           for relative,(machine,magic) in expected.items():
+              arch=relative.split('-windows/')[0];p='x64' if arch=='x86_64' else 'x86'
+              records=t['runtime_archives'][arch];assert set(records)=={'libc++.a','libunwind.a'}
+              link_log=(root/('make-api-'+p+'.log')).read_text();link_map=(root/('link-api-'+p+'.map')).read_text()
+              providers=crt_providers(arch,mingw,records,package,link_log,link_map)
               path=root/'pe'/relative;raw=path.read_bytes();before=pe_snapshot(raw)
               raw_text=subprocess.check_output([tool,'--coff-imports','--coff-exports','--sections',str(path)],text=True)
               prefixes=(str(root),str(pathlib.Path.cwd()),str(pathlib.Path.home()))
@@ -508,7 +590,10 @@ jobs:
               text=subprocess.check_output([tool,'--coff-imports','--coff-exports','--sections',str(stripped)],text=True)
               assert abi_records(raw_text)==abi_records(text),'Strip changed exact exports/imports or their ABI metadata'
               assert path.read_bytes()==raw and preserved.read_bytes()==raw,'Raw source build changed during audit'
-              if stripped_paths:remaining_paths.append(relative)
+              project_prefixes=[str(root),str(pathlib.Path.cwd())]
+              if str(pathlib.Path.home())!='/Users/runner':project_prefixes.append(str(pathlib.Path.home()))
+              accepted_crt=accept_crt_paths(data,after,arch,providers,project_prefixes)
+              print(json.dumps({'file':relative,'acceptedOfficialCrtSourceStrings':accepted_crt},indent=2),flush=True)
               shutil.copy2(stripped,path)
               assert path.read_bytes()==data,'Final DLL differs from audited debug-stripped bytes'
               assert data[:2]==b'MZ'
@@ -529,8 +614,11 @@ jobs:
               result[relative]={'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),'machine':hex(machine),
                   'coffTimestamp':stamp,'exports':sorted(exports),'imports':imports,'debugOnlyStripPerformed':True,
                   'rawSha256':hashlib.sha256(raw).hexdigest(),'rawBytes':len(raw),'rawPathFindings':raw_paths,
-                  'remainingPathFindings':stripped_paths,'codeLoaderDataAndAbiUnchanged':True}
-          assert not remaining_paths,('Current runner build path remains after debug-only stripping; inspect section/context diagnostics',remaining_paths)
+                  'remainingPathFindings':stripped_paths,'codeLoaderDataAndAbiUnchanged':True,
+                  'acceptedOfficialCrtSourceStrings':accepted_crt,'compilerRuntimeArchives':records,
+                  'linkerDiagnosticsSha256':hashlib.sha256(link_log.encode()).hexdigest(),
+                  'linkerMapSha256':hashlib.sha256(link_map.encode()).hexdigest(),'allOtherRunnerAndProjectPathsRejected':True}
+          package.close()
           for tree in (root/'gbe',root/'gbe/third-party/common/linux',root/'gbe/third-party/deps/common',root/'premake-core',root/'abseil-cpp'):
               subprocess.run(['git','-C',str(tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
           subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
