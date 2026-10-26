@@ -1,0 +1,266 @@
+name: CoD matched Steam API native build-tool source probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-cod-steamapi-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-cod-steamapi-probe
+  cancel-in-progress: false
+
+jobs:
+  native-build-tools:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out immutable Playport source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: playportdev/playport
+          ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+          persist-credentials: "false"
+          submodules: "false"
+          path: source
+      - name: Record and verify native Mac compiler inputs
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install bash cmake ninja
+          cd source
+          mkdir -p .work/cod-steamapi/tmp
+          export TMPDIR="$PWD/.work/cod-steamapi/tmp"
+          python3 - <<'PY'
+          import json,pathlib,subprocess
+          root=pathlib.Path('.work/cod-steamapi').resolve()
+          def out(*args):return subprocess.check_output(args,text=True).strip()
+          assert out('uname','-m')=='arm64'
+          tools={name:out('xcrun','--sdk','macosx','--find',name) for name in ('clang','clang++','ld','ar')}
+          tools.update(sdk=out('xcrun','--sdk','macosx','--show-sdk-path'),
+                       sdk_version=out('xcrun','--sdk','macosx','--show-sdk-version'),
+                       bash=out('brew','--prefix','bash')+'/bin/bash',xcode=out('xcodebuild','-version'))
+          assert all(not any(c.isspace() for c in value) for key,value in tools.items() if key!='xcode')
+          subprocess.run([tools['bash'],'-c','(( BASH_VERSINFO[0] >= 5 ))'],check=True)
+          subprocess.run([tools['clang'],'-isysroot',tools['sdk'],'-fuse-ld='+tools['ld'],
+                          '-x','c','-','-o',str(root/'native-link-probe')],
+                         input='int main(void) { return 0; }\n',text=True,check=True)
+          (root/'tools.json').write_text(json.dumps(tools,indent=2));print(json.dumps(tools,indent=2))
+          PY
+      - name: Prepare exact patched GBE and native build-tool sources
+        id: sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi/tmp"
+          python3 - <<'PY'
+          import hashlib,json,pathlib,re,subprocess
+          repo=pathlib.Path.cwd();root=repo/'.work/cod-steamapi'
+          def out(*args):return subprocess.check_output(args,text=True).strip()
+          assert out('git','rev-parse','HEAD')=='412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+          pins={p[0]:p[1:3] for line in (repo/'pins.lock').read_text().splitlines()
+                if (p:=line.split()) and not line.startswith('#')}
+          assert pins['gbe']==['7103add7ca6ef3ef8353279219880068f2494fc8','https://github.com/Detanup01/gbe_fork.git']
+          assert pins['abseil-cpp']==['20250512.1','https://github.com/abseil/abseil-cpp.git']
+          def checkout(path,url,revision):
+              assert re.fullmatch(r'[0-9a-f]{40}',revision) and url.startswith('https://')
+              subprocess.run(['git','init',str(path)],check=True)
+              subprocess.run(['git','-C',str(path),'fetch','--depth=1',url,revision],check=True)
+              subprocess.run(['git','-C',str(path),'checkout','--detach','FETCH_HEAD'],check=True)
+              assert out('git','-C',str(path),'rev-parse','HEAD')==revision
+          gbe=root/'gbe';url=pins['gbe'][1]
+          checkout(gbe,url,pins['gbe'][0])
+          links={'third-party/common/linux':'79460394c02dba44e1f92e2d5359d84f0b7aaa54',
+                 'third-party/deps/common':'92a4a130262083c4e887155cbe6bcab99baf36ea'}
+          for path,revision in links.items():
+              assert out('git','-C',str(gbe),'ls-tree','HEAD',path).split()[:3]==['160000','commit',revision]
+          series=[line.strip() for line in (repo/'patches/gbe/series').read_text().splitlines()
+                  if line.strip() and not line.startswith('#')]
+          assert len(series)==6 and len(set(series))==6
+          record={'gbe_base':pins['gbe'][0],'gitlinks':links,'patches':[]}
+          for name in series:
+              assert pathlib.PurePosixPath(name).name==name
+              patch=repo/'patches/gbe'/name
+              record['patches'].append([name,hashlib.sha256(patch.read_bytes()).hexdigest()])
+              subprocess.run(['git','-C',str(gbe),'-c','user.name=GBE source probe','-c','user.email=probe@localhost',
+                              'am','--committer-date-is-author-date',str(patch)],check=True)
+          assert out('git','-C',str(gbe),'rev-parse','HEAD~6')==pins['gbe'][0]
+          for path,revision in links.items():checkout(gbe/path,url,revision)
+          linux=gbe/'third-party/common/linux';deps=gbe/'third-party/deps/common'
+          assert 'https://github.com/premake/premake-core/releases/tag/v5.0.0-beta8' in (linux/'premake/SOURCE.txt').read_text()
+          assert 'protobuf/releases/tag/v34.1' in (deps/'protobuf/SOURCE.txt').read_text()
+          # The annotated tag object and its commit are pinned; no signature claim is made.
+          premake=root/'premake-core'
+          subprocess.run(['git','init',str(premake)],check=True)
+          subprocess.run(['git','-C',str(premake),'fetch','--depth=1','https://github.com/premake/premake-core.git',
+                          'refs/tags/v5.0.0-beta8:refs/tags/v5.0.0-beta8'],check=True)
+          assert out('git','-C',str(premake),'rev-parse','v5.0.0-beta8^{tag}')=='974e64084aa7ceb06a432c3acd5e28cb6ee997e3'
+          assert out('git','-C',str(premake),'rev-parse','v5.0.0-beta8^{commit}')=='2ca338a25ed5f6e62d36c9cd70e5f313953c630d'
+          subprocess.run(['git','-C',str(premake),'checkout','--detach','v5.0.0-beta8'],check=True)
+          checkout(root/'abseil-cpp',pins['abseil-cpp'][1],'76bb24329e8bf5f39704eb10d21b9a80befa7c81')
+          archive=deps/'protobuf/protobuf.tar.gz'
+          blob=out('git','-C',str(deps),'ls-tree','HEAD','protobuf/protobuf.tar.gz').split()[2]
+          assert out('git','-C',str(deps),'hash-object','protobuf/protobuf.tar.gz')==blob
+          record.update(premake_commit='2ca338a25ed5f6e62d36c9cd70e5f313953c630d',
+                        premake_tag_object='974e64084aa7ceb06a432c3acd5e28cb6ee997e3',premake_tag_signature_verified=False,
+                        abseil_commit='76bb24329e8bf5f39704eb10d21b9a80befa7c81',
+                        protobuf_git_blob=blob,protobuf_archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
+          (root/'sources.json').write_text(json.dumps(record,indent=2));print(json.dumps(record,indent=2))
+          PY
+      - name: Source-build Premake beta8 as native Mac ARM64
+        id: premake
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi/tmp"
+          python3 - <<'PY'
+          import difflib,hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path('.work/cod-steamapi').resolve();t=json.loads((root/'tools.json').read_text())
+          source=root/'premake-core';original=(source/'Bootstrap.mak').read_text()
+          # Only the osx recipe's Linux CPU-count expression is replaced by a bounded job count.
+          before='./build/bootstrap/premake_bootstrap --arch=$(PLATFORM) --to=build/bootstrap $(PREMAKE_OPTS) gmake\n\t$(MAKE) -C build/bootstrap -j`getconf _NPROCESSORS_ONLN` config=$(CONFIG)'
+          assert original.count(before)==1
+          adapted=original.replace(before,before.replace('-j`getconf _NPROCESSORS_ONLN`','-j3'))
+          adapter=root/'Bootstrap-macos.mak';adapter.write_text(adapted)
+          print(''.join(difflib.unified_diff(original.splitlines(True),adapted.splitlines(True),fromfile='pinned Bootstrap.mak',tofile='Mac bounded-job adapter')))
+          env=dict(os.environ)
+          for key in ('CC','CXX','OBJC','AR','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT','TOOLCHAINS'):env.pop(key,None)
+          env['SDKROOT']=t['sdk']
+          cc=t['clang']+' -isysroot '+t['sdk']+' -fuse-ld='+t['ld']
+          cxx=t['clang++']+' -isysroot '+t['sdk']+' -fuse-ld='+t['ld']
+          subprocess.run(['make','-f',str(adapter),'osx','PLATFORM=AARCH64','CONFIG=release',
+                          'CC='+cc,'CXX='+cxx,'AR='+t['ar']],cwd=source,env=env,check=True)
+          binary=source/'bin/release/premake5'
+          assert binary.is_file() and not binary.is_symlink()
+          # Native Mach-O and version execution are gated in the final native-tool/codegen step.
+          (root/'premake-build.json').write_text(json.dumps({'bootstrapSourceSha256':hashlib.sha256(original.encode()).hexdigest(),
+              'bootstrapAdapterSha256':hashlib.sha256(adapted.encode()).hexdigest(),'binarySha256':hashlib.sha256(binary.read_bytes()).hexdigest()},indent=2))
+          PY
+      - name: Build native protoc from the pinned embedded source archive
+        id: protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi/tmp"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,shutil,subprocess,tarfile
+          root=pathlib.Path('.work/cod-steamapi').resolve();t=json.loads((root/'tools.json').read_text())
+          def safe_extract(archive,destination):
+              assert not destination.exists(),destination
+              destination.mkdir(parents=True)
+              with tarfile.open(archive,'r:gz') as source:
+                  entries=source.getmembers();assert 0<len(entries)<=50000
+                  names=set();total=0
+                  for member in entries:
+                      path=pathlib.PurePosixPath(member.name)
+                      assert not path.is_absolute() and '..' not in path.parts and '\\' not in member.name
+                      assert path.parts and path.parts[0]=='protobuf' and ':' not in member.name
+                      assert member.name not in names,'duplicate archive member'
+                      names.add(member.name)
+                      assert not member.issym() and not member.islnk() and (member.isdir() or member.isfile()),member.name
+                      assert 0<=member.size<=128*1024**2
+                      total+=member.size;assert total<=1024**3
+                      target=destination.joinpath(*path.parts)
+                      assert target.resolve().is_relative_to(destination.resolve())
+                  for member in entries:
+                      target=destination.joinpath(*pathlib.PurePosixPath(member.name).parts)
+                      if member.isdir():target.mkdir(parents=True,exist_ok=True)
+                      else:
+                          target.parent.mkdir(parents=True,exist_ok=True)
+                          assert not target.exists(),target
+                          with source.extractfile(member) as reader,target.open('xb') as writer:shutil.copyfileobj(reader,writer)
+          archive=root/'gbe/third-party/deps/common/protobuf/protobuf.tar.gz'
+          extracted=root/'host-protoc';safe_extract(archive,extracted);source=extracted/'protobuf'
+          dependencies=(source/'cmake/dependencies.cmake').read_text()
+          assert re.search(r'^set\(abseil-cpp-version "20250512\.1"\)',dependencies,re.M)
+          assert 'set(protobuf_VERSION_STRING "7.34.1")' in (source/'CMakeLists.txt').read_text()
+          assert (source/'third_party/utf8_range/CMakeLists.txt').is_file(),'Embedded utf8_range source is required'
+          env=dict(os.environ)
+          for key in ('CC','CXX','OBJC','AR','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT','TOOLCHAINS'):env.pop(key,None)
+          subprocess.run(['cmake','-G','Ninja','-S',str(source),'-B',str(extracted/'build'),
+              '-DCMAKE_BUILD_TYPE=Release','-DCMAKE_C_COMPILER='+t['clang'],'-DCMAKE_CXX_COMPILER='+t['clang++'],
+              '-DCMAKE_OSX_SYSROOT='+t['sdk'],'-DCMAKE_OSX_ARCHITECTURES=arm64',
+              '-DCMAKE_EXE_LINKER_FLAGS=-isysroot '+t['sdk']+' -fuse-ld='+t['ld'],
+              '-Dprotobuf_BUILD_TESTS=OFF','-Dprotobuf_FORCE_FETCH_DEPENDENCIES=ON',
+              '-DFETCHCONTENT_SOURCE_DIR_ABSL='+str(root/'abseil-cpp'),'-DFETCHCONTENT_FULLY_DISCONNECTED=ON',
+              '-Dprotobuf_WITH_ZLIB=OFF'],env=env,check=True)
+          subprocess.run(['ninja','-C',str(extracted/'build'),'-j3','protoc'],env=env,check=True)
+          print('Exact embedded protobuf source and disconnected Abseil compiled for this Mac; no Windows dependency graph built.')
+          PY
+      - name: Gate native tools and generate the actual GBE protocol sources
+        id: codegen
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-steamapi/tmp"
+          python3 - <<'PY'
+          import hashlib,json,pathlib,struct,subprocess
+          root=pathlib.Path('.work/cod-steamapi').resolve();gbe=root/'gbe'
+          def macho(data):
+              assert data[:4]==b'\xcf\xfa\xed\xfe','Expected thin native Mach-O64'
+              _,cpu,subtype,kind,ncmd,size,flags,reserved=struct.unpack_from('<8I',data)
+              assert cpu==0x0100000c and kind==2,(cpu,kind)
+              at=32;platforms=[]
+              for _ in range(ncmd):
+                  command,length=struct.unpack_from('<II',data,at)
+                  assert length>=8 and at+length<=len(data)
+                  if command==0x32:platforms.append(struct.unpack_from('<I',data,at+8)[0])
+                  at+=length
+              assert platforms==[1],platforms
+          premake=root/'premake-core/bin/release/premake5';protoc=root/'host-protoc/build/protoc'
+          macho(premake.read_bytes());macho(protoc.read_bytes())
+          premake_version=subprocess.check_output([str(premake),'--version'],text=True).strip()
+          assert '5.0.0-beta8' in premake_version,premake_version
+          protoc_version=subprocess.check_output([str(protoc),'--version'],text=True).strip()
+          assert protoc_version=='libprotoc 34.1',protoc_version
+          output=root/'codegen';output.mkdir();(output/'tf2').mkdir()
+          include=root/'host-protoc/protobuf/src';tf2=sorted((gbe/'dll/gc_tf2').glob('*.proto'));assert tf2
+          groups=[([gbe/'dll'/'gc_steam/steammessages.proto'],[gbe/'dll/gc_steam'],output),
+                  (tf2,[gbe/'dll/gc_steam',gbe/'dll/gc_tf2'],output/'tf2'),
+                  ([gbe/'dll/net.proto'],[gbe/'dll'],output)]
+          expected=set();inputs={}
+          for sources,paths,destination in groups:
+              args=[str(protoc),'-I'+str(include),*('-I'+str(path) for path in paths),
+                    '--cpp_out='+str(destination),*map(str,sources)]
+              subprocess.run(args,cwd=gbe,check=True)
+              for source in sources:
+                  assert source.is_file()
+                  inputs[str(source.relative_to(gbe))]=hashlib.sha256(source.read_bytes()).hexdigest()
+                  for extension in ('.pb.cc','.pb.h'):
+                      name=str((destination/(source.stem+extension)).relative_to(output))
+                      assert name not in expected,name
+                      expected.add(name)
+          actual={str(path.relative_to(output)) for path in output.rglob('*') if path.is_file()}
+          assert actual==expected,(actual,expected)
+          generated={name:hashlib.sha256((output/name).read_bytes()).hexdigest() for name in sorted(actual)}
+          assert all((output/name).stat().st_size>0 for name in actual)
+          result={'nativeBuildToolsOnly':True,'windowsDllsBuilt':False,'gameOrAccountInputUsed':False,
+                  'premakeVersion':premake_version,'protocVersion':protoc_version,'inputs':inputs,'generated':generated,
+                  'premakeSha256':hashlib.sha256(premake.read_bytes()).hexdigest(),
+                  'protocSha256':hashlib.sha256(protoc.read_bytes()).hexdigest()}
+          (root/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+          for tree in (gbe,gbe/'third-party/common/linux',gbe/'third-party/deps/common',root/'premake-core',root/'abseil-cpp'):
+              subprocess.run(['git','-C',str(tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
+          subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
+          print('PASS: native ARM64 Mac source-built tools and actual GBE protocol code generation only; no Windows DLL or runtime compatibility claim.')
+          PY
+      - name: Record bounded prerequisite outcomes
+        if: "${{ always() }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Source-only native Mac prerequisite: exact patched GBE, source-built Premake beta8 and embedded protoc 34.1, actual protocol code generation.' \
+            'Tools ${{ steps.tools.outcome }}; sources ${{ steps.sources.outcome }}; native Premake ${{ steps.premake.outcome }}; native protoc ${{ steps.protoc.outcome }}; native architecture/version/codegen ${{ steps.codegen.outcome }}.' \
+            'No Windows DLL build, artifact/cache upload, SDK export, account/game input, signing or target execution is part of this probe.' \
+            'Next after a pass: prepare separate matched Windows dependency and api_regular x86/x64 stages with the verified Mac cross-compiler; preserve host authentication/ownership checks. Continue in the current thread; no new thread required.' >> "$GITHUB_STEP_SUMMARY"
