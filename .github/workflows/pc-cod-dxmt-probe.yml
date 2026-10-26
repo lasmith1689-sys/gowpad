@@ -392,7 +392,8 @@ jobs:
         (wrapper/'winemetal_unix.c').write_text('#include '+json.dumps(str(original))+'\n'
          '_Static_assert(sizeof(__wine_unix_call_funcs)/sizeof(void*) == 150, "native slot count");\n'
          '_Static_assert(sizeof(__wine_unix_call_wow64_funcs)/sizeof(void*) == 150, "wow64 slot count");\n')
-        (wrapper/'cache.c').symlink_to(d/'src/winemetal/unix/cache.c')
+        # Include the original file so its ../winemetal_thunks.h lookup stays source-relative.
+        (wrapper/'cache.c').write_text('#include '+json.dumps(str(d/'src/winemetal/unix/cache.c'))+'\n')
         (root/'llvm-host-build').symlink_to(root/'llvm-headers',target_is_directory=True)
         adapter=root/'adapter';(adapter/'stages').mkdir(parents=True)
         shutil.copy2(repo/'build/lib.sh',adapter/'lib.sh')
