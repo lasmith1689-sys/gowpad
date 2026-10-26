@@ -1,0 +1,310 @@
+name: Madeira i386 and Dock source probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-madeira-i386-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-madeira-i386-probe
+  cancel-in-progress: false
+
+jobs:
+  madeira-i386-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out the existing Madeira pin
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: willfaust/Madeira
+          ref: e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          persist-credentials: false
+          submodules: false
+          path: runtime
+      - name: Verify and initialize exact source gitlinks
+        id: sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          test "$(git rev-parse HEAD)" = e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          pins = {
+              'wine': '9129e9684daaeae70da9435e7c6060e59392634e',
+              'dxmt': '128b297c6e9a00014408dc68b4c2c2373b5813de',
+              'madeira-dock': '72558e416a390f3669457930f09a389e54f49556',
+          }
+          for name, revision in pins.items():
+              row = subprocess.check_output(['git', 'ls-tree', 'HEAD', name], text=True).split()
+              assert row == ['160000', 'commit', revision, name], (name, row)
+          farm = Path('app/Madeira/i386-windows')
+          assert not [p for p in farm.iterdir() if p.name != '.gitkeep'], 'i386 farm was not empty'
+          assert not Path('app/Madeira/arm64ec-windows/dockhost.exe').exists()
+          Path('component-source-pins.json').write_text(json.dumps(pins, indent=2) + '\n')
+          PY
+          git submodule update --init --depth 1 --recursive wine dxmt madeira-dock
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          for name, revision in json.loads(Path('component-source-pins.json').read_text()).items():
+              actual = subprocess.check_output(['git', '-C', name, 'rev-parse', 'HEAD'], text=True).strip()
+              assert actual == revision, (name, actual)
+          status = subprocess.check_output(['git', 'submodule', 'status', '--recursive', 'wine', 'dxmt', 'madeira-dock'], text=True)
+          assert all(line.startswith(' ') for line in status.splitlines()), status
+          print(status)
+          PY
+      - name: Install host build tools and verify the matching cross-compiler
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          brew install bison flex pkg-config meson ninja
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          bison --version | head -n 1
+          meson --version
+          cd runtime
+          mkdir -p toolchains
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+            -o toolchains/llvm-mingw.tar.xz \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz
+          printf '%s  %s\n' bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7 toolchains/llvm-mingw.tar.xz | shasum -a 256 -c -
+          tar -xf toolchains/llvm-mingw.tar.xz -C toolchains
+          tc="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
+          "$tc/i686-w64-mingw32-clang" --version | head -n 1
+          "$tc/x86_64-w64-mingw32-clang" --version | head -n 1
+          # Host tools must use Apple's macOS SDK, not the PE compiler on PATH.
+          printf 'int main(void) { return 0; }\n' > toolchains/host-probe.c
+          xcrun --sdk macosx clang toolchains/host-probe.c -o toolchains/host-probe
+          if ! xcrun --sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun --sdk macosx --find metallib
+      - name: Build every policy-selected i386 Wine and DXMT module
+        id: i386
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          macsdk="$(xcrun --sdk macosx --show-sdk-path)"
+          macld="$(xcrun --sdk macosx --find ld)"
+          export MADEIRA_WINE_HOST_CC="xcrun --sdk macosx clang"
+          export MADEIRA_WINE_HOST_CXX="xcrun --sdk macosx clang++"
+          export MADEIRA_WINE_HOST_LDFLAGS="-isysroot $macsdk -fuse-ld=$macld"
+          # Bare compiler flags would also enter Meson's Windows host machine.
+          # Wine records the scoped native settings in its generated Makefile.
+          unset CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+          export SDKROOT="$macsdk"
+          export JOBS=3
+          unset SKIP_DXMT
+          cd runtime
+          # Record the exact breadth set selected by upstream, without changing its policy.
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          path = Path('build/wine-i386/build.sh')
+          source = path.read_text()
+          anchor = 'echo "== ${#TARGETS[@]} i386 modules (skipped by policy: ${#SKIP[@]} names) =="'
+          assert source.count(anchor) == 1
+          addition = '\nprintf "%s\\n" "${TARGETS[@]}" > "$R/i386-selected-targets.txt"'
+          source = source.replace(anchor, anchor + addition)
+          configure = '(cd "$B" && ../configure --enable-archs=i386'
+          scoped = '(cd "$B" && CC="$MADEIRA_WINE_HOST_CC" CXX="$MADEIRA_WINE_HOST_CXX" LDFLAGS="$MADEIRA_WINE_HOST_LDFLAGS" ../configure --enable-archs=i386'
+          assert source.count(configure) == 1
+          path.write_text(source.replace(configure, scoped))
+          # The upstream native file names bare clang. The script prepends
+          # MinGW to PATH, so bind Meson's host tools explicitly to Apple clang.
+          native = Path('dxmt/build-osx.txt')
+          assert native.read_text().strip() == "[binaries]\nc = 'clang'\ncpp = 'clang++'"
+          compilers = [subprocess.check_output(['xcrun', '--sdk', 'macosx', '--find', name], text=True).strip() for name in ('clang', 'clang++')]
+          sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
+          linker = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--find', 'ld'], text=True).strip()
+          assert all(Path(name).is_absolute() and not any(c in name for c in "'\n\r") for name in compilers + [sdk, linker])
+          compile_args = ['-isysroot', sdk]
+          link_args = compile_args + ['-fuse-ld=' + linker]
+          description = "[binaries]\nc = '%s'\ncpp = '%s'\n\n[built-in options]\n" % tuple(compilers)
+          description += '\n'.join(key + ' = ' + repr(args) for key, args in [
+              ('c_args', compile_args), ('cpp_args', compile_args),
+              ('c_link_args', link_args), ('cpp_link_args', link_args),
+          ]) + '\n'
+          native.write_text(description)
+          PY
+          # No positional module selector and no SKIP_DXMT: this is the whole upstream farm.
+          bash build/wine-i386/build.sh || {
+            tail -n 100 wine/build-i386/madeira-i386-build.log 2>/dev/null || true
+            tail -n 80 wine/build-i386/config.log 2>/dev/null || true
+            tail -n 80 dxmt/build-pe-i386/meson-logs/meson-log.txt 2>/dev/null || true
+            exit 1
+          }
+      - name: Build Dock from its pinned source and run only host unit tests
+        id: dock
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          export HOST_CC="$(xcrun --sdk macosx --find clang)"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          bash build/madeira-dock/build.sh --check
+          test -s app/Madeira/arm64ec-windows/dockhost.exe
+          test -s app/Madeira/arm64ec-windows/dock-notices.txt
+      - name: Reject incomplete farms and inspect PE dependencies without executing them
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          python3 - <<'PY'
+          import hashlib, json, re, struct
+          from pathlib import Path
+
+          class PE:
+              def __init__(self, path):
+                  self.path = path
+                  self.data = d = path.read_bytes()
+                  assert d[:2] == b'MZ', str(path)
+                  pe = struct.unpack_from('<I', d, 0x3c)[0]
+                  assert d[pe:pe + 4] == b'PE\0\0', str(path)
+                  self.machine, sections = struct.unpack_from('<HH', d, pe + 4)
+                  optional_size = struct.unpack_from('<H', d, pe + 20)[0]
+                  optional = pe + 24
+                  self.magic = struct.unpack_from('<H', d, optional)[0]
+                  assert self.magic in (0x10b, 0x20b), str(path)
+                  self.image_base = struct.unpack_from('<I' if self.magic == 0x10b else '<Q', d, optional + (28 if self.magic == 0x10b else 24))[0]
+                  directory_start = optional + (96 if self.magic == 0x10b else 112)
+                  count = struct.unpack_from('<I', d, directory_start - 4)[0]
+                  self.directories = [struct.unpack_from('<II', d, directory_start + i * 8) for i in range(min(count, 16))]
+                  self.sections = []
+                  for i in range(sections):
+                      off = optional + optional_size + i * 40
+                      name = d[off:off + 8].rstrip(b'\0').decode('ascii')
+                      virtual_size, rva, raw_size, raw = struct.unpack_from('<IIII', d, off + 8)
+                      assert raw + raw_size <= len(d), (path, name)
+                      self.sections.append((name, rva, virtual_size, raw, raw_size))
+
+              def offset(self, rva, size=1):
+                  for _, start, virtual_size, raw, raw_size in self.sections:
+                      if start <= rva and rva + size <= start + raw_size:
+                          return raw + rva - start
+                  raise ValueError(f'{self.path}: unmapped RVA {rva:x} size {size}')
+
+              def string(self, rva):
+                  off = self.offset(rva)
+                  end = self.data.index(b'\0', off, min(off + 4096, len(self.data)))
+                  return self.data[off:end].decode('ascii')
+
+              def imports(self, index):
+                  if index >= len(self.directories):
+                      return []
+                  rva, size = self.directories[index]
+                  if not rva:
+                      return []
+                  width, fmt = (20, '<5I') if index == 1 else (32, '<8I')
+                  result = []
+                  for i in range(size // width):
+                      fields = struct.unpack_from(fmt, self.data, self.offset(rva + i * width, width))
+                      if not any(fields):
+                          return result
+                      name = fields[3] if index == 1 else fields[1]
+                      if index == 13 and not fields[0] & 1:
+                          name -= self.image_base
+                      result.append(self.string(name).lower())
+                  raise ValueError(f'{self.path}: unterminated import descriptors')
+
+              def apisets(self):
+                  section = next(s for s in self.sections if s[0] == '.apiset')
+                  _, _, _, raw, length = section
+                  data = self.data[raw:raw + length]
+                  version, size, _, count, entries, _, _ = struct.unpack_from('<7I', data)
+                  assert version == 6 and size <= len(data) and count < 10000
+                  def name(off, length):
+                      assert off + length <= size and length % 2 == 0
+                      return data[off:off + length].decode('utf-16-le').lower()
+                  result = {}
+                  for i in range(count):
+                      _, off, length, _, values, value_count = struct.unpack_from('<6I', data, entries + i * 24)
+                      contract = name(off, length) + '.dll'
+                      hosts = []
+                      for j in range(value_count):
+                          _, _, _, host, host_length = struct.unpack_from('<5I', data, values + j * 20)
+                          if host_length:
+                              hosts.append(name(host, host_length))
+                      result[contract] = sorted(set(hosts))
+                  return result
+
+          farm = Path('app/Madeira/i386-windows')
+          selected = Path('i386-selected-targets.txt').read_text().splitlines()
+          assert selected and len(selected) == len(set(selected))
+          assert all(re.fullmatch(r'(dlls|programs)/[^/]+/i386-windows/[^/ :]+', p) for p in selected)
+          expected = {Path(p).name.lower() for p in selected}
+          assert len(expected) == len(selected), 'duplicate output names in breadth set'
+          dxmt = {'d3d9.dll', 'd3d9shim.dll', 'd3d9-emulated.dll', 'd3d11.dll', 'dxgi.dll', 'd3d10core.dll', 'winemetal.dll'}
+          assert not expected & dxmt
+          expected |= dxmt
+          files = [p for p in farm.iterdir() if p.name != '.gitkeep']
+          actual = {p.name.lower(): p for p in files}
+          assert len(actual) == len(files) and set(actual) == expected, {'missing': sorted(expected - set(actual)), 'extra': sorted(set(actual) - expected)}
+          assert {'ntdll.dll', 'kernel32.dll', 'kernelbase.dll', 'user32.dll', 'gdi32.dll', 'apisetschema.dll', 'msiexec.exe', 'fusion.dll'} <= set(actual)
+          images = {name: PE(path) for name, path in actual.items() if path.suffix.lower() != '.tlb'}
+          assert images and all(p.machine == 0x14c and p.magic == 0x10b for p in images.values()), 'non-i386/PE32 output in i386 farm'
+          apisets = images['apisetschema.dll'].apisets()
+          assert apisets, 'empty API-set schema'
+          missing = []
+          records = []
+          def resolve(module, available, schema):
+              if module in available:
+                  return [module]
+              hosts = schema.get(module, [])
+              if hosts and all(host in available for host in hosts):
+                  return hosts
+              return None
+          for name, pe in sorted(images.items()):
+              normal, delayed = pe.imports(1), pe.imports(13)
+              for kind, modules in [('normal', normal), ('delay', delayed)]:
+                  for module in modules:
+                      if resolve(module, images, apisets) is None:
+                          missing.append({'file': name, 'kind': kind, 'import': module})
+              records.append({'name': name, 'machine': hex(pe.machine), 'optional_magic': hex(pe.magic), 'sha256': hashlib.sha256(pe.data).hexdigest(), 'imports': normal, 'delay_imports': delayed})
+          # This is DLL-name closure of normal and delayed imports, including API sets.
+          # It does not claim exported-symbol, unix-call, loader or gameplay correctness.
+          dock = Path('app/Madeira/arm64ec-windows/dockhost.exe')
+          dock_pe = PE(dock)
+          assert dock_pe.machine == 0x8664 and dock_pe.magic == 0x20b
+          # Dock is a known x86-64 compile target. 0x8664 alone would not prove
+          # that another module lacks ARM64EC/ARM64X hybrid code.
+          farm64 = {p.name.lower(): p for p in dock.parent.iterdir() if p.is_file()}
+          api64 = PE(farm64['apisetschema.dll']).apisets()
+          dock_imports = dock_pe.imports(1) + dock_pe.imports(13)
+          dock_missing = [name for name in dock_imports if resolve(name, farm64, api64) is None]
+          notices = (dock.parent / 'dock-notices.txt').read_text()
+          for value in ('72558e416a390f3669457930f09a389e54f49556', 'LICENSE-EXCEPTION.md', 'GNU GENERAL PUBLIC LICENSE', 'MinGW-w64 runtime notice', 'LLVM runtime notice'):
+              assert value in notices, value
+          report = {'wine_targets': len(selected), 'dxmt_outputs': sorted(dxmt), 'i386_pe_count': len(images), 'non_pe_type_libraries': len(actual) - len(images), 'apiset_contracts': len(apisets), 'missing_dll_names': missing, 'files': records, 'dock': {'machine': hex(dock_pe.machine), 'sha256': hashlib.sha256(dock_pe.data).hexdigest(), 'imports': dock_imports, 'missing_dll_names': dock_missing, 'notices_sha256': hashlib.sha256(notices.encode()).hexdigest()}, 'scope': 'source-built PE components; normal and delayed DLL-name closure only; no app build or target execution'}
+          encoded = json.dumps(report, sort_keys=True, indent=2) + '\n'
+          Path('i386-component-report.json').write_text(encoded)
+          print(json.dumps({k: v for k, v in report.items() if k != 'files'}, sort_keys=True, indent=2))
+          print('component_report_sha256=' + hashlib.sha256(encoded.encode()).hexdigest())
+          assert not missing and not dock_missing, 'unresolved DLL names: component gate failed'
+          assert actual['d3d9.dll'].read_bytes() == actual['d3d9shim.dll'].read_bytes()
+          assert actual['d3d9.dll'].read_bytes() != actual['d3d9-emulated.dll'].read_bytes()
+          print('PASS: whole policy-selected i386 farm, seven DXMT files, Dock and notices; PE identities and DLL-name closure checked.')
+          PY
+      - name: Summarize actual component outcomes
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Source identities: %s\nToolchain: %s\ni386 Wine + DXMT: %s\nDock + host unit tests: %s\nIndependent PE and DLL-name gate: %s\n' \
+            '${{ steps.sources.outcome }}' '${{ steps.toolchain.outcome }}' '${{ steps.i386.outcome }}' \
+            '${{ steps.dock.outcome }}' '${{ steps.inspect.outcome }}' >> "$GITHUB_STEP_SUMMARY"
+          printf '\nThis component probe builds no app, signs nothing and runs no Windows executable. It exports no SDK, binaries or game data. Full WoW64 needs the matching aarch64 Wine and FEX modules, native unix/graphics assembly, app integration and device tests. No new thread required.\n' >> "$GITHUB_STEP_SUMMARY"
+
