@@ -1,0 +1,151 @@
+name: Native ARM64 Apple SDK link validation
+'on':
+  workflow_dispatch: null
+  push:
+    branches: [codex/native-arm64-sdk-probe-20261026]
+    paths: [.github/workflows/native-sdk-link-probe.yml]
+permissions:
+  contents: read
+concurrency:
+  group: native-arm64-sdk-probe
+  cancel-in-progress: false
+jobs:
+  native-sdk-link:
+    if: github.ref == 'refs/heads/codex/native-arm64-sdk-probe-20261026'
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - name: Compile and link newly authored code with in-place Apple SDKs
+        id: compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path('.work/native-sdk-link-probe').absolute()
+          assert not root.exists() and not any(p.is_symlink() for p in (root,*root.parents))
+          root.mkdir(parents=True)
+          env=dict(os.environ)
+          for key in ('SDKROOT','TOOLCHAINS','CC','CXX','CFLAGS','CXXFLAGS','LDFLAGS','MACOSX_DEPLOYMENT_TARGET','IPHONEOS_DEPLOYMENT_TARGET'):
+              env.pop(key,None)
+          commands=[]
+          def run(label,args):
+              args=list(map(str,args));p=subprocess.run(args,env=env,cwd=root,capture_output=True,timeout=90)
+              (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)
+              commands.append({'label':label,'argv':args,'exitCode':p.returncode,
+                'stdoutSha256':hashlib.sha256(p.stdout).hexdigest(),'stderrSha256':hashlib.sha256(p.stderr).hexdigest()})
+              (root/'commands.json').write_text(json.dumps(commands,indent=2))
+              print(label, 'exit',p.returncode,flush=True)
+              if p.returncode:
+                  print(p.stdout.decode(errors='replace'));print(p.stderr.decode(errors='replace'))
+              assert p.returncode==0,label
+              return p.stdout.decode().strip()
+          developer=run('developer',['xcode-select','-p']);env['DEVELOPER_DIR']=developer
+          sdk=pathlib.Path(run('iphone-sdk',['xcrun','--sdk','iphoneos','--show-sdk-path']))
+          macsdk=pathlib.Path(run('mac-sdk',['xcrun','--sdk','macosx','--show-sdk-path']))
+          sdkversion=run('iphone-sdk-version',['xcrun','--sdk','iphoneos','--show-sdk-version'])
+          assert int(sdkversion.split('.')[0])>=26 and sdk.is_dir() and macsdk.is_dir()
+          clang=pathlib.Path(run('apple-clang',['xcrun','--sdk','macosx','--find','clang']))
+          assert clang.is_absolute() and clang.is_file()
+          assert pathlib.Path(developer).resolve() in clang.resolve().parents
+          version=run('clang-version',[clang,'--version']);xcode=run('xcode-version',['xcodebuild','-version'])
+          source=r'''#include <stdint.h>
+          #import <Foundation/Foundation.h>
+          __attribute__((visibility("default")))
+          uint32_t own_native_value(uint32_t x,uint32_t y) {
+              return (x ^ UINT32_C(0xa5a5a5a5)) + y;
+          }
+          __attribute__((visibility("default")))
+          uint32_t own_sdk_foundation_length(void) {
+              @autoreleasepool {
+                  NSString *s=[NSString stringWithUTF8String:"native-sdk-validation"];
+                  return (uint32_t)[s length];
+              }
+          }
+          '''
+          main=r'''#include <stdint.h>
+          #include <stdio.h>
+          extern uint32_t own_native_value(uint32_t,uint32_t);
+          extern uint32_t own_sdk_foundation_length(void);
+          int main(void) {
+              for (uint32_t i=0;i<1024;i++) {
+                  uint32_t x=i*UINT32_C(0x1020304),y=UINT32_MAX-i;
+                  uint64_t expected=(uint64_t)(x ^ UINT32_C(0xa5a5a5a5))+y;
+                  if (own_native_value(x,y)!=(uint32_t)expected) return 1;
+              }
+              if (own_sdk_foundation_length()!=21) return 2;
+              puts("PASS: 1024 own arithmetic vectors and host Foundation length");
+              return 0;
+          }
+          '''
+          (root/'own_probe.m').write_text(source);(root/'own_main.c').write_text(main)
+          common=['-O2','-Wall','-Wextra','-Werror','-fno-stack-protector']
+          run('compile-ios-object',[clang,'-target','arm64-apple-ios26.0','-isysroot',sdk,*common,
+            '-fobjc-arc','-c',root/'own_probe.m','-o',root/'own-ios.o'])
+          run('link-ios-library',[clang,'-target','arm64-apple-ios26.0','-isysroot',sdk,'-dynamiclib',
+            root/'own-ios.o','-framework','Foundation','-Wl,-no_adhoc_codesign',
+            '-install_name','@rpath/libOwnNativeSDKProbe.dylib','-o',root/'libOwnNativeSDKProbe.dylib'])
+          run('compile-host-object',[clang,'-isysroot',macsdk,*common,'-fobjc-arc','-c',
+            root/'own_probe.m','-o',root/'own-host.o'])
+          run('link-host-test',[clang,'-isysroot',macsdk,*common,root/'own_main.c',root/'own-host.o',
+            '-framework','Foundation','-o',root/'own-host-test'])
+          plan={'root':str(root),'developer':developer,'clang':str(clang),'clangVersion':version,
+            'xcode':xcode,'iphoneSdkVersion':sdkversion,'iphoneSdkUsedInPlace':True,
+            'sourceSha256':hashlib.sha256(source.encode()).hexdigest(),
+            'mainSha256':hashlib.sha256(main.encode()).hexdigest(),
+            'codeOrigin':'Newly authored generic arithmetic and Foundation calls only',
+            'retailOrRecoveredCodeSupplied':False,'appCreated':False,'signingRequested':False,
+            'gameDeliveryClaimed':False}
+          (root/'plan.json').write_text(json.dumps(plan,indent=2))
+          PY
+      - name: Inspect actual iOS Mach-O and run the native Mac fixture
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,struct,subprocess
+          root=pathlib.Path('.work/native-sdk-link-probe').absolute()
+          plan=json.loads((root/'plan.json').read_text());assert plan['root']==str(root)
+          env=dict(os.environ,DEVELOPER_DIR=plan['developer'])
+          def run(label,args):
+              p=subprocess.run(list(map(str,args)),env=env,capture_output=True,timeout=15)
+              (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)
+              print(label,'exit',p.returncode,flush=True)
+              if p.returncode:print(p.stdout.decode(errors='replace'));print(p.stderr.decode(errors='replace'))
+              assert p.returncode==0,label
+              return p.stdout.decode().strip()
+          dll=root/'libOwnNativeSDKProbe.dylib';data=dll.read_bytes();h=struct.unpack_from('<8I',data)
+          assert h[0]==0xfeedfacf and h[1]==0x100000c and h[3]==6,h
+          at=32;platforms=[];dependencies=[];install=[];rpaths=[];signatures=[]
+          for _ in range(h[4]):
+              cmd,size=struct.unpack_from('<II',data,at);assert size>=8 and at+size<=32+h[5]<=len(data)
+              if cmd==0x32:platforms.append(struct.unpack_from('<III',data,at+8))
+              if cmd in (0xc,0x18,0x1f,0x80000018,0x8000001f,0xd):
+                  off=struct.unpack_from('<I',data,at+8)[0];assert 0<off<size
+                  text=data[at+off:at+size].split(b'\0')[0].decode()
+                  (install if cmd==0xd else dependencies).append(text)
+              if cmd==0x8000001c:rpaths.append(data[at+struct.unpack_from('<I',data,at+8)[0]:at+size].split(b'\0')[0].decode())
+              if cmd==0x1d:signatures.append(cmd)
+              at+=size
+          assert at==32+h[5] and len(platforms)==1 and platforms[0][0]==2
+          assert platforms[0][1]==26<<16 and platforms[0][2]>=26<<16,platforms
+          assert install==['@rpath/libOwnNativeSDKProbe.dylib'] and not rpaths and not signatures
+          allowed={'/System/Library/Frameworks/Foundation.framework/Foundation','/usr/lib/libobjc.A.dylib','/usr/lib/libSystem.B.dylib'}
+          assert set(dependencies)<=allowed and '/System/Library/Frameworks/Foundation.framework/Foundation' in dependencies,dependencies
+          nm=pathlib.Path(run('find-nm',['xcrun','--sdk','macosx','--find','nm']))
+          assert nm.is_absolute() and nm.is_file()
+          exports=set(run('ios-exports',[nm,'-g','-U','-j',dll]).splitlines())
+          assert exports=={'_own_native_value','_own_sdk_foundation_length'},exports
+          imports=run('ios-imports',[nm,'-u','-j',dll]).splitlines();assert imports
+          host=run('host-execution',[root/'own-host-test'])
+          assert host=='PASS: 1024 own arithmetic vectors and host Foundation length',host
+          result={'plan':plan,'iosLibrary':{'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),
+            'architecture':'ARM64','platform':'iOS','minimumVersion':'26.0','sdkVersion':plan['iphoneSdkVersion'],
+            'installNames':install,'imports':imports,'dependencies':dependencies,'exports':sorted(exports),
+            'rpaths':rpaths,'codeSignaturePresent':bool(signatures)},
+            'hostTestPassed':True,'iosCodeExecuted':False,'simulatorExecuted':False,'iphoneConnected':False,
+            'developmentSigningProved':False,'appCreated':False,'artifactUploaded':False,'gameDeliveryClaimed':False}
+          text=json.dumps(result,indent=2);(root/'result.json').write_text(text);print(text)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write('\nNative SDK link validation only; no game app or phone test.\n\n```json\n'+text+'\n```\n')
+          PY
