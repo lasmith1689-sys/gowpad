@@ -1,0 +1,361 @@
+name: Private native ld64 source and COMMON capability
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-native-ld64-source-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-native-ld64-source-probe
+  cancel-in-progress: false
+
+jobs:
+  native-ld64-source-capability:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - name: "Build only the frozen native ld64 target closure in a private prefix"
+        id: "source_build"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, struct, subprocess
+          pin = '904de2a71d4da6a9b30d2efaf912a10ddc7d9ddb'
+          repository = 'https://github.com/tpoechtrager/cctools-port.git'
+          closure = [('ld64/src/3rd', 'libhelper.la'), ('ld64/src/mach_o', 'libmacho.la'),
+                     ('ld64/src/ld/parsers', 'libParsers.la'), ('ld64/src/ld/passes', 'libPasses.la')]
+          root = pathlib.Path('.work/native-ld64-source').resolve()
+          root.mkdir(parents=True, exist_ok=False)
+          source, build, prefix = root / 'source', root / 'build', root / 'prefix'
+          logs = root / 'logs'
+          logs.mkdir()
+          build.mkdir()
+          environment = dict(os.environ)
+          for name in ('CC', 'CXX', 'LD', 'AR', 'RANLIB', 'CFLAGS', 'CXXFLAGS', 'CPPFLAGS', 'LDFLAGS', 'LIBS', 'SDKROOT', 'IPHONEOS_DEPLOYMENT_TARGET', 'MACOSX_DEPLOYMENT_TARGET'):
+              environment.pop(name, None)
+          scoped = {'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1', 'LC_ALL': 'C'}
+          environment.update(scoped)
+          record = {'commands': [], 'scope': 'native .o/.a partial-link capability only; no SDK stub, bitcode, media or final app link proof',
+                    'sourceRecipe': {'repository': 'playportdev/playport', 'revision': '412de5f8c0bdd26d84e0127eb5776ba992e3b152',
+                                     'path': 'build/toolchain/ld64.sh', 'gitBlob': '47a402534f039630918ed1f8fa6f09a113aa01da'},
+                    'sourceRevision': pin, 'sourceRepository': repository, 'cctoolsVersion': '1030.6.3', 'ld64Version': '956.6',
+                    'tapiSupport': False, 'ltoSupport': False, 'xarSupport': False, 'sdkUsedInPlace': True,
+                    'finalAppLinkProved': False, 'targetOutputExecuted': False, 'toolsInstalledGlobally': False, 'sdkExported': False}
+
+          def run(arguments, *, cwd=None, timeout=1800, check=True):
+              arguments = list(map(str, arguments))
+              log = logs / (str(len(record['commands'])).zfill(3) + '.log')
+              row = {'arguments': arguments, 'cwd': str(cwd or pathlib.Path.cwd()), 'log': str(log), 'scopedEnvironment': dict(scoped),
+                     'executableResolved': shutil.which(arguments[0]) if not pathlib.Path(arguments[0]).is_absolute() else arguments[0]}
+              record['commands'].append(row)
+              try:
+                  result = subprocess.run(arguments, cwd=cwd, env=environment, capture_output=True, text=True, timeout=timeout)
+                  log.write_text('COMMAND ' + json.dumps(arguments) + '\nSTDOUT\n' + result.stdout + '\nSTDERR\n' + result.stderr)
+                  row.update(returncode=result.returncode, logSha256=hashlib.sha256(log.read_bytes()).hexdigest())
+                  if check and result.returncode:
+                      print(log.read_text())
+                      raise AssertionError('Native source command failed: ' + str(log))
+                  return (result.stdout + result.stderr).strip()
+              except subprocess.TimeoutExpired as error:
+                  def decode(value):
+                      return value.decode(errors='replace') if isinstance(value, bytes) else (value or '')
+                  log.write_text('COMMAND ' + json.dumps(arguments) + '\nSTDOUT\n' + decode(error.stdout) + '\nSTDERR\n' + decode(error.stderr))
+                  row.update(returncode=124, logSha256=hashlib.sha256(log.read_bytes()).hexdigest())
+                  print(log.read_text())
+                  raise
+
+          def out(arguments):
+              return run(arguments, timeout=30)
+
+          def ld_target_closure(text):
+              logical = text.replace('\\\n', ' ')
+              match = re.search(r'^ld_LDADD\s*=([^\n]*)$', logical, re.M)
+              assert match, 'Missing frozen ld_LDADD assignment'
+              return re.findall(r'\$\(top_builddir\)/([^\s\\]+\.la)', match[1])
+
+          try:
+              assert out(['uname', '-m']) == 'arm64'
+              record['xcode'] = out(['xcodebuild', '-version'])
+              record['developerDirectory'] = out(['xcode-select', '-p'])
+              macsdk = out(['xcrun', '--sdk', 'macosx', '--show-sdk-path'])
+              record['macSdkVersion'] = out(['xcrun', '--sdk', 'macosx', '--show-sdk-version'])
+              tools = {name: out(['xcrun', '--sdk', 'macosx', '--find', name])
+                       for name in ('clang', 'clang++', 'ld', 'ar', 'ranlib', 'otool', 'lipo')}
+              assert pathlib.Path(macsdk).is_dir()
+              assert all(pathlib.Path(path).is_absolute() and pathlib.Path(path).is_file() for path in tools.values())
+              assert not any(re.search(r'\s', path) for path in (str(root), macsdk, *tools.values())), 'Whitespace-free native tool/SDK flags required'
+              record['tools'] = tools
+              record['clangVersion'] = out([tools['clang'], '--version'])
+              record['clangCxxVersion'] = out([tools['clang++'], '--version'])
+              record['makeExecutable'] = shutil.which('make')
+              assert record['makeExecutable']
+              record['makeVersion'] = out(['make', '--version'])
+              run(['git', 'init', str(source)], timeout=30)
+              run(['git', '-C', str(source), 'remote', 'add', 'origin', repository], timeout=30)
+              run(['git', '-C', str(source), 'fetch', '--depth=1', 'origin', pin], timeout=180)
+              run(['git', '-C', str(source), '-c', 'advice.detachedHead=false', 'checkout', '--detach', pin], timeout=60)
+              assert out(['git', '-C', str(source), 'rev-parse', 'HEAD']) == pin
+              assert not out(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no'])
+              manifest = out(['git', '-C', str(source), 'ls-tree', '-r', 'HEAD']) + '\n'
+              (root / 'source-tree-manifest.txt').write_text(manifest)
+              record.update({'sourceManifestSha256': hashlib.sha256(manifest.encode()).hexdigest(),
+                             'sourceTree': out(['git', '-C', str(source), 'rev-parse', 'HEAD^{tree}']),
+                             'sourceFiles': len(manifest.splitlines())})
+              record.update({'sourceDirtyBefore': False})
+              blobs = {
+                  'cctools/configure': '44dac3adc4a2a1346a5e174fcd9ff0c50a601f4b',
+                  'cctools/configure.ac': '454c090be40aa75a97159aec78b6310bc362f38e',
+                  'cctools/m4/llvm.m4': '7641fc77b4461e0126066cacda6d0c12a61edae5',
+                  'cctools/ld64/src/ld/Makefile.am': 'eabb2e54549271e5850d0ff0cdf11dbca76bee47',
+                  'cctools/ld64/src/ld/Makefile.in': 'c65b9c93aba5340f3a3ee616f5f009345b6d6876',
+                  'cctools/ld64/src/3rd/Makefile.am': '9c4de6bed6a725d866626eae446f84cc7194508d',
+                  'cctools/ld64/src/3rd/Makefile.in': '7691e990ecdc6546d9c580e52aca1bbf2be50727',
+                  'cctools/ld64/src/mach_o/Makefile.am': '5d5fc22645abad98f8997e125382e6fb28ff18b0',
+                  'cctools/ld64/src/mach_o/Makefile.in': '804e4c4a90d65f239b021264f95eff4575751b72',
+                  'cctools/ld64/src/ld/parsers/Makefile.am': 'e6dd4061911c422a5006ac6bab40af53fb104c15',
+                  'cctools/ld64/src/ld/parsers/Makefile.in': 'b619d8398863e01207fc369d9fed10f1e8448f60',
+                  'cctools/ld64/src/ld/passes/Makefile.am': 'bad0ebafe65a530a14dcfb1dd64fa0702a97eac9',
+                  'cctools/ld64/src/ld/passes/Makefile.in': 'c0316c13aa4755f703bc23298720e6b1705d077c',
+              }
+              for path, expected in blobs.items():
+                  assert out(['git', '-C', str(source), 'rev-parse', 'HEAD:' + path]) == expected
+              record['verifiedSourceBlobs'] = blobs
+              original_ld = (source / 'cctools/ld64/src/ld/Makefile.am').read_text()
+              actual_closure = ld_target_closure(original_ld)
+              assert actual_closure == [directory + '/' + target for directory, target in closure]
+              assert 'libstuff' not in ' '.join(actual_closure)
+              record['targetClosure'] = actual_closure
+              scoped.update({'CC': tools['clang'], 'CXX': tools['clang++'], 'SDKROOT': macsdk,
+                             'AR': tools['ar'], 'RANLIB': tools['ranlib'], 'HOST_AR': tools['ar'], 'HOST_RANLIB': tools['ranlib'],
+                             'CFLAGS': '-O2 -g0 -arch arm64 -isysroot ' + macsdk,
+                             'CXXFLAGS': '-O2 -g0 -arch arm64 -isysroot ' + macsdk,
+                             'LDFLAGS': '-arch arm64 -isysroot ' + macsdk + ' -fuse-ld=' + tools['ld']})
+              environment.update(scoped)
+              record['configureFlags'] = ['--prefix=' + str(prefix), '--target=arm64-apple-darwin',
+                                          '--disable-tapi-support', '--disable-lto-support', '--disable-xar-support']
+              run([str(source / 'cctools/configure'), *record['configureFlags']], cwd=build, timeout=600)
+              ld_directory = build / 'ld64/src/ld'
+              makefile = (ld_directory / 'Makefile').read_text()
+              for variable in ('TAPI_DEF', 'TAPI_LIB', 'LTO_DEF', 'LTO_RPATH', 'XAR_LIB'):
+                  match = re.search(r'^' + variable + r'\s*=([^\n]*)$', makefile, re.M)
+                  assert match and not match[1].strip(), 'Optional linker feature unexpectedly enabled: ' + variable
+              assert re.search(r'^prefix\s*=\s*' + re.escape(str(prefix)) + r'$', makefile, re.M)
+              # make -j3 only exact ld64 dependency targets; no recursive cctools build.
+              for directory, target in closure:
+                  run(['make', '-C', str(build / directory), '-j3', target])
+              run(['make', '-C', str(ld_directory), '-j3', 'ld'])
+              run(['make', '-C', str(ld_directory), 'install-binPROGRAMS'], timeout=60)
+              linker = prefix / 'bin/arm64-apple-darwin-ld'
+              assert linker.is_file()
+              data = linker.read_bytes()
+              assert len(data) >= 32
+              magic, cpu, subtype, filetype = struct.unpack_from('<4I', data)
+              assert magic == 0xfeedfacf and cpu == 0x0100000c and filetype == 2, 'Expected native ARM64 host executable'
+              assert out([tools['lipo'], '-archs', str(linker)]).split() == ['arm64']
+              load_commands = out([tools['otool'], '-l', str(linker)])
+              assert 'LC_BUILD_VERSION' in load_commands and re.search(r'\bplatform\s+1\b', load_commands)
+              dependency_text = out([tools['otool'], '-L', str(linker)])
+              dependencies = [line.strip().split(' (compatibility version', 1)[0] for line in dependency_text.splitlines()[1:] if line.strip()]
+              assert dependencies and all(' (compatibility version' in line for line in dependency_text.splitlines()[1:] if line.strip())
+              assert all(path.startswith(('/usr/lib/', '/System/Library/')) for path in dependencies), dependencies
+              record.update({'linker': str(linker), 'linkerSha256': hashlib.sha256(data).hexdigest(), 'linkerBytes': len(data),
+                             'nativeDependencies': dependencies, 'nativeLoadCommands': load_commands,
+                             'linkerVersion': run([str(linker), '-v'], timeout=30, check=False)})
+              assert '956.6' in record['linkerVersion'], 'Unexpected source-built ld64 version'
+              assert not out(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no'])
+              record.update({'sourceDirtyAfter': False})
+              record['status'] = 'passed'
+          except Exception as error:
+              record.update(status='failed', error=str(error))
+              raise
+          finally:
+              (root / 'source-build-inventory.json').write_text(json.dumps(record, indent=2))
+              print(json.dumps(record, indent=2))
+          PY
+      - name: "Prove explicit COMMON allocation and second-pass symbol privacy"
+        id: "proof"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re, struct, subprocess
+
+          def packed_version(text):
+              parts = list(map(int, text.split('.')))
+              assert 1 <= len(parts) <= 3
+              parts += [0] * (3 - len(parts))
+              return (parts[0] << 16) | (parts[1] << 8) | parts[2]
+
+          def inspect_macho(data):
+              assert len(data) >= 32, 'Truncated Mach-O header'
+              magic, cpu, subtype, filetype, count, length, flags, reserved = struct.unpack_from('<8I', data)
+              assert magic == 0xfeedfacf and cpu == 0x0100000c and filetype == 1, 'Expected ARM64 MH_OBJECT'
+              assert 32 + length <= len(data), 'Truncated load commands'
+              sections, symbols, platforms = [], {}, []
+              table = None
+              position = 32
+              for unused in range(count):
+                  assert position + 8 <= 32 + length
+                  command, size = struct.unpack_from('<II', data, position)
+                  assert size >= 8 and position + size <= 32 + length
+                  if command == 0x19:
+                      assert size >= 72
+                      nsects = struct.unpack_from('<I', data, position + 64)[0]
+                      assert 72 + nsects * 80 <= size
+                      for index in range(nsects):
+                          values = struct.unpack_from('<16s16sQQIIIIIIII', data, position + 72 + index * 80)
+                          sections.append({'name': values[0].split(bytes([0]))[0].decode(),
+                                           'segment': values[1].split(bytes([0]))[0].decode(),
+                                           'address': values[2], 'size': values[3], 'flags': values[8]})
+                  elif command == 0x32:
+                      assert size >= 24
+                      platforms.append(struct.unpack_from('<III', data, position + 8))
+                  elif command == 0x25:
+                      assert size == 16
+                      minos, sdk = struct.unpack_from('<II', data, position + 8)
+                      platforms.append((2, minos, sdk))
+                  elif command in (0x24, 0x2f, 0x30):
+                      raise AssertionError('Unexpected non-iPhone platform command')
+                  elif command == 2:
+                      assert size == 24 and table is None
+                      table = struct.unpack_from('<IIII', data, position + 8)
+                  position += size
+              assert position == 32 + length and len(platforms) == 1 and table
+              symoff, nsyms, stroff, strsize = table
+              assert symoff + nsyms * 16 <= len(data) and stroff + strsize <= len(data)
+              strings = data[stroff:stroff + strsize]
+              for index in range(nsyms):
+                  nameoff, kind, section, desc, value = struct.unpack_from('<IBBHQ', data, symoff + index * 16)
+                  assert nameoff < len(strings)
+                  end = strings.find(bytes([0]), nameoff)
+                  assert end >= nameoff
+                  name = strings[nameoff:end].decode()
+                  if not name or kind & 0xe0:
+                      continue
+                  assert name not in symbols, 'Duplicate symbol in synthetic object'
+                  symbols[name] = {'type': kind, 'section': section, 'description': desc, 'value': value}
+              platform, minos, sdk = platforms[0]
+              return {'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data), 'platform': platform,
+                      'minos': minos, 'sdk': sdk, 'sections': sections, 'symbols': symbols}
+
+          def parse_nm(text):
+              symbols = {}
+              for line in text.splitlines():
+                  match = re.fullmatch(r'(\S+) ([A-Za-z?\-]) ([0-9a-f]*) +([0-9a-f]+)', line)
+                  assert match and match[1] not in symbols and match[2] != '?', 'Unparsed/unknown native nm symbol: ' + line
+                  symbols[match[1]] = {'type': match[2], 'value': int(match[3] or '0', 16), 'size': int(match[4], 16)}
+              return symbols
+
+          def validate_semantics(info, nm_symbols, mode, sdk_version):
+              assert info['platform'] == 2
+              assert info['minos'] == 0x110000
+              assert info['sdk'] == packed_version(sdk_version)
+              symbols = info['symbols']
+              fn, var = symbols['_common_fn'], symbols['_common_symbol']
+              assert fn['type'] & 0x0e == 0x0e and fn['section'] > 0
+              assert nm_symbols['_common_fn']['type'] == 'T'
+              actual_exports = {name for name, row in symbols.items() if row['type'] & 1 and not row['type'] & 0x10}
+              expected_exports = {'_common_fn'} if mode == 'final' else {'_common_fn', '_common_symbol'}
+              assert actual_exports == expected_exports
+              assert not any(row['type'] & 0x0e == 0 and row['value'] == 0 for row in symbols.values()), 'Unexpected unresolved symbol'
+              if mode == 'input':
+                  assert var['type'] & 0x0e == 0 and var['value'] == 4 and var['section'] == 0
+                  assert nm_symbols['_common_symbol']['type'] == 'C'
+                  assert sum(row['type'] == 'C' for row in nm_symbols.values()) == 1
+              else:
+                  assert not any(symbol['type'] == 'C' for symbol in nm_symbols.values())
+                  assert var['type'] & 0x0e == 0x0e and 0 < var['section'] <= len(info['sections'])
+                  section = info['sections'][var['section'] - 1]
+                  assert section['size'] == 4 and section['flags'] & 0xff == 1
+                  assert var['value'] == section['address']
+                  if mode == 'final':
+                      assert not var['type'] & 1
+                      assert nm_symbols['_common_symbol']['type'] in ('b', 's', 'd')
+                  else:
+                      assert nm_symbols['_common_symbol']['type'] in ('B', 'S', 'D')
+
+          root = pathlib.Path('.work/native-ld64-source').resolve()
+          inventory = json.loads((root / 'source-build-inventory.json').read_text())
+          assert inventory['status'] == 'passed'
+          linker = pathlib.Path(inventory['linker'])
+          assert linker.is_file() and linker.is_absolute() and linker.is_relative_to(root / 'prefix')
+          assert hashlib.sha256(linker.read_bytes()).hexdigest() == inventory['linkerSha256']
+          record = {'commands': [], 'linker': str(linker), 'linkerSha256': inventory['linkerSha256'],
+                    'targetOutputExecuted': False, 'sdkExported': False, 'mediaProved': False, 'finalAppLinkProved': False,
+                    'scope': 'native .o/.a partial-link capability only; no SDK stub, bitcode, media or final app link proof'}
+          def command(arguments, input_text=None):
+              arguments = list(map(str, arguments))
+              assert arguments[0] == str(linker) or pathlib.Path(arguments[0]).name in ('xcrun', 'clang', 'llvm-nm'), 'Only native compiler/linker/inspection tools may execute'
+              result = subprocess.run(arguments, capture_output=True, text=True, input=input_text, timeout=30)
+              row = {'arguments': arguments, 'returncode': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+              record['commands'].append(row)
+              assert result.returncode == 0, json.dumps(row)
+              return result.stdout.strip()
+          def out(*args):
+              return command(args)
+          try:
+              sdk = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-path')
+              sdk_version = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-version')
+              assert sdk_version == '27.1', 'Re-review SDK metadata if the selected provider image changes'
+              clang = pathlib.Path(out('xcrun', '--sdk', 'iphoneos', '--find', 'clang'))
+              nm = pathlib.Path(out('xcrun', '--sdk', 'iphoneos', '--find', 'llvm-nm'))
+              assert pathlib.Path(sdk).is_dir() and all(p.is_absolute() and p.is_file() for p in (clang, nm))
+              version = command([nm, '--version'])
+              match = re.search(r'\b(?:LLVM version|version)\s+(\d+)\.', version)
+              version_major = int(match[1]) if match else 0
+              assert version_major in (20, 21, 22)
+              record['tools'] = {'sdk': sdk, 'sdkVersion': sdk_version, 'clang': str(clang), 'llvmNm': str(nm),
+                                 'llvmNmVersion': version, 'llvmNmSha256': hashlib.sha256(nm.read_bytes()).hexdigest(),
+                                 'clangSha256': hashlib.sha256(clang.read_bytes()).hexdigest()}
+              source = 'int common_symbol; int common_fn(void){return common_symbol;}\n'
+              directory = root / 'common-proof'
+              directory.mkdir()
+              input_object, first, final = (directory / name for name in ('input.o', 'prelinked.o', 'final.o'))
+              command([clang, '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-fcommon', '-g0', '-fno-stack-protector', '-x', 'c', '-', '-c', '-o', input_object], input_text=source)
+              def inspect(path):
+                  text = command([nm, '--format=posix', '--no-demangle', '--debug-syms', '--no-sort', path])
+                  assert not record['commands'][-1]['stderr'], 'Native nm diagnostic requires review'
+                  return inspect_macho(path.read_bytes()), parse_nm(text)
+              input_info, input_symbols = inspect(input_object)
+              record['inputObject'] = {'macho': input_info, 'nm': input_symbols, 'sourceSha256': hashlib.sha256(source.encode()).hexdigest()}
+              validate_semantics(input_info, input_symbols, 'input', sdk_version)
+              first_args = ['-r', '-d', '-arch', 'arm64', '-platform_version', 'ios', '17.0', sdk_version,
+                            '-syslibroot', sdk, '-u', '_common_fn', '-o', str(first), str(input_object)]
+              command([linker, *first_args])
+              first_info, first_symbols = inspect(first)
+              record['firstObject'] = {'macho': first_info, 'nm': first_symbols}
+              validate_semantics(first_info, first_symbols, 'first', sdk_version)
+              second_args = ['-r', '-S', '-arch', 'arm64', '-platform_version', 'ios', '17.0', sdk_version,
+                             '-syslibroot', sdk, '-exported_symbol', '_common_fn', '-o', str(final), str(first)]
+              command([linker, *second_args])
+              final_info, final_symbols = inspect(final)
+              record['finalObject'] = {'macho': final_info, 'nm': final_symbols}
+              validate_semantics(final_info, final_symbols, 'final', sdk_version)
+              assert hashlib.sha256(input_object.read_bytes()).hexdigest() == input_info['sha256']
+              assert hashlib.sha256(first.read_bytes()).hexdigest() == first_info['sha256']
+              assert hashlib.sha256(linker.read_bytes()).hexdigest() == inventory['linkerSha256']
+              record['status'] = 'passed'
+          except Exception as error:
+              record.update(status='failed', error=str(error))
+              raise
+          finally:
+              (root / 'common-visibility-proof.json').write_text(json.dumps(record, indent=2))
+              print(json.dumps(record, indent=2))
+          PY
+      - name: "Record native source capability boundary"
+        if: "${{ always() }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Private pinned native ld64 source build: ${{ steps.source_build.outcome }}; COMMON/privacy proof: ${{ steps.proof.outcome }}.' \
+            'Only explicit native object/archive partial links are in scope; TAPI, LTO and XAR are disabled.' \
+            'No SDK export, target execution, final app link, media compatibility, account or global tool installation was performed.' \
+            'Next: review source build provenance and actual two-pass proof before adapting media prelinks to this linker. Continue in the current thread; no new thread required.' >> "$GITHUB_STEP_SUMMARY"
