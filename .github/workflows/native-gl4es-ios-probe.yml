@@ -1,0 +1,155 @@
+name: Native GL4ES iOS source and UIKit surface link
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - codex/native-gl4es-ios-probe-20261026
+    paths:
+    - .github/workflows/native-gl4es-ios-probe.yml
+permissions:
+  contents: read
+concurrency:
+  group: native-gl4es-ios-probe
+  cancel-in-progress: false
+jobs:
+  gl4es-ios:
+    if: github.ref == 'refs/heads/codex/native-gl4es-ios-probe-20261026'
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+    - name: Pin public MIT source and prove in-place SDK inputs
+      id: prepare
+      shell: bash
+      run: "set -euo pipefail\npython3 - <<'PY'\nimport base64,hashlib,json,os,pathlib,re,subprocess\nroot=pathlib.Path('.work/gl4es-ios').absolute()\n\
+        assert not root.exists() and not any(p.is_symlink() for p in (root,*root.parents))\nroot.mkdir(parents=True)\n\
+        env=dict(os.environ,GIT_TERMINAL_PROMPT='0',HOMEBREW_NO_AUTO_UPDATE='1')\nfor key in ('SDKROOT','TOOLCHAINS','CC','CXX','CFLAGS','CXXFLAGS','LDFLAGS','MACOSX_DEPLOYMENT_TARGET','IPHONEOS_DEPLOYMENT_TARGET'):\n\
+        \    env.pop(key,None)\ndef run(label,args):\n    p=subprocess.run(list(map(str,args)),cwd=root,env=env,capture_output=True,timeout=120)\n\
+        \    (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)\n\
+        \    print(label,'exit',p.returncode,flush=True)\n    if p.returncode:print(p.stdout.decode(errors='replace'));print(p.stderr.decode(errors='replace'))\n\
+        \    assert p.returncode==0,label\n    return p.stdout.decode().strip()\ndeveloper=run('developer',['xcode-select','-p']);env['DEVELOPER_DIR']=developer\n\
+        sdk=pathlib.Path(run('sdk',['xcrun','--sdk','iphoneos','--show-sdk-path']))\nsdkversion=run('sdk-version',['xcrun','--sdk','iphoneos','--show-sdk-version'])\n\
+        assert int(sdkversion.split('.')[0])>=26 and sdk.is_dir()\ntools={name:run('find-'+name,['xcrun','--sdk','iphoneos','--find',name])\
+        \ for name in ['clang','ar','ranlib','nm']}\nassert all(pathlib.Path(p).is_absolute() and pathlib.Path(p).is_file()\
+        \ for p in tools.values())\nassert pathlib.Path(developer).resolve() in pathlib.Path(tools['clang']).resolve().parents\n\
+        versions={'xcode':run('xcode-version',['xcodebuild','-version']),'clang':run('clang-version',[tools['clang'],'--version']),\n\
+        \          'cmake':run('cmake-version',['cmake','--version']),'make':run('make-version',['make','--version'])}\n\
+        frameworks=sdk/'System/Library/Frameworks'\nneeded=['UIKit.framework/Headers/UIKit.h','UIKit.framework/UIKit.tbd',\n\
+        \  'QuartzCore.framework/Headers/CAEAGLLayer.h','QuartzCore.framework/QuartzCore.tbd',\n  'OpenGLES.framework/Headers/EAGL.h','OpenGLES.framework/Headers/ES2/gl.h','OpenGLES.framework/OpenGLES.tbd',\n\
+        \  'Foundation.framework/Foundation.tbd']\nsdkinputs={}\nfor relative in needed:\n    p=frameworks/relative;assert\
+        \ p.is_file(),('Required in-place Apple SDK input absent',relative)\n    sdkinputs[relative]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}\n\
+        pin='2037865590d410bcd7b8d1f22b841472ed6d39ac';url='https://github.com/ptitSeb/gl4es.git'\nassert re.fullmatch('[0-9a-f]{40}',pin)\
+        \ and url=='https://github.com/ptitSeb/gl4es.git'\nsource=root/'source';source.mkdir()\ngit=['git','-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','core.autocrlf=false','-C',source]\n\
+        run('source-init',git+['init','--quiet'])\nrun('source-fetch',git+['fetch','--depth=1','--no-tags',url,pin])\n\
+        run('source-checkout',git+['checkout','--detach','FETCH_HEAD'])\nassert run('source-pin',git+['rev-parse','HEAD'])==pin\n\
+        sourcehashes={'LICENSE': {'sha256': '69a3049c77abd88658f6ad7cf6a5b6ceb5cf03b80e60f7c4657d90322cfab7bd',\
+        \ 'bytes': 1105}, 'README.md': {'sha256': '3009610981bd589f29e5b3efe06331041a69899f8dfa4c684e36217775cafe2c',\
+        \ 'bytes': 4681}, 'COMPILE.md': {'sha256': 'fdd7a2d8f08bb3cf7d41b881114eb15e666a76dc6755b1dc8037dd96cce70360',\
+        \ 'bytes': 6870}, 'CMakeLists.txt': {'sha256': '3ea6228a4b3e527a01645fe223afd8b7c170281ed358020c7efa979bb7feda2e',\
+        \ 'bytes': 11571}, 'src/CMakeLists.txt': {'sha256': '141450dea053a650fbf2e0a6d22f930eda7fa801563e59004ddb73daa85264ce',\
+        \ 'bytes': 9559}, 'src/gl/attributes.h': {'sha256': 'c65c44765d2c00bb1f360f7ce51fcd7c0d2d25edd56e732810bb4421106f1467',\
+        \ 'bytes': 5920}, 'src/gl/directstate.c': {'sha256': 'a805b7631f331a2437eeaa358037fc69fe42c9d9450800ecc04aac2944dde613',\
+        \ 'bytes': 42219}, 'src/gl/loader.c': {'sha256': '62896167f73fe5fcb38acad339750f6cfbb4a7db2573df34415fb1b43c078bde',\
+        \ 'bytes': 5241}, 'src/gl/loader.h': {'sha256': '3a3de23684db3957a3843850e5d3399ee9afb03b92bae6ea433aee74bd42f625',\
+        \ 'bytes': 12059}, 'src/gl/init.c': {'sha256': '35804e977fb5bd3e8a7cdae192a95bfb93e89bbb201392f65daaecdd7d165969',\
+        \ 'bytes': 24652}, 'include/GL/gl.h': {'sha256': 'd03e03f7874502bcb5125dac530993555d37ebcfcf602354426a812f68160366',\
+        \ 'bytes': 84831}, 'include/gl4esinit.h': {'sha256': '3da0beccca54312010e74e1e99814ae64b38e9ccceb782648afcaa83283af6ad',\
+        \ 'bytes': 903}}\nfor name,row in sourcehashes.items():\n    data=(source/name).read_bytes();assert len(data)==row['bytes']\
+        \ and hashlib.sha256(data).hexdigest()==row['sha256'],name\naliaslines=[line.strip() for p in (source/'src').rglob('*.c')\
+        \ for line in p.read_text().splitlines() if 'AliasDecl(' in line]\nexpected=['AliasDecl(void,gl4es_glEnableClientStatei,(GLenum\
+        \ array, GLuint index),gl4es_glEnableClientStateIndexed);',\n          'AliasDecl(void,gl4es_glDisableClientStatei,(GLenum\
+        \ array, GLuint index),gl4es_glDisableClientStateIndexed);']\nassert aliaslines==expected,aliaslines\nfiles={'apple_alias_adapter.h':\
+        \ {'base64': 'LyogUGVyc29uYWwgQXBwbGUgYnVpbGQgYWRhcHRlciwgbm90IGFuIHVwc3RyZWFtIGNvbnRyaWJ1dGlvbi4KICogVGhlIHBpbm5lZCBzb3VyY2UgaGFzIGV4YWN0bHkgdHdvIEFsaWFzRGVjbCB1c2VzLCBib3RoIHZvaWQoYXJyYXksaW5kZXgpLgogKiBNYWNoLU8gQ2xhbmcgY2Fubm90IGVtaXQgR0NDIGFsaWFzIGF0dHJpYnV0ZXMuIFByZXNlcnZlIHR5cGVkIGNhbGwgYmVoYXZpb3I7CiAqIGFkZHJlc3MgaWRlbnRpdHkgb2YgdGhlIHR3byBzcGVsbGluZyB2YXJpYW50cyBpcyBkZWxpYmVyYXRlbHkgbm90IHByb21pc2VkLgogKiBUaGUgd29ya2Zsb3cgY2hlY2tzIHRoZSBleGFjdCBzb3VyY2UgYnl0ZXMvY291bnQgYmVmb3JlIGVuYWJsaW5nIHRoaXMgbWFjcm8uICovCiNpZiAhZGVmaW5lZChfX0FQUExFX18pIHx8ICFkZWZpbmVkKF9fYWFyY2g2NF9fKQojZXJyb3IgVGhpcyBhZGFwdGVyIGlzIHNjb3BlZCB0byBBcHBsZSBBUk02NCBvbmx5CiNlbmRpZgojZGVmaW5lIEFsaWFzRGVjbChSRVQsIE5BTUUsIERFRiwgT0xEKSBcCiAgICBSRVQgQVBJRU5UUllfR0w0RVMgTkFNRSBERUYgeyBPTEQoYXJyYXksIGluZGV4KTsgfQo=',\
+        \ 'sha256': '249c6638bbf6291241626fd6da188119ef46fcd0424169866e7d5b368aa79487'}, 'desktop_probe.c': {'base64':\
+        \ 'LyogTmV3bHkgYXV0aG9yZWQgZGVza3RvcCBPcGVuR0wgZml4dHVyZSwgd2l0aCBubyBnYW1lIHNvdXJjZSBvciBhc3NldHMuCiAqIEdMNEVTJ3MgQXBwbGUgaGVhZGVyIG1hcHMgZ2wqIGJlbG93IHRvIGdsNGVzX2dsKi4gTmF0aXZlIEdMRVMgc3RheXMgaW4gLm0uICovCiNpbmNsdWRlIDxHTC9nbC5oPgojaW5jbHVkZSA8Z2w0ZXNpbml0Lmg+CgppbnQgb3duX2dsNGVzX2Rlc2t0b3BfdHJpYW5nbGUoaW50IHdpZHRoLCBpbnQgaGVpZ2h0KQp7CiAgICBnbFZpZXdwb3J0KDAsIDAsIHdpZHRoLCBoZWlnaHQpOwogICAgZ2xDbGVhckNvbG9yKDAuMWYsIDAuMmYsIDAuM2YsIDEuMGYpOwogICAgZ2xDbGVhcihHTF9DT0xPUl9CVUZGRVJfQklUKTsKICAgIGdsTWF0cml4TW9kZShHTF9QUk9KRUNUSU9OKTsKICAgIGdsTG9hZElkZW50aXR5KCk7CiAgICBnbE9ydGhvKC0xLjAsIDEuMCwgLTEuMCwgMS4wLCAtMS4wLCAxLjApOwogICAgZ2xNYXRyaXhNb2RlKEdMX01PREVMVklFVyk7CiAgICBnbExvYWRJZGVudGl0eSgpOwogICAgZ2xCZWdpbihHTF9UUklBTkdMRVMpOwogICAgZ2xDb2xvcjNmKDEuMGYsIDAuMGYsIDAuMGYpOyBnbFZlcnRleDJmKC0wLjVmLCAtMC41Zik7CiAgICBnbENvbG9yM2YoMC4wZiwgMS4wZiwgMC4wZik7IGdsVmVydGV4MmYoMC41ZiwgLTAuNWYpOwogICAgZ2xDb2xvcjNmKDAuMGYsIDAuMGYsIDEuMGYpOyBnbFZlcnRleDJmKDAuMGYsIDAuNWYpOwogICAgZ2xFbmQoKTsKICAgIGdsRmx1c2goKTsKICAgIHJldHVybiBnbEdldEVycm9yKCkgPT0gR0xfTk9fRVJST1I7Cn0K',\
+        \ 'sha256': '76d9c82084b1d83622ea2b43171f6bd97420092d214ad6fd4c227af6fd7e9874'}, 'ios_surface.m': {'base64':\
+        \ 'LyogTmV3bHkgYXV0aG9yZWQgc2luZ2xlLWNvbnRleHQgVUlLaXQvRUFHTCBkZXBlbmRlbmN5IGZpeHR1cmUuCiAqIFRoaXMgaXMgYSBzdXJmYWNlIGxpYnJhcnksIG5vdCBhbiBhcHAgb3IgYSBnYW1lOyBub3QgZXhlY3V0ZWQgYnkgdGhlIHByb2JlLgogKiBUaGUgcmVhbCBjYWxsZXIgbXVzdCBhdHRhY2ggdGhlIHZpZXcgYmVmb3JlIGRyYXcvbGF5b3V0IG9uIHRoZSBtYWluIHRocmVhZC4KICogTm8gR0w0RVMgZGVza3RvcCBHTCBoZWFkZXIgYmVsb25ncyBpbiB0aGlzIG5hdGl2ZS1HTEVTIHRyYW5zbGF0aW9uIHVuaXQuICovCiNkZWZpbmUgR0xFU19TSUxFTkNFX0RFUFJFQ0FUSU9OCiNpbXBvcnQgPFVJS2l0L1VJS2l0Lmg+CiNpbXBvcnQgPFF1YXJ0ekNvcmUvQ0FFQUdMTGF5ZXIuaD4KI2ltcG9ydCA8T3BlbkdMRVMvRUFHTC5oPgojaW1wb3J0IDxPcGVuR0xFUy9FUzIvZ2wuaD4KI2luY2x1ZGUgPGRsZmNuLmg+CiNpbmNsdWRlIDxzdHJpbmcuaD4KI2luY2x1ZGUgPGdsNGVzaW5pdC5oPgoKZXh0ZXJuIGludCBvd25fZ2w0ZXNfZGVza3RvcF90cmlhbmdsZShpbnQgd2lkdGgsIGludCBoZWlnaHQpOwpzdGF0aWMgdm9pZCAqYmFja2VuZF9oYW5kbGU7CnN0YXRpYyBHTHVpbnQgZHJhd2FibGVfZmJvOwpzdGF0aWMgR0xpbnQgZHJhd2FibGVfd2lkdGgsIGRyYXdhYmxlX2hlaWdodDsKc3RhdGljIHZvaWQgKCpuYXRpdmVfYmluZF9mYm8pKEdMZW51bSwgR0x1aW50KTsKCi8qIEEgbm9uemVybyBFQUdMIGRyYXdhYmxlIEZCTyBpbXBsZW1lbnRzIGRlc2t0b3AgZnJhbWVidWZmZXIgemVybyBoZXJlLgogKiBUaGlzIGZpeHR1cmUgaXMgZGVsaWJlcmF0ZWx5IG9uZSBjb250ZXh0L3ZpZXcuIE5vIG11bHRpd2luZG93IGNsYWltLiAqLwpzdGF0aWMgdm9pZCBiaW5kX2RyYXdhYmxlX2ZibyhHTGVudW0gdGFyZ2V0LCBHTHVpbnQgZnJhbWVidWZmZXIpCnsKICAgIG5hdGl2ZV9iaW5kX2Zibyh0YXJnZXQsIGZyYW1lYnVmZmVyID8gZnJhbWVidWZmZXIgOiBkcmF3YWJsZV9mYm8pOwp9CgpzdGF0aWMgdm9pZCAqbmF0aXZlX2dsZXNfcHJvYyhjb25zdCBjaGFyICpuYW1lKQp7CiAgICBpZiAoIXN0cmNtcChuYW1lLCAiZ2xCaW5kRnJhbWVidWZmZXIiKSB8fCAhc3RyY21wKG5hbWUsICJnbEJpbmRGcmFtZWJ1ZmZlck9FUyIpKQogICAgICAgIHJldHVybiAodm9pZCAqKWJpbmRfZHJhd2FibGVfZmJvOwogICAgcmV0dXJuIGRsc3ltKGJhY2tlbmRfaGFuZGxlLCBuYW1lKTsKfQoKc3RhdGljIHZvaWQgZHJhd2FibGVfc2l6ZShpbnQgKndpZHRoLCBpbnQgKmhlaWdodCkKewogICAgKndpZHRoID0gZHJhd2FibGVfd2lkdGg7CiAgICAqaGVpZ2h0ID0gZHJhd2FibGVfaGVpZ2h0Owp9CgpAaW50ZXJmYWNlIE93bkdMNEVTU3VyZmFjZSA6IFVJVmlldyB7CiAgICBFQUdMQ29udGV4dCAqX2NvbnRleHQ7CiAgICBHTHVpbnQgX2NvbG9yOwogICAgQk9PTCBfaW5pdGlhbGl6ZWQ7Cn0KLSAoQk9PTClkcmF3Rml4dHVyZTsKLSAodm9pZCljbG9zZUZpeHR1cmU7CkBlbmQKCkBpbXBsZW1lbnRhdGlvbiBPd25HTDRFU1N1cmZhY2UKKyAoQ2xhc3MpbGF5ZXJDbGFzcyB7IHJldHVybiBbQ0FFQUdMTGF5ZXIgY2xhc3NdOyB9Ci0gKGluc3RhbmNldHlwZSlpbml0V2l0aEZyYW1lOihDR1JlY3QpZnJhbWUKewogICAgaWYgKCFbTlNUaHJlYWQgaXNNYWluVGhyZWFkXSB8fCBiYWNrZW5kX2hhbmRsZSkgcmV0dXJuIG5pbDsKICAgIHNlbGYgPSBbc3VwZXIgaW5pdFdpdGhGcmFtZTpmcmFtZV07CiAgICBpZiAoIXNlbGYpIHJldHVybiBuaWw7CiAgICBDQUVBR0xMYXllciAqbGF5ZXIgPSAoQ0FFQUdMTGF5ZXIgKilzZWxmLmxheWVyOwogICAgbGF5ZXIub3BhcXVlID0gWUVTOwogICAgbGF5ZXIuZHJhd2FibGVQcm9wZXJ0aWVzID0gQHtrRUFHTERyYXdhYmxlUHJvcGVydHlSZXRhaW5lZEJhY2tpbmc6IEBOTywKICAgICAgICBrRUFHTERyYXdhYmxlUHJvcGVydHlDb2xvckZvcm1hdDoga0VBR0xDb2xvckZvcm1hdFJHQkE4fTsKICAgIF9jb250ZXh0ID0gW1tFQUdMQ29udGV4dCBhbGxvY10gaW5pdFdpdGhBUEk6a0VBR0xSZW5kZXJpbmdBUElPcGVuR0xFUzJdOwogICAgaWYgKCFfY29udGV4dCkgcmV0dXJuIG5pbDsKICAgIGJhY2tlbmRfaGFuZGxlID0gZGxvcGVuKCIvU3lzdGVtL0xpYnJhcnkvRnJhbWV3b3Jrcy9PcGVuR0xFUy5mcmFtZXdvcmsvT3BlbkdMRVMiLCBSVExEX05PVyB8IFJUTERfTE9DQUwpOwogICAgaWYgKCFiYWNrZW5kX2hhbmRsZSkgcmV0dXJuIG5pbDsKICAgIG5hdGl2ZV9iaW5kX2ZibyA9ICh2b2lkICgqKShHTGVudW0sR0x1aW50KSlkbHN5bShiYWNrZW5kX2hhbmRsZSwgImdsQmluZEZyYW1lYnVmZmVyIik7CiAgICBpZiAoIW5hdGl2ZV9iaW5kX2ZibykgeyBkbGNsb3NlKGJhY2tlbmRfaGFuZGxlKTsgYmFja2VuZF9oYW5kbGUgPSBOVUxMOyByZXR1cm4gbmlsOyB9CiAgICByZXR1cm4gc2VsZjsKfQotIChCT09MKWRyYXdGaXh0dXJlCnsKICAgIGlmICghW05TVGhyZWFkIGlzTWFpblRocmVhZF0gfHwgIVtFQUdMQ29udGV4dCBzZXRDdXJyZW50Q29udGV4dDpfY29udGV4dF0pIHJldHVybiBOTzsKICAgIGlmICghX2luaXRpYWxpemVkKSB7CiAgICAgICAgaWYgKCFfY29sb3IpIGdsR2VuUmVuZGVyYnVmZmVycygxLCAmX2NvbG9yKTsKICAgICAgICBnbEJpbmRSZW5kZXJidWZmZXIoR0xfUkVOREVSQlVGRkVSLCBfY29sb3IpOwogICAgICAgIGlmICghW19jb250ZXh0IHJlbmRlcmJ1ZmZlclN0b3JhZ2U6R0xfUkVOREVSQlVGRkVSIGZyb21EcmF3YWJsZTooQ0FFQUdMTGF5ZXIgKilzZWxmLmxheWVyXSkgcmV0dXJuIE5POwogICAgICAgIGdsR2V0UmVuZGVyYnVmZmVyUGFyYW1ldGVyaXYoR0xfUkVOREVSQlVGRkVSLCBHTF9SRU5ERVJCVUZGRVJfV0lEVEgsICZkcmF3YWJsZV93aWR0aCk7CiAgICAgICAgZ2xHZXRSZW5kZXJidWZmZXJQYXJhbWV0ZXJpdihHTF9SRU5ERVJCVUZGRVIsIEdMX1JFTkRFUkJVRkZFUl9IRUlHSFQsICZkcmF3YWJsZV9oZWlnaHQpOwogICAgICAgIGlmICghZHJhd2FibGVfZmJvKSBnbEdlbkZyYW1lYnVmZmVycygxLCAmZHJhd2FibGVfZmJvKTsKICAgICAgICBnbEJpbmRGcmFtZWJ1ZmZlcihHTF9GUkFNRUJVRkZFUiwgZHJhd2FibGVfZmJvKTsKICAgICAgICBnbEZyYW1lYnVmZmVyUmVuZGVyYnVmZmVyKEdMX0ZSQU1FQlVGRkVSLCBHTF9DT0xPUl9BVFRBQ0hNRU5UMCwgR0xfUkVOREVSQlVGRkVSLCBfY29sb3IpOwogICAgICAgIGlmIChnbENoZWNrRnJhbWVidWZmZXJTdGF0dXMoR0xfRlJBTUVCVUZGRVIpICE9IEdMX0ZSQU1FQlVGRkVSX0NPTVBMRVRFKSByZXR1cm4gTk87CiAgICAgICAgc2V0X2dldHByb2NhZGRyZXNzKG5hdGl2ZV9nbGVzX3Byb2MpOwogICAgICAgIHNldF9nZXRtYWluZmJzaXplKGRyYXdhYmxlX3NpemUpOwogICAgICAgIGluaXRpYWxpemVfZ2w0ZXMoKTsKICAgICAgICBpZiAoZ2w0ZXNfR2V0UHJvY0FkZHJlc3MoImdsQ2xlYXIiKSA9PSBkbHN5bShiYWNrZW5kX2hhbmRsZSwgImdsQ2xlYXIiKSkgcmV0dXJuIE5POwogICAgICAgIF9pbml0aWFsaXplZCA9IFlFUzsKICAgIH0KICAgIGdsQmluZEZyYW1lYnVmZmVyKEdMX0ZSQU1FQlVGRkVSLCBkcmF3YWJsZV9mYm8pOwogICAgaWYgKCFvd25fZ2w0ZXNfZGVza3RvcF90cmlhbmdsZShkcmF3YWJsZV93aWR0aCwgZHJhd2FibGVfaGVpZ2h0KSkgcmV0dXJuIE5POwogICAgZ2xCaW5kUmVuZGVyYnVmZmVyKEdMX1JFTkRFUkJVRkZFUiwgX2NvbG9yKTsKICAgIHJldHVybiBbX2NvbnRleHQgcHJlc2VudFJlbmRlcmJ1ZmZlcjpHTF9SRU5ERVJCVUZGRVJdOwp9Ci0gKHZvaWQpY2xvc2VGaXh0dXJlCnsKICAgIGlmICghX2NvbnRleHQpIHJldHVybjsKICAgIFtFQUdMQ29udGV4dCBzZXRDdXJyZW50Q29udGV4dDpfY29udGV4dF07CiAgICBpZiAoX2luaXRpYWxpemVkKSBjbG9zZV9nbDRlcygpOwogICAgaWYgKGRyYXdhYmxlX2ZibykgZ2xEZWxldGVGcmFtZWJ1ZmZlcnMoMSwgJmRyYXdhYmxlX2Zibyk7CiAgICBpZiAoX2NvbG9yKSBnbERlbGV0ZVJlbmRlcmJ1ZmZlcnMoMSwgJl9jb2xvcik7CiAgICBkcmF3YWJsZV9mYm8gPSAwOyBfY29sb3IgPSAwOwogICAgW0VBR0xDb250ZXh0IHNldEN1cnJlbnRDb250ZXh0Om5pbF07CiAgICBfY29udGV4dCA9IG5pbDsKICAgIGlmIChiYWNrZW5kX2hhbmRsZSkgZGxjbG9zZShiYWNrZW5kX2hhbmRsZSk7CiAgICBiYWNrZW5kX2hhbmRsZSA9IE5VTEw7IG5hdGl2ZV9iaW5kX2ZibyA9IE5VTEw7Cn0KLSAodm9pZClkZWFsbG9jIHsgW3NlbGYgY2xvc2VGaXh0dXJlXTsgfQpAZW5kCgpfX2F0dHJpYnV0ZV9fKCh2aXNpYmlsaXR5KCJkZWZhdWx0IikpKQp2b2lkICpvd25faW9zX2dsNGVzX21ha2Vfc3VyZmFjZShpbnQgd2lkdGgsIGludCBoZWlnaHQpCnsKICAgIE93bkdMNEVTU3VyZmFjZSAqdmlldyA9IFtbT3duR0w0RVNTdXJmYWNlIGFsbG9jXSBpbml0V2l0aEZyYW1lOkNHUmVjdE1ha2UoMCwwLHdpZHRoLGhlaWdodCldOwogICAgcmV0dXJuIChfX2JyaWRnZV9yZXRhaW5lZCB2b2lkICopdmlldzsKfQpfX2F0dHJpYnV0ZV9fKCh2aXNpYmlsaXR5KCJkZWZhdWx0IikpKQppbnQgb3duX2lvc19nbDRlc19kcmF3X3N1cmZhY2Uodm9pZCAqc3VyZmFjZSkKewogICAgcmV0dXJuIFsoX19icmlkZ2UgT3duR0w0RVNTdXJmYWNlICopc3VyZmFjZSBkcmF3Rml4dHVyZV07Cn0KX19hdHRyaWJ1dGVfXygodmlzaWJpbGl0eSgiZGVmYXVsdCIpKSkKdm9pZCBvd25faW9zX2dsNGVzX2Nsb3NlX3N1cmZhY2Uodm9pZCAqc3VyZmFjZSkKewogICAgT3duR0w0RVNTdXJmYWNlICp2aWV3ID0gKF9fYnJpZGdlX3RyYW5zZmVyIE93bkdMNEVTU3VyZmFjZSAqKXN1cmZhY2U7CiAgICBbdmlldyBjbG9zZUZpeHR1cmVdOwp9Cg==',\
+        \ 'sha256': '094d9a2e735bbdf42654f217fd8d07f91e2f1fc45d91ea2294282bfcbac3b4f4'}}\nfor name,row in files.items():\n\
+        \    data=base64.b64decode(row['base64'],validate=True);assert hashlib.sha256(data).hexdigest()==row['sha256']\n\
+        \    (root/name).write_bytes(data)\nplan={'root':str(root),'source':str(source),'revision':pin,'repository':url,'developer':developer,\n\
+        \  'sdk':str(sdk),'sdkVersion':sdkversion,'sdkInputs':sdkinputs,'tools':tools,'versions':versions,\n  'canonicalSourceHashes':sourcehashes,'ownSourceHashes':{n:v['sha256']\
+        \ for n,v in files.items()},\n  'aliasAdapter':'Two exact Apple-only typed forwarders; not function-address\
+        \ alias identity',\n  'retailInputsSupplied':False,'sdkExported':False,'appCreated':False}\n(root/'plan.json').write_text(json.dumps(plan,indent=2))\n\
+        print(json.dumps({'revision':pin,'versions':versions,'sdkVersion':sdkversion,'sdkInputs':sdkinputs,'ownSourceHashes':plan['ownSourceHashes']},indent=2))\n\
+        \nPY\n"
+    - name: Build full static GL4ES and link newly authored UIKit surface
+      id: build
+      shell: bash
+      run: "set -euo pipefail\npython3 - <<'PY'\nimport hashlib,json,os,pathlib,subprocess\nroot=pathlib.Path('.work/gl4es-ios').absolute();plan=json.loads((root/'plan.json').read_text())\n\
+        assert plan['root']==str(root)\nsource=pathlib.Path(plan['source']);tools=plan['tools'];sdk=plan['sdk']\n\
+        env=dict(os.environ,DEVELOPER_DIR=plan['developer']);records=[]\nfor key in ('SDKROOT','TOOLCHAINS','CC','CXX','CFLAGS','CXXFLAGS','LDFLAGS','MACOSX_DEPLOYMENT_TARGET','IPHONEOS_DEPLOYMENT_TARGET'):\n\
+        \    env.pop(key,None)\ndef run(label,args,timeout=120):\n    args=list(map(str,args));p=subprocess.run(args,cwd=root,env=env,capture_output=True,timeout=timeout)\n\
+        \    (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)\n\
+        \    records.append({'label':label,'argv':args,'exitCode':p.returncode,'stdoutSha256':hashlib.sha256(p.stdout).hexdigest(),'stderrSha256':hashlib.sha256(p.stderr).hexdigest()})\n\
+        \    (root/'build-commands.json').write_text(json.dumps(records,indent=2));print(label,'exit',p.returncode,flush=True)\n\
+        \    if p.returncode:\n        print(p.stdout.decode(errors='replace')[-24000:]);print(p.stderr.decode(errors='replace')[-24000:])\n\
+        \    assert p.returncode==0,label\n    return p.stdout.decode().strip()\nadapter=root/'apple_alias_adapter.h'\n\
+        assert not any(c.isspace() for c in str(adapter))\nflags='-include '+str(adapter)\nconfigure=['cmake','-S',source,'-B',root/'build','-G','Unix\
+        \ Makefiles',\n  '-DCMAKE_SYSTEM_NAME=iOS','-DCMAKE_SYSTEM_PROCESSOR=arm64','-DCMAKE_OSX_ARCHITECTURES=arm64',\n\
+        \  '-DCMAKE_OSX_SYSROOT='+sdk,'-DCMAKE_OSX_DEPLOYMENT_TARGET=26.0','-DCMAKE_C_COMPILER='+tools['clang'],\n\
+        \  '-DCMAKE_C_COMPILER_TARGET=arm64-apple-ios26.0','-DCMAKE_AR='+tools['ar'],'-DCMAKE_RANLIB='+tools['ranlib'],\n\
+        \  '-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY','-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER',\n  '-DCMAKE_BUILD_TYPE=Release','-DCMAKE_C_FLAGS='+flags,'-DCMAKE_C_FLAGS_RELEASE=-O2\
+        \ -DNDEBUG',\n  '-DNOX11=ON','-DNOEGL=ON','-DSTATICLIB=ON','-DNO_LOADER=ON','-DNO_INIT_CONSTRUCTOR=ON',\n\
+        \  '-DDEFAULT_ES=2','-DGBM=OFF','-DEGL_WRAPPER=OFF','-DUSE_CCACHE=OFF','-DCMAKE_EXPORT_COMPILE_COMMANDS=ON']\n\
+        run('configure-gl4es',configure)\nrun('build-full-static-gl4es',['cmake','--build',root/'build','--target','GL','--parallel','3'],1200)\n\
+        archive=source/'lib/libGL.a';assert archive.is_file() and archive.stat().st_size>100000\nflags=['-target','arm64-apple-ios26.0','-isysroot',sdk,'-O2','-fvisibility=hidden','-Wall','-Wextra','-Werror','-Wno-error=deprecated-declarations','-I'+str(source/'include')]\n\
+        run('compile-desktop-fixture',[tools['clang'],*flags,'-c',root/'desktop_probe.c','-o',root/'desktop_probe.o'])\n\
+        run('compile-native-surface',[tools['clang'],*flags,'-fobjc-arc','-c',root/'ios_surface.m','-o',root/'ios_surface.o'])\n\
+        dylib=root/'libOwnGL4ESIOSSurface.dylib'\nrun('link-whole-library-and-surface',[tools['clang'],'-target','arm64-apple-ios26.0','-isysroot',sdk,\n\
+        \  '-dynamiclib',root/'ios_surface.o',root/'desktop_probe.o','-Wl,-force_load,'+str(archive),\n  '-framework','UIKit','-framework','QuartzCore','-framework','OpenGLES','-framework','Foundation',\n\
+        \  '-Wl,-no_adhoc_codesign','-install_name','@rpath/libOwnGL4ESIOSSurface.dylib','-o',dylib])\nrun('upstream-tracked-files-unchanged',['git','-C',source,'diff','--exit-code'])\n\
+        print(json.dumps({'archiveBytes':archive.stat().st_size,'archiveSha256':hashlib.sha256(archive.read_bytes()).hexdigest(),\n\
+        \  'dylibBytes':dylib.stat().st_size,'dylibSha256':hashlib.sha256(dylib.read_bytes()).hexdigest()},indent=2))\n\
+        \nPY\n"
+    - name: Inspect all ARM64 iOS members and symbol separation
+      id: inspect
+      shell: bash
+      run: "set -euo pipefail\npython3 - <<'PY'\nimport hashlib,json,os,pathlib,re,struct,subprocess\nroot=pathlib.Path('.work/gl4es-ios').absolute();plan=json.loads((root/'plan.json').read_text())\n\
+        assert plan['root']==str(root)\nsource=pathlib.Path(plan['source']);archive=source/'lib/libGL.a';dylib=root/'libOwnGL4ESIOSSurface.dylib'\n\
+        def macho(data,kind):\n    h=struct.unpack_from('<8I',data);assert h[0]==0xfeedfacf and h[1]==0x100000c\
+        \ and h[3]==kind,h\n    at=32;platforms=[];loads=[];ids=[];rpaths=[];signed=False\n    for _ in range(h[4]):\n\
+        \        cmd,size=struct.unpack_from('<II',data,at);assert size>=8 and at+size<=32+h[5]<=len(data)\n   \
+        \     if cmd==0x32:platforms.append(struct.unpack_from('<III',data,at+8))\n        if cmd in (0xc,0x18,0x1f,0x80000018,0x8000001f,0xd):\n\
+        \            off=struct.unpack_from('<I',data,at+8)[0];assert 0<off<size\n            text=data[at+off:at+size].split(b'\\\
+        0')[0].decode();(ids if cmd==0xd else loads).append(text)\n        if cmd==0x8000001c:rpaths.append(data[at+struct.unpack_from('<I',data,at+8)[0]:at+size].split(b'\\\
+        0')[0].decode())\n        if cmd==0x1d:signed=True\n        at+=size\n    assert at==32+h[5] and len(platforms)==1\
+        \ and platforms[0][0]==2 and platforms[0][1]==26<<16,platforms\n    return {'platforms':platforms,'loads':loads,'installIds':ids,'rpaths':rpaths,'signaturePresent':signed}\n\
+        data=archive.read_bytes();assert data.startswith(b'!<arch>\\n');at=8;members=[]\nwhile at<len(data):\n \
+        \   header=data[at:at+60];assert len(header)==60 and header[58:60]==b'`\\n'\n    name=header[:16].decode().strip();size=int(header[48:58]);payload=data[at+60:at+60+size];assert\
+        \ len(payload)==size\n    if name.startswith('#1/'):\n        n=int(name[3:]);name=payload[:n].rstrip(b'\\\
+        0').decode();payload=payload[n:]\n    name=name.rstrip('/')\n    if name and not name.startswith('__.SYMDEF'):\n\
+        \        metadata=macho(payload,1)\n        members.append({'name':name,'bytes':len(payload),'sha256':hashlib.sha256(payload).hexdigest(),'metadata':metadata})\n\
+        \    at+=60+size+(size%2)\nassert at==len(data) and len(members)>=70\nmetadata=macho(dylib.read_bytes(),6)\n\
+        assert metadata['installIds']==['@rpath/libOwnGL4ESIOSSurface.dylib'] and not metadata['rpaths'] and not\
+        \ metadata['signaturePresent']\nallowed={'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/QuartzCore.framework/QuartzCore',\n\
+        \  '/System/Library/Frameworks/OpenGLES.framework/OpenGLES','/System/Library/Frameworks/Foundation.framework/Foundation',\n\
+        \  '/usr/lib/libobjc.A.dylib','/usr/lib/libSystem.B.dylib'}\nassert set(metadata['loads'])<=allowed and\
+        \ {'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/OpenGLES.framework/OpenGLES'}<=set(metadata['loads']),metadata\n\
+        env=dict(os.environ,DEVELOPER_DIR=plan['developer'])\ndef symbols(label,args):\n    p=subprocess.run([plan['tools']['nm'],*map(str,args)],env=env,capture_output=True,timeout=60)\n\
+        \    (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)\n\
+        \    assert p.returncode==0,(label,p.stderr.decode(errors='replace'))\n    return set(line.strip() for line\
+        \ in p.stdout.decode().splitlines() if re.fullmatch(r'_[A-Za-z0-9_.$]+',line.strip()))\ndefined=symbols('archive-defined',['-g','-U','-j',archive])\n\
+        required={'_initialize_gl4es','_close_gl4es','_set_getprocaddress','_set_getmainfbsize','_gl4es_GetProcAddress',\n\
+        \  '_gl4es_glBegin','_gl4es_glEnd','_gl4es_glMatrixMode','_gl4es_glBindTexture','_gl4es_glTexImage2D','_gl4es_glNewList','_gl4es_glCallList'}\n\
+        assert required<=defined,sorted(required-defined)\ndesktop=symbols('desktop-undefined',['-u','-j',root/'desktop_probe.o'])\n\
+        assert {'_gl4es_glBegin','_gl4es_glClear','_gl4es_glMatrixMode'}<=desktop\nassert not any(re.match(r'^_gl[A-Z]',name)\
+        \ for name in desktop),desktop\ntbd=pathlib.Path(plan['sdk'])/'System/Library/Frameworks/OpenGLES.framework/OpenGLES.tbd'\n\
+        native=set(re.findall(r'(?<![A-Za-z0-9_])_gl[A-Za-z0-9_]+',tbd.read_text()))\nassert {'_glBindFramebuffer','_glClear','_glGetError'}<=native,native\n\
+        overlap=sorted(defined&native);assert not overlap,overlap\nexports=symbols('linked-defined',['-g','-U','-j',dylib])\n\
+        surface={'_own_ios_gl4es_make_surface','_own_ios_gl4es_draw_surface','_own_ios_gl4es_close_surface'}\nassert\
+        \ surface<=exports,surface-exports\nundefined=symbols('linked-undefined',['-u','-j',dylib]);assert undefined\n\
+        assert not any(name.startswith(('_gl4es_','_set_get','_initialize_gl4es','_close_gl4es')) for name in undefined),undefined\n\
+        compile_db=json.loads((root/'build/compile_commands.json').read_text())\nassert len(compile_db)>=70\nfor\
+        \ row in compile_db:\n    command=row['command'];assert '-arch arm64' in command and '-isysroot' in command\n\
+        \    assert 'apple_alias_adapter.h' in command and '-DNOEGL' in command and '-DNOX11' in command\n    assert\
+        \ not any(bad in command for bad in ('wine','unicorn','MoltenVK','-m32'))\nfor name,row in plan['canonicalSourceHashes'].items():assert\
+        \ hashlib.sha256((source/name).read_bytes()).hexdigest()==row['sha256']\nresult={'revision':plan['revision'],'sdkVersion':plan['sdkVersion'],'versions':plan['versions'],\n\
+        \  'archive':{'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'allMemberCount':len(members),'members':members},\n\
+        \  'linkedSurface':{'bytes':dylib.stat().st_size,'sha256':hashlib.sha256(dylib.read_bytes()).hexdigest(),'metadata':metadata,\n\
+        \    'exports':sorted(exports),'imports':sorted(undefined)},'desktopFixtureImports':sorted(desktop),\n \
+        \ 'nativeOpenGLESCollisionCount':len(overlap),'compiledTranslationUnitCount':len(compile_db),\n  'ownSourceHashes':plan['ownSourceHashes'],'upstreamSourceUnchanged':True,\n\
+        \  'mitLicenseSha256':plan['canonicalSourceHashes']['LICENSE']['sha256'],\n  'aliasAdapter':plan['aliasAdapter'],'allLibraryMembersLinked':True,\n\
+        \  'iosCodeExecuted':False,'pixelsVerified':False,'gameCompatibilityVerified':False,\n  'appCreated':False,'deviceOrSigningUsed':False,'artifactsUploaded':False,'sdkExported':False}\n\
+        text=json.dumps(result,indent=2);(root/'result.json').write_text(text)\ncompact=dict(result);compact['archive']={k:v\
+        \ for k,v in result['archive'].items() if k!='members'}\nprint(json.dumps(compact,indent=2))\nwith open(os.environ['GITHUB_STEP_SUMMARY'],'a')\
+        \ as f:f.write('\\nNative GL4ES static library/UIKit surface link only; no game/device/pixel claim.\\n\\\
+        n```json\\n'+json.dumps(compact,indent=2)+'\\n```\\n')\n\nPY\n"
