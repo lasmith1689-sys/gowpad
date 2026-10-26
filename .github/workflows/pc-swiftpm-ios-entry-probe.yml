@@ -1,0 +1,199 @@
+name: Native SwiftPM iPhone graph toolset and entry mechanics
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - codex/pc-games-runtime-probe-20261025
+    paths:
+    - .github/workflows/pc-swiftpm-ios-entry-probe.yml
+permissions:
+  contents: read
+concurrency:
+  group: pc-swiftpm-ios-entry-probe
+  cancel-in-progress: false
+jobs:
+  swiftpm-ios-entry:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+    - name: Prepare exact reviewed mechanics and own-source local fixtures
+      id: prepare
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import ast,base64,hashlib,importlib.util,json,os,pathlib,re,subprocess,sys
+        root=pathlib.Path('.work/swiftpm-ios-entry').resolve()
+        assert not root.exists() and not any(p.is_symlink() for p in (root,*root.parents))
+        root.mkdir(parents=True);(root/'tools').mkdir();(root/'tmp').mkdir()
+        env=dict(os.environ)
+        for key in tuple(env):
+            if key in ('SDKROOT','SDK_NAME','SDK_VERSION','TOOLCHAINS','SWIFT_EXEC','DEVELOPER_DIR','IPHONEOS_DEPLOYMENT_TARGET','MACOSX_DEPLOYMENT_TARGET') or key.startswith(('SWIFTPM_','PLAYPORT_')):env.pop(key)
+        def out(args):return subprocess.check_output(list(map(str,args)),env=env,text=True).strip()
+        developer=out(['xcode-select','-p']);env.update(DEVELOPER_DIR=developer,TMPDIR=str(root/'tmp'),LC_ALL='C')
+        swift=pathlib.Path(out(['xcrun','-f','swift']));version=out([swift,'--version'])
+        sdk=out(['xcrun','--sdk','iphoneos','--show-sdk-path']);sdkversion=out(['xcrun','--sdk','iphoneos','--show-sdk-version'])
+        assert out(['uname','-m'])=='arm64' and re.search(r'Swift version 6\.4\b',version)
+        assert tuple(map(int,sdkversion.split('.')[:2]))>=(27,0)
+        assert swift.is_absolute() and swift.is_file() and swift.resolve().is_relative_to(pathlib.Path(developer).resolve())
+        ld=out(['xcrun','--sdk','iphoneos','--find','ld'])
+        llvm=next((pathlib.Path('/opt/homebrew/opt')/name/'bin' for name in ('llvm@22','llvm@21','llvm@20','llvm')
+            if all((pathlib.Path('/opt/homebrew/opt')/name/'bin'/tool).is_file() for tool in ('llvm-nm','llvm-objdump'))),None)
+        assert llvm is not None,'Use existing native inspection tools; no global installation'
+        value=base64.b64decode('aW1wb3J0IGpzb24sb3Msc3RydWN0LHN5cwpmcm9tIHBhdGhsaWIgaW1wb3J0IFBhdGgKY2xhc3MgU3RvcChWYWx1ZUVycm9yKTpwYXNzCgpkZWYgcmVxdWlyZShvaywgbWVzc2FnZSk6DQogICAgaWYgbm90IG9rOg0KICAgICAgICByYWlzZSBTdG9wKG1lc3NhZ2UpCgpkZWYgbmV3X2RpcmVjdG9yeShwYXRoKToNCiAgICBwYXRoID0gUGF0aChwYXRoKS5hYnNvbHV0ZSgpDQogICAgcmVxdWlyZShub3QgYW55KHAuaXNfc3ltbGluaygpIGZvciBwIGluIChwYXRoLCAqcGF0aC5wYXJlbnRzKSksICdTeW1saW5rIG91dHB1dCBhbmNlc3RyeSByZWZ1c2VkJykNCiAgICByZXF1aXJlKG5vdCBwYXRoLmV4aXN0cygpLCAnT3V0cHV0IGFscmVhZHkgZXhpc3RzOyByZWZ1c2luZyBvdmVyd3JpdGUnKQ0KICAgIHJlcXVpcmUocGF0aC5wYXJlbnQuaXNfZGlyKCksICdPdXRwdXQgcGFyZW50IG11c3QgYWxyZWFkeSBleGlzdCcpDQogICAgcGF0aC5ta2RpcigpDQogICAgcmV0dXJuIHBhdGgucmVzb2x2ZSgpCgpkZWYgYnVpbGRlcl9wYWNrYWdlKHJlbGVhc2UpOg0KICAgICIiIlVwc3RyZWFtJ3Mgb25seSBzdHVicyBhcmUgZW1wdHkgQyBmaWxlczsgb3JpZ2luYWwgcHJvZHVjdHMgcHJvdmlkZSBlbnRyeSBjb2RlLiIiIg0KICAgIHBhdGggPSBqc29uLmR1bXBzKHN0cihyZWxlYXNlKSkNCiAgICByZXR1cm4gJycnLy8gc3dpZnQtdG9vbHMtdmVyc2lvbjogNi4wDQppbXBvcnQgUGFja2FnZURlc2NyaXB0aW9uDQpsZXQgcGFja2FnZSA9IFBhY2thZ2UoDQogICAgbmFtZTogIlBsYXlwb3J0LUJ1aWxkZXIiLA0KICAgIHBsYXRmb3JtczogWy5pT1MoIjI2LjAiKV0sDQogICAgZGVwZW5kZW5jaWVzOiBbLnBhY2thZ2UobmFtZTogIlJvb3RQYWNrYWdlIiwgcGF0aDogUk9PVF9QQVRIKV0sDQogICAgdGFyZ2V0czogWw0KICAgICAgICAuZXhlY3V0YWJsZVRhcmdldChuYW1lOiAiUGxheXBvcnQtQXBwIiwNCiAgICAgICAgICAgIGRlcGVuZGVuY2llczogWy5wcm9kdWN0KG5hbWU6ICJQbGF5cG9ydCIsIHBhY2thZ2U6ICJSb290UGFja2FnZSIpXSwNCiAgICAgICAgICAgIGxpbmtlclNldHRpbmdzOiBbLnVuc2FmZUZsYWdzKFsNCiAgICAgICAgICAgICAgICAiLVhsaW5rZXIiLCAiLXJwYXRoIiwgIi1YbGlua2VyIiwgIkBleGVjdXRhYmxlX3BhdGgvRnJhbWV3b3JrcyIsDQogICAgICAgICAgICAgICAgIi1YbGlua2VyIiwgIi1ub19hZGhvY19jb2Rlc2lnbiIsDQogICAgICAgICAgICBdKV0pLA0KICAgICAgICAuZXhlY3V0YWJsZVRhcmdldChuYW1lOiAiUGxheXBvcnRKSVQtRXh0ZW5zaW9uIiwNCiAgICAgICAgICAgIGRlcGVuZGVuY2llczogWy5wcm9kdWN0KG5hbWU6ICJQbGF5cG9ydEpJVCIsIHBhY2thZ2U6ICJSb290UGFja2FnZSIpXSwNCiAgICAgICAgICAgIGxpbmtlclNldHRpbmdzOiBbLmxpbmtlZEZyYW1ld29yaygiRm91bmRhdGlvbiIpLCAudW5zYWZlRmxhZ3MoWw0KICAgICAgICAgICAgICAgICItWGxpbmtlciIsICItZSIsICItWGxpbmtlciIsICJfTlNFeHRlbnNpb25NYWluIiwNCiAgICAgICAgICAgICAgICAiLVhsaW5rZXIiLCAiLXJwYXRoIiwgIi1YbGlua2VyIiwgIkBleGVjdXRhYmxlX3BhdGgvLi4vLi4vRnJhbWV3b3JrcyIsDQogICAgICAgICAgICAgICAgIi1YbGlua2VyIiwgIi1ycGF0aCIsICItWGxpbmtlciIsICJAZXhlY3V0YWJsZV9wYXRoL0ZyYW1ld29ya3MiLA0KICAgICAgICAgICAgICAgICItWGxpbmtlciIsICItbm9fYWRob2NfY29kZXNpZ24iLA0KICAgICAgICAgICAgXSldKSwNCiAgICBdDQopDQonJycucmVwbGFjZSgnUk9PVF9QQVRIJywgcGF0aCkKCmRlZiBuYXRpdmVfbGlua19hcmd1bWVudHMoYXJndW1lbnRzLCBzb3VyY2UpOg0KICAgICIiIk5hdGl2ZSBmb3JtIG9mIGZyb3plbiBidWlsZC9sZDY0L3N3aWZ0LWJ1aWxkJ3MgcGF0aC1vbmx5IGxpbmtlciBhZGFwdGVyLiIiIg0KICAgIHNvdXJjZSA9IFBhdGgoc291cmNlKS5yZXNvbHZlKCkNCiAgICByZXN1bHQsIGF0ID0gWyctb3NvX3ByZWZpeCcsIHN0cihzb3VyY2UpICsgJy8nXSwgMA0KICAgIHdoaWxlIGF0IDwgbGVuKGFyZ3VtZW50cyk6DQogICAgICAgIGFyZyA9IGFyZ3VtZW50c1thdF0NCiAgICAgICAgaWYgYXJnIGluICgnLXJwYXRoJywgJy1hZGRfYXN0X3BhdGgnKToNCiAgICAgICAgICAgIHJlcXVpcmUoYXQgKyAxIDwgbGVuKGFyZ3VtZW50cyksICdNaXNzaW5nIGxpbmtlciBwYXRoIGFyZ3VtZW50JykNCiAgICAgICAgICAgIHZhbHVlID0gYXJndW1lbnRzW2F0ICsgMV0NCiAgICAgICAgICAgIGluc2lkZSA9IFBhdGgodmFsdWUpLmlzX2Fic29sdXRlKCkgYW5kIFBhdGgodmFsdWUpLnJlc29sdmUoKS5pc19yZWxhdGl2ZV90byhzb3VyY2UpDQogICAgICAgICAgICBpZiBhcmcgPT0gJy1hZGRfYXN0X3BhdGgnIGFuZCBpbnNpZGU6DQogICAgICAgICAgICAgICAgcmVzdWx0ICs9IFthcmcsIFBhdGgodmFsdWUpLnJlc29sdmUoKS5yZWxhdGl2ZV90byhzb3VyY2UpLmFzX3Bvc2l4KCldDQogICAgICAgICAgICBlbGlmIGFyZyAhPSAnLXJwYXRoJyBvciBub3QgaW5zaWRlOg0KICAgICAgICAgICAgICAgIHJlc3VsdCArPSBbYXJnLCB2YWx1ZV0NCiAgICAgICAgICAgIGF0ICs9IDINCiAgICAgICAgZWxzZToNCiAgICAgICAgICAgIHJlc3VsdC5hcHBlbmQoYXJnKQ0KICAgICAgICAgICAgYXQgKz0gMQ0KICAgIHJldHVybiByZXN1bHQKCmRlZiBjcmVhdGVfbmF0aXZlX2xpbmtlcl9hZGFwdGVyKHdvcmssIHNvdXJjZSwgYXBwbGVfbGQpOg0KICAgIHJlcXVpcmUoUGF0aCh3b3JrKS5yZXNvbHZlKCkuaXNfcmVsYXRpdmVfdG8oUGF0aChzb3VyY2UpLnJlc29sdmUoKSksICdMaW5rZXIgZGVidWcgcGF0aCBtYXBwaW5nIHJlcXVpcmVzIG5lc3RlZCB3b3JrIHJvb3QnKQ0KICAgIGRpcmVjdG9yeSA9IG5ld19kaXJlY3Rvcnkod29yayAvICduYXRpdmUtbGlua2VyJykNCiAgICAjIEluY2x1ZGUgdGhlIHRlc3RlZCBwdXJlIGFyZ3VtZW50IHRyYW5zZm9ybWVyIHZlcmJhdGltLCBub3QgYW4gdW5jaGVja2VkDQogICAgIyBzaGVsbC1zdHJpbmcgcmVjb25zdHJ1Y3Rpb24uIEFwcGxlIGxkIHJlbWFpbnMgdGhlIGFjdHVhbCB0YXJnZXQgbGlua2VyLg0KICAgIGltcG9ydCBpbnNwZWN0DQogICAgcHJvZ3JhbSA9ICgnIyEnICsgc3lzLmV4ZWN1dGFibGUgKyAnXG5pbXBvcnQgb3MsIHN5c1xuZnJvbSBwYXRobGliIGltcG9ydCBQYXRoXG4nDQogICAgICAgICAgICAgICArICdkZWYgcmVxdWlyZShvaywgbWVzc2FnZSk6XG4gICAgaWYgbm90IG9rOiByYWlzZSBWYWx1ZUVycm9yKG1lc3NhZ2UpXG5cbicNCiAgICAgICAgICAgICAgICsgaW5zcGVjdC5nZXRzb3VyY2UobmF0aXZlX2xpbmtfYXJndW1lbnRzKSArICdcbicNCiAgICAgICAgICAgICAgICsgJ2FyZ3VtZW50cyA9IG5hdGl2ZV9saW5rX2FyZ3VtZW50cyhzeXMuYXJndlsxOl0sICcgKyByZXByKHN0cihzb3VyY2UpKSArICcpXG4nDQogICAgICAgICAgICAgICArICdvcy5leGVjdignICsgcmVwcihhcHBsZV9sZCkgKyAnLCBbJyArIHJlcHIoYXBwbGVfbGQpICsgJ10gKyBhcmd1bWVudHMpXG4nKQ0KICAgIHdyYXBwZXIgPSBkaXJlY3RvcnkgLyAnbGQnDQogICAgd3JhcHBlci53cml0ZV90ZXh0KHByb2dyYW0pDQogICAgd3JhcHBlci5jaG1vZCgwbzc1NSkNCiAgICB0b29sc2V0ID0gZGlyZWN0b3J5IC8gJ3Rvb2xzZXQuanNvbicNCiAgICB0b29sc2V0LndyaXRlX3RleHQoanNvbi5kdW1wcyh7J3NjaGVtYVZlcnNpb24nOiAnMS4wJywgJ3Jvb3RQYXRoJzogJy4nLCAnbGlua2VyJzogeydwYXRoJzogJ2xkJ319LCBpbmRlbnQ9MikgKyAnXG4nKQ0KICAgIHJldHVybiB0b29sc2V0CgpkZWYgbWFjaG8oZGF0YSk6DQogICAgIiIiQm91bmRlZCBsaXR0bGUtZW5kaWFuIEFSTTY0IE1hY2gtTyBtZXRhZGF0YSwgaW5jbHVkaW5nIHJlYWwgZW50cnkgbWFwcGluZy4iIiINCiAgICByZXF1aXJlKGxlbihkYXRhKSA+PSAzMiwgJ1RydW5jYXRlZCBNYWNoLU8gaGVhZGVyJykNCiAgICBtYWdpYywgY3B1LCBzdWIsIGtpbmQsIGNvdW50LCBjb21tYW5kX2J5dGVzLCBmbGFncywgcmVzZXJ2ZWQgPSBzdHJ1Y3QudW5wYWNrX2Zyb20oJzw4SScsIGRhdGEpDQogICAgcmVxdWlyZShtYWdpYyA9PSAweGZlZWRmYWNmIGFuZCBjcHUgPT0gMHgwMTAwMDAwYyBhbmQgc3ViICYgMHhmZmZmZmYgPT0gMCwNCiAgICAgICAgICAgICdFeHBlY3RlZCB0aGluIEFSTTY0LWFsbCBNYWNoLU8sIG5vdCBQRS9mYXQveDg2L0FSTTY0ZScpDQogICAgcmVxdWlyZShjb21tYW5kX2J5dGVzIDw9IGxlbihkYXRhKSAtIDMyIGFuZCBjb3VudCA8PSBjb21tYW5kX2J5dGVzIC8vIDgsICdJbnZhbGlkIGxvYWQtY29tbWFuZCBib3VuZHMnKQ0KICAgIHJlc3VsdCA9IHsndHlwZSc6IGtpbmQsICdmbGFncyc6IGZsYWdzLCAnZHlsaWJzJzogW10sICdycGF0aHMnOiBbXSwgJ3NpZ25hdHVyZVByZXNlbnQnOiBGYWxzZSwgJ3NlZ21lbnRzJzogW119DQogICAgb2ZmLCBlbmQgPSAzMiwgMzIgKyBjb21tYW5kX2J5dGVzDQogICAgZm9yIF8gaW4gcmFuZ2UoY291bnQpOg0KICAgICAgICByZXF1aXJlKG9mZiArIDggPD0gZW5kLCAnVHJ1bmNhdGVkIGxvYWQgY29tbWFuZCcpDQogICAgICAgIGNvbW1hbmQsIHNpemUgPSBzdHJ1Y3QudW5wYWNrX2Zyb20oJzxJSScsIGRhdGEsIG9mZikNCiAgICAgICAgcmVxdWlyZShzaXplID49IDggYW5kIHNpemUgJSA4ID09IDAgYW5kIG9mZiArIHNpemUgPD0gZW5kLCAnSW52YWxpZCBsb2FkLWNvbW1hbmQgc2l6ZScpDQogICAgICAgIGRlZiBzdHJpbmdfYXQocmVsYXRpdmUpOg0KICAgICAgICAgICAgcmVxdWlyZSg4IDw9IHJlbGF0aXZlIDwgc2l6ZSBhbmQgYidcMCcgaW4gZGF0YVtvZmYgKyByZWxhdGl2ZTpvZmYgKyBzaXplXSwgJ0ludmFsaWQgbG9hZC1jb21tYW5kIHN0cmluZycpDQogICAgICAgICAgICByZXR1cm4gZGF0YVtvZmYgKyByZWxhdGl2ZTpvZmYgKyBzaXplXS5zcGxpdChiJ1wwJywgMSlbMF0uZGVjb2RlKCd1dGYtOCcpDQogICAgICAgIGlmIGNvbW1hbmQgPT0gMHgzMjoNCiAgICAgICAgICAgIHJlcXVpcmUoc2l6ZSA+PSAyNCBhbmQgJ2J1aWxkJyBub3QgaW4gcmVzdWx0LCAnQmFkL2R1cGxpY2F0ZSBidWlsZC12ZXJzaW9uIGNvbW1hbmQnKQ0KICAgICAgICAgICAgcmVzdWx0WydidWlsZCddID0gc3RydWN0LnVucGFja19mcm9tKCc8SUlJJywgZGF0YSwgb2ZmICsgOCkNCiAgICAgICAgZWxpZiBjb21tYW5kIGluICgweGMsIDB4ODAwMDAwMTgsIDB4ODAwMDAwMWYsIDB4ODAwMDAwMjMsIDB4MjApOg0KICAgICAgICAgICAgcmVxdWlyZShzaXplID49IDI0LCAnVHJ1bmNhdGVkIGR5bGliIGNvbW1hbmQnKQ0KICAgICAgICAgICAgcmVzdWx0WydkeWxpYnMnXS5hcHBlbmQoc3RyaW5nX2F0KHN0cnVjdC51bnBhY2tfZnJvbSgnPEknLCBkYXRhLCBvZmYgKyA4KVswXSkpDQogICAgICAgIGVsaWYgY29tbWFuZCA9PSAweGQ6DQogICAgICAgICAgICByZXF1aXJlKHNpemUgPj0gMjQsICdUcnVuY2F0ZWQgaW5zdGFsbCBJRCcpDQogICAgICAgICAgICByZXN1bHRbJ2luc3RhbGxJRCddID0gc3RyaW5nX2F0KHN0cnVjdC51bnBhY2tfZnJvbSgnPEknLCBkYXRhLCBvZmYgKyA4KVswXSkNCiAgICAgICAgZWxpZiBjb21tYW5kID09IDB4ODAwMDAwMWM6DQogICAgICAgICAgICByZXF1aXJlKHNpemUgPj0gMTYsICdUcnVuY2F0ZWQgcnBhdGgnKQ0KICAgICAgICAgICAgcmVzdWx0WydycGF0aHMnXS5hcHBlbmQoc3RyaW5nX2F0KHN0cnVjdC51bnBhY2tfZnJvbSgnPEknLCBkYXRhLCBvZmYgKyA4KVswXSkpDQogICAgICAgIGVsaWYgY29tbWFuZCA9PSAweDFkOg0KICAgICAgICAgICAgcmVxdWlyZShzaXplID49IDE2LCAnVHJ1bmNhdGVkIHNpZ25hdHVyZSBjb21tYW5kJykNCiAgICAgICAgICAgIHNpZ29mZiwgc2lnc2l6ZSA9IHN0cnVjdC51bnBhY2tfZnJvbSgnPElJJywgZGF0YSwgb2ZmICsgOCkNCiAgICAgICAgICAgIHJlcXVpcmUoc2lnb2ZmIDw9IGxlbihkYXRhKSBhbmQgc2lnc2l6ZSA8PSBsZW4oZGF0YSkgLSBzaWdvZmYsICdTaWduYXR1cmUgb3V0c2lkZSBmaWxlJykNCiAgICAgICAgICAgIHJlc3VsdFsnc2lnbmF0dXJlUHJlc2VudCddID0gVHJ1ZQ0KICAgICAgICBlbGlmIGNvbW1hbmQgPT0gMHgyYzoNCiAgICAgICAgICAgIHJlcXVpcmUoc2l6ZSA+PSAyNCwgJ1RydW5jYXRlZCBlbmNyeXB0aW9uIGNvbW1hbmQnKQ0KICAgICAgICAgICAgcmVxdWlyZShzdHJ1Y3QudW5wYWNrX2Zyb20oJzxJJywgZGF0YSwgb2ZmICsgMTYpWzBdID09IDAsICdFbmNyeXB0ZWQgY29kZSByZWZ1c2VkJykNCiAgICAgICAgZWxpZiBjb21tYW5kID09IDB4MTk6DQogICAgICAgICAgICByZXF1aXJlKHNpemUgPj0gNzIsICdUcnVuY2F0ZWQgc2VnbWVudCcpDQogICAgICAgICAgICB2bWFkZHIsIHZtc2l6ZSwgZmlsZW9mZiwgZmlsZXNpemUgPSBzdHJ1Y3QudW5wYWNrX2Zyb20oJzw0UScsIGRhdGEsIG9mZiArIDI0KQ0KICAgICAgICAgICAgcmVxdWlyZShmaWxlb2ZmIDw9IGxlbihkYXRhKSBhbmQgZmlsZXNpemUgPD0gbGVuKGRhdGEpIC0gZmlsZW9mZiwgJ1NlZ21lbnQgb3V0c2lkZSBmaWxlJykNCiAgICAgICAgICAgIHJlc3VsdFsnc2VnbWVudHMnXS5hcHBlbmQoKHZtYWRkciwgdm1zaXplLCBmaWxlb2ZmLCBmaWxlc2l6ZSkpDQogICAgICAgIGVsaWYgY29tbWFuZCA9PSAweDgwMDAwMDI4Og0KICAgICAgICAgICAgcmVxdWlyZShzaXplID49IDI0IGFuZCAnZW50cnlPZmZzZXQnIG5vdCBpbiByZXN1bHQsICdJbnZhbGlkIGV4ZWN1dGFibGUgZW50cnkgY29tbWFuZCcpDQogICAgICAgICAgICByZXN1bHRbJ2VudHJ5T2Zmc2V0J10gPSBzdHJ1Y3QudW5wYWNrX2Zyb20oJzxRJywgZGF0YSwgb2ZmICsgOClbMF0NCiAgICAgICAgb2ZmICs9IHNpemUNCiAgICByZXF1aXJlKG9mZiA9PSBlbmQgYW5kICdidWlsZCcgaW4gcmVzdWx0LCAnTWlzc2luZy9pbnZhbGlkIGlPUyBidWlsZCB2ZXJzaW9uJykNCiAgICBwbGF0Zm9ybSwgbWluaW11bSwgc2RrID0gcmVzdWx0WydidWlsZCddDQogICAgcmVxdWlyZShwbGF0Zm9ybSA9PSAyIGFuZCBtaW5pbXVtID49IDE3IDw8IDE2IGFuZCBzZGsgPj0gbWluaW11bSwgJ0V4cGVjdGVkIGRldmljZSBpT1MgbWV0YWRhdGEsIG5vdCBzaW11bGF0b3IvTWFjJykNCiAgICByZXF1aXJlKGZsYWdzICYgMSwgJ01hY2gtTyBsYWNrcyBOT1VOREVGUycpDQogICAgaWYgJ2VudHJ5T2Zmc2V0JyBpbiByZXN1bHQ6DQogICAgICAgIG1hdGNoZXMgPSBbdm0gKyByZXN1bHRbJ2VudHJ5T2Zmc2V0J10gLSBmaWxlb2ZmIGZvciB2bSwgXywgZmlsZW9mZiwgbGVuZ3RoIGluIHJlc3VsdFsnc2VnbWVudHMnXQ0KICAgICAgICAgICAgICAgICAgIGlmIGZpbGVvZmYgPD0gcmVzdWx0WydlbnRyeU9mZnNldCddIDwgZmlsZW9mZiArIGxlbmd0aF0NCiAgICAgICAgcmVxdWlyZShsZW4obWF0Y2hlcykgPT0gMSwgJ0VudHJ5IHBvaW50IGRvZXMgbm90IG1hcCB0byBleGFjdGx5IG9uZSBmaWxlLWJhY2tlZCBzZWdtZW50JykNCiAgICAgICAgcmVzdWx0WydlbnRyeUFkZHJlc3MnXSA9IG1hdGNoZXNbMF0NCiAgICByZXR1cm4gcmVzdWx0Cg==',validate=True)
+        assert hashlib.sha256(value).hexdigest()=='b862d9fd4a193f74ba4c80e0d868852c910627cf4ab35db1d3aaee75d045f2f7'
+        ast.parse(value.decode());(root/'tools/builder-mechanics.py').write_bytes(value)
+        spec=importlib.util.spec_from_file_location('mechanics',root/'tools/builder-mechanics.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        record={'swift':str(swift),'swiftVersion':version,'developer':developer,'sdk':sdk,'sdkVersion':sdkversion,
+            'appleLd':ld,'llvm':str(llvm),'xcode':out(['xcodebuild','-version']),
+            'productionHelperSha256':'61c79373d446c8a1059831c6b197a35ee143627616f25b56255c233535568d83',
+            'extractedHelperSha256':'b862d9fd4a193f74ba4c80e0d868852c910627cf4ab35db1d3aaee75d045f2f7','scope':'Own-source CLI graph/toolset/main/helper entry mechanics only'}
+        (root/'toolchain.json').write_text(json.dumps(record,indent=2));print(json.dumps(record,indent=2))
+        fixtures=root/'fixtures';fixtures.mkdir();leaf=fixtures/'LocalLeaf';package=fixtures/'RootPackage'
+        for path in (leaf/'Sources/Leaf',package/'Sources/EntryMain',package/'Sources/EntryHelper',package/'Sources/EntryPoint/include'):path.mkdir(parents=True)
+        (leaf/'Package.swift').write_text('// swift-tools-version: 6.0\nimport PackageDescription\nlet package=Package(name:"LocalLeaf",platforms:[.iOS("26.0")],products:[.library(name:"LocalLeaf",targets:["Leaf"])],targets:[.target(name:"Leaf")])\n')
+        (leaf/'Sources/Leaf/Leaf.swift').write_text('public func fixtureText() -> String { "Own-source CLI entry smoke" }\n')
+        (package/'Package.swift').write_text('// swift-tools-version: 6.0\nimport PackageDescription\nlet package=Package(name:"RootPackage",platforms:[.iOS("26.0")],products:[.library(name:"Playport",targets:["EntryMain"]),.library(name:"PlayportJIT",targets:["EntryHelper","EntryPoint"])],dependencies:[.package(path:"../LocalLeaf")],targets:[.target(name:"EntryMain",dependencies:[.product(name:"LocalLeaf",package:"LocalLeaf")]),.target(name:"EntryHelper",linkerSettings:[.linkedFramework("Foundation"),.unsafeFlags(["-Xlinker","-ObjC"])]),.target(name:"EntryPoint",linkerSettings:[.linkedFramework("Foundation")])])\n')
+        (package/'Sources/EntryMain/Main.swift').write_text('import SwiftUI\nimport Leaf\n@main public struct EntrySmokeApp: App {\n public init() {}\n public var body: some Scene { WindowGroup { Text(fixtureText()) } }\n}\n')
+        (package/'Sources/EntryHelper/Principal.swift').write_text('import Foundation\n@objc(EntrySmokePrincipal) public final class EntrySmokePrincipal: NSObject {\n @objc public func smokeValue() -> Int32 { 64 }\n}\n')
+        (package/'Sources/EntryPoint/include/EntryPoint.h').write_text('int NSExtensionMain(int argc,char **argv);\n')
+        (package/'Sources/EntryPoint/entry.c').write_text('#include <dlfcn.h>\n__attribute__((used,visibility("default"))) int NSExtensionMain(int argc,char **argv) {\n int (*foundation_main)(int,char **)=(int (*)(int,char **))dlsym(RTLD_NEXT,"NSExtensionMain");\n return foundation_main(argc,argv);\n}\n')
+        (root/'work').mkdir();builder=root/'work/builder';builder.mkdir();(builder/'Package.swift').write_text(m.builder_package(package))
+        for target in ('Playport-App','PlayportJIT-Extension'):
+            path=builder/'Sources'/target;path.mkdir(parents=True);(path/'stub.c').write_bytes(b'')
+        toolset=m.create_native_linker_adapter(root/'work',root,ld);wrapper=toolset.parent/'ld';original=wrapper.read_text()
+        assert original.count('os.execv(')==1
+        # Record transformed arguments before the same real Apple ld exec; no argument/code-generation change.
+        audit="import json\nwith open("+repr(str(root/'linker-invocations.jsonl'))+",'a') as audit: audit.write(json.dumps(arguments)+'\\n')\nos.execv("
+        wrapper.write_text(original.replace('os.execv(',audit));wrapper.chmod(0o755)
+        (root/'linker-observer.json').write_text(json.dumps({'unobservedSha256':hashlib.sha256(original.encode()).hexdigest(),
+            'observedSha256':hashlib.sha256(wrapper.read_bytes()).hexdigest(),'originalExecCount':1,'argumentsChangedByObservation':False},indent=2))
+        inventory={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for parent in (fixtures,builder,root/'tools',root/'work/native-linker') for p in parent.rglob('*') if p.is_file()}
+        (root/'fixture-inventory.json').write_text(json.dumps(inventory,indent=2))
+        PY
+    - name: Embed frozen strict import checker without acquisition
+      id: checker
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import base64,hashlib,pathlib
+        root=pathlib.Path('.work/swiftpm-ios-entry').resolve()
+        value=base64.b64decode('IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwojIFNQRFgtTGljZW5zZS1JZGVudGlmaWVyOiBHUEwtMy4wLW9yLWxhdGVyCiIiIkNoZWNrIGEgTWFjaC1PIGR5bGliIGJ1aWx0IGZvciBpT1Mgd2l0aG91dCBydW5uaW5nIGl0IChidWlsZC9zdGFnZXMvbWVzYS5zaCkuCgogICAgY2hlY2stbWFjaG8taW1wb3J0cy5weSAtLXNkayBTREsgWy0tcGxhdGZvcm0gaW9zXSBbLS1taW5vcyAyNi4wXQogICAgICAgICAgICAgICAgICAgICAgICAgICBbLS1leHBvcnRzIFNZTSxTWU1dIFstLXdpdGggTElCXS4uLiBEWUxJQgoKLSBMQ19CVUlMRF9WRVJTSU9OIG5hbWVzIFBMQVRGT1JNIGFuZCBNSU5PUywgYW5kIHRoZSBmaWxlIGlzIGFybTY0IG9ubHk7Ci0gZXZlcnkgbm9uLXdlYWsgdW5kZWZpbmVkIHN5bWJvbCBpcyBleHBvcnRlZCwgZm9yIGFybTY0IG9uIFBMQVRGT1JNLCBieSB0aGUKICBTREsgLnRiZCBzdHViIG9mIGEgbGlicmFyeSB0aGUgZHlsaWIgbGlua3MgKGZvbGxvd2luZyByZS1leHBvcnRzKS4gTGlicmFyaWVzCiAgbGlua2VkIHRocm91Z2ggQHJwYXRoIGFyZSBub3QgaW4gdGhlIFNESyBhbmQgYXJlIHJlcG9ydGVkLCBub3QgcmVzb2x2ZWQsCiAgdW5sZXNzIGEgLS13aXRoIExJQiBidWlsdCBiZXNpZGUgaXQgaGFzIHRoYXQgaW5zdGFsbCBuYW1lOiB0aGVuIExJQidzCiAgZXhwb3J0ZWQgc3ltYm9scyByZXNvbHZlIHRoZSBpbXBvcnRzIChNZXNhRUdMIGxpbmtzIE1lc2FHYWxsaXVtKTsKLSBlYWNoIG9mIEVYUE9SVFMgaXMgYW4gZXhwb3J0ZWQgc3ltYm9sIG9mIHRoZSBkeWxpYjsKLSB0aGUgZmlsZSBuYW1lcyBuZWl0aGVyIHRoZSByZXBvc2l0b3J5IG5vciAkSE9NRS4KCkEgZHJpdmVyIGxpbmtlZCB3aXRoIC11bmRlZmluZWQgZHluYW1pY19sb29rdXAgYnVpbGRzIGFnYWluc3QgYW55IHN5bWJvbDsgdGhpcwppcyB3aGF0IGZpbmRzLCBvbiB0aGUgd29ya3N0YXRpb24sIHRoZSBvbmVzIGR5bGQgd291bGQgcmVmdXNlIG9uIHRoZSBwaG9uZS4KRXhpdCBzdGF0dXMgMSBvbiBhbnkgZmFpbHVyZSwgd2l0aCBvbmUgbGluZSBwZXIgcHJvYmxlbS4KIiIiCmltcG9ydCBhcmdwYXJzZQppbXBvcnQgb3MKaW1wb3J0IHJlCmltcG9ydCBzdWJwcm9jZXNzCmltcG9ydCBzeXMKClBMQVRGT1JNX0lEID0geyJtYWNvcyI6IDEsICJpb3MiOiAyfQoKCmRlZiBydW4oKmNtZCk6CiAgICByZXR1cm4gc3VicHJvY2Vzcy5ydW4oY21kLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUsIGNoZWNrPVRydWUpLnN0ZG91dAoKCmRlZiB0YmRfcGF0aChzZGssIGluc3RhbGxfbmFtZSk6CiAgICBiYXNlID0gb3MucGF0aC5qb2luKHNkaywgaW5zdGFsbF9uYW1lLmxzdHJpcCgiLyIpKQogICAgZm9yIGNhbmQgaW4gKGJhc2UgKyAiLnRiZCIsIHJlLnN1YihyIlwuZHlsaWIkIiwgIi50YmQiLCBiYXNlKSk6CiAgICAgICAgaWYgb3MucGF0aC5pc2ZpbGUoY2FuZCk6CiAgICAgICAgICAgIHJldHVybiBjYW5kCiAgICByZXR1cm4gTm9uZQoKCmRlZiB0YmRfZXhwb3J0cyhzZGssIHBhdGgsIHBsYXRmb3JtLCBzZWVuKToKICAgICIiIlN5bWJvbHMgYSAudGJkIGV4cG9ydHMgZm9yIGFybTY0IG9uIFBMQVRGT1JNLCB3aXRoIGl0cyByZS1leHBvcnRlZCBsaWJyYXJpZXMnLiIiIgogICAgc3ltcywgcmVleHBvcnRzID0gc2V0KCksIFtdCiAgICB0ZXh0ID0gb3BlbihwYXRoLCBlbmNvZGluZz0idXRmLTgiLCBlcnJvcnM9InJlcGxhY2UiKS5yZWFkKCkKICAgIGZvciBibG9jayBpbiByZS5maW5kaXRlcihyIi0gdGFyZ2V0czpccypcWyhbXlxdXSopXF1ccypcbigoPzpbIFx0XXs0LH0uKlxuPykqKSIsIHRleHQpOgogICAgICAgIHRhcmdldHMgPSBbdC5zdHJpcCgpIGZvciB0IGluIGJsb2NrLmdyb3VwKDEpLnNwbGl0KCIsIildCiAgICAgICAgaWYgbm90IGFueSh0IGluIChmImFybTY0LXtwbGF0Zm9ybX0iLCBmImFybTY0ZS17cGxhdGZvcm19IikgZm9yIHQgaW4gdGFyZ2V0cyk6CiAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgZm9yIGtpbmQsIGl0ZW1zIGluIHJlLmZpbmRhbGwoCiAgICAgICAgICAgICAgICByIihzeW1ib2xzfG9iamMtY2xhc3Nlc3xvYmpjLWVoLXR5cGVzfG9iamMtaXZhcnN8d2Vhay1zeW1ib2xzfHRocmVhZC1sb2NhbC1zeW1ib2xzfGxpYnJhcmllcyk6XHMqXFsoW15cXV0qKVxdIiwKICAgICAgICAgICAgICAgIGJsb2NrLmdyb3VwKDIpLCByZS5TKToKICAgICAgICAgICAgbmFtZXMgPSBbeC5zdHJpcCgpLnN0cmlwKCInXCIiKSBmb3IgeCBpbiBpdGVtcy5zcGxpdCgiLCIpIGlmIHguc3RyaXAoKV0KICAgICAgICAgICAgaWYga2luZCA9PSAibGlicmFyaWVzIjoKICAgICAgICAgICAgICAgIHJlZXhwb3J0cyArPSBuYW1lcwogICAgICAgICAgICBlbGlmIGtpbmQgPT0gIm9iamMtY2xhc3NlcyI6CiAgICAgICAgICAgICAgICBmb3IgYyBpbiBuYW1lczoKICAgICAgICAgICAgICAgICAgICBzeW1zIHw9IHsiX09CSkNfQ0xBU1NfJF8iICsgYywgIl9PQkpDX01FVEFDTEFTU18kXyIgKyBjfQogICAgICAgICAgICBlbGlmIGtpbmQgPT0gIm9iamMtZWgtdHlwZXMiOgogICAgICAgICAgICAgICAgc3ltcyB8PSB7Il9PQkpDX0VIVFlQRV8kXyIgKyBjIGZvciBjIGluIG5hbWVzfQogICAgICAgICAgICBlbGlmIGtpbmQgPT0gIm9iamMtaXZhcnMiOgogICAgICAgICAgICAgICAgc3ltcyB8PSB7Il9PQkpDX0lWQVJfJF8iICsgYyBmb3IgYyBpbiBuYW1lc30KICAgICAgICAgICAgZWxzZToKICAgICAgICAgICAgICAgIHN5bXMgfD0gc2V0KG5hbWVzKQogICAgZm9yIGxpYiBpbiByZWV4cG9ydHM6CiAgICAgICAgaWYgbGliIG5vdCBpbiBzZWVuOgogICAgICAgICAgICBzZWVuLmFkZChsaWIpCiAgICAgICAgICAgIHQgPSB0YmRfcGF0aChzZGssIGxpYikKICAgICAgICAgICAgaWYgdDoKICAgICAgICAgICAgICAgIHN5bXMgfD0gdGJkX2V4cG9ydHMoc2RrLCB0LCBwbGF0Zm9ybSwgc2VlbikKICAgIHJldHVybiBzeW1zCgoKZGVmIG1haW4oKToKICAgIGFwID0gYXJncGFyc2UuQXJndW1lbnRQYXJzZXIoZGVzY3JpcHRpb249X19kb2NfXy5zcGxpdCgiXG4iKVswXSkKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1zZGsiLCByZXF1aXJlZD1UcnVlKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXBsYXRmb3JtIiwgZGVmYXVsdD0iaW9zIiwgY2hvaWNlcz1zb3J0ZWQoUExBVEZPUk1fSUQpKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLW1pbm9zIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1leHBvcnRzIiwgZGVmYXVsdD0iIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS13aXRoIiwgZGVzdD0id2l0aF9saWJzIiwgYWN0aW9uPSJhcHBlbmQiLCBkZWZhdWx0PVtdLAogICAgICAgICAgICAgICAgICAgIGhlbHA9ImEgZHlsaWIgbGlua2VkIHRocm91Z2ggQHJwYXRoLCByZXNvbHZlZCBieSBpdHMgZXhwb3J0cyIpCiAgICBhcC5hZGRfYXJndW1lbnQoImR5bGliIikKICAgIGEgPSBhcC5wYXJzZV9hcmdzKCkKICAgIGJhZCA9IFtdCgogICAgYXJjaHMgPSBydW4oImxsdm0tb2JqZHVtcCIsICItLW1hY2hvIiwgIi0tYXJjaGl2ZS1oZWFkZXJzIiwgIi0tdW5pdmVyc2FsLWhlYWRlcnMiLCBhLmR5bGliKQogICAgaGVhZHMgPSBydW4oImxsdm0tb2JqZHVtcCIsICItLW1hY2hvIiwgIi0tcHJpdmF0ZS1oZWFkZXJzIiwgYS5keWxpYikKICAgIGlmICJBUk02NCIgbm90IGluIGhlYWRzIG9yICJmYXRfbWFnaWMiIGluIGFyY2hzLmxvd2VyKCk6CiAgICAgICAgYmFkLmFwcGVuZCgibm90IGEgdGhpbiBhcm02NCBNYWNoLU8iKQogICAgYnYgPSByZS5zZWFyY2gociJjbWQgTENfQlVJTERfVkVSU0lPTi4qP3BsYXRmb3JtIChcUyspLio/bWlub3MgKFxTKykiLCBoZWFkcywgcmUuUykKICAgIGlmIG5vdCBidjoKICAgICAgICBiYWQuYXBwZW5kKCJubyBMQ19CVUlMRF9WRVJTSU9OIikKICAgIGVsc2U6CiAgICAgICAgcGxhdCwgbWlub3MgPSBidi5ncm91cCgxKSwgYnYuZ3JvdXAoMikKICAgICAgICBpZiBwbGF0IG5vdCBpbiAoc3RyKFBMQVRGT1JNX0lEW2EucGxhdGZvcm1dKSwgYS5wbGF0Zm9ybSwgYS5wbGF0Zm9ybS51cHBlcigpLCAiSU9TIiBpZiBhLnBsYXRmb3JtID09ICJpb3MiIGVsc2UgIk1BQ09TIik6CiAgICAgICAgICAgIGJhZC5hcHBlbmQoZiJMQ19CVUlMRF9WRVJTSU9OIHBsYXRmb3JtIHtwbGF0fSwgd2FudCB7YS5wbGF0Zm9ybX0iKQogICAgICAgIGlmIGEubWlub3MgYW5kIG1pbm9zICE9IGEubWlub3M6CiAgICAgICAgICAgIGJhZC5hcHBlbmQoZiJMQ19CVUlMRF9WRVJTSU9OIG1pbm9zIHttaW5vc30sIHdhbnQge2EubWlub3N9IikKCiAgICBsaWJzID0gW2wuc3RyaXAoKS5zcGxpdCgiICgiKVswXSBmb3IgbCBpbiBydW4oImxsdm0tb2JqZHVtcCIsICItLW1hY2hvIiwgIi0tZHlsaWJzLXVzZWQiLCBhLmR5bGliKS5zcGxpdGxpbmVzKClbMTpdXQogICAgc2VsZl9pZCA9IGxpYnMucG9wKDApIGlmIGxpYnMgYW5kIGxpYnNbMF0uc3RhcnRzd2l0aCgiQHJwYXRoLyIpIGFuZCBvcy5wYXRoLmJhc2VuYW1lKGEuZHlsaWIpIGluIGxpYnNbMF0gZWxzZSBOb25lCiAgICBiZXNpZGUgPSB7fQogICAgZm9yIHcgaW4gYS53aXRoX2xpYnM6CiAgICAgICAgaWRzID0gcnVuKCJsbHZtLW9iamR1bXAiLCAiLS1tYWNobyIsICItLWR5bGliLWlkIiwgdykuc3BsaXRsaW5lcygpWzE6XQogICAgICAgIGlmIGlkczoKICAgICAgICAgICAgYmVzaWRlW2lkc1swXS5zdHJpcCgpXSA9IHcKICAgIGV4cG9ydGVkID0gc2V0KCkKICAgIGZvciBsaWIgaW4gbGliczoKICAgICAgICBpZiBsaWIgaW4gYmVzaWRlOgogICAgICAgICAgICBleHBvcnRlZCB8PSBzZXQocnVuKCJsbHZtLW5tIiwgIi1nIiwgIi0tZGVmaW5lZC1vbmx5IiwgIi1qIiwgYmVzaWRlW2xpYl0pLnNwbGl0KCkpCiAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgaWYgbGliLnN0YXJ0c3dpdGgoIkAiKToKICAgICAgICAgICAgYmFkLmFwcGVuZChmImxpbmtzIHtsaWJ9LCB3aGljaCBpcyBub3QgaW4gdGhlIFNESyIpCiAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgdCA9IHRiZF9wYXRoKGEuc2RrLCBsaWIpCiAgICAgICAgaWYgbm90IHQ6CiAgICAgICAgICAgIGJhZC5hcHBlbmQoZiJsaW5rcyB7bGlifSwgd2hpY2ggdGhlIFNESyBkb2VzIG5vdCBoYXZlIikKICAgICAgICAgICAgY29udGludWUKICAgICAgICBleHBvcnRlZCB8PSB0YmRfZXhwb3J0cyhhLnNkaywgdCwgYS5wbGF0Zm9ybSwge2xpYn0pCgogICAgdW5yZXNvbHZlZCA9IFtdCiAgICBmb3IgbGluZSBpbiBydW4oImxsdm0tbm0iLCAiLXUiLCAiLW0iLCBhLmR5bGliKS5zcGxpdGxpbmVzKCk6CiAgICAgICAgdG9rcyA9IGxpbmUuc3BsaXQoKQogICAgICAgIGlmICJleHRlcm5hbCIgbm90IGluIHRva3Mgb3IgIndlYWsiIGluIHRva3M6CiAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgbmFtZSA9IHRva3NbdG9rcy5pbmRleCgiZXh0ZXJuYWwiKSArIDFdCiAgICAgICAgaWYgbmFtZSBub3QgaW4gZXhwb3J0ZWQ6CiAgICAgICAgICAgIHVucmVzb2x2ZWQuYXBwZW5kKG5hbWUpCiAgICBiYWQgKz0gW2YiaW1wb3J0cyB7bn0sIHdoaWNoIG5vIGxpbmtlZCBsaWJyYXJ5IGV4cG9ydHMgZm9yIHthLnBsYXRmb3JtfSIgZm9yIG4gaW4gdW5yZXNvbHZlZF0KCiAgICBkZWZpbmVkID0gc2V0KHJ1bigibGx2bS1ubSIsICItZyIsICItLWRlZmluZWQtb25seSIsICItaiIsIGEuZHlsaWIpLnNwbGl0KCkpCiAgICBmb3Igc3ltIGluIGZpbHRlcihOb25lLCBhLmV4cG9ydHMuc3BsaXQoIiwiKSk6CiAgICAgICAgaWYgIl8iICsgc3ltIG5vdCBpbiBkZWZpbmVkOgogICAgICAgICAgICBiYWQuYXBwZW5kKGYiZG9lcyBub3QgZXhwb3J0IHtzeW19IikKCiAgICBibG9iID0gb3BlbihhLmR5bGliLCAicmIiKS5yZWFkKCkKICAgIHJlcG8gPSBvcy5wYXRoLnJlYWxwYXRoKG9zLnBhdGguam9pbihvcy5wYXRoLmRpcm5hbWUoX19maWxlX18pLCAiLi4iKSkKICAgIGZvciBwIGluIHtyZXBvLCBvcy5wYXRoLmV4cGFuZHVzZXIoIn4iKX06CiAgICAgICAgaWYgcCBhbmQgcCAhPSAiLyIgYW5kIHAuZW5jb2RlKCkgaW4gYmxvYjoKICAgICAgICAgICAgYmFkLmFwcGVuZChmIm5hbWVzIHRoZSBwYXRoIHtwfSIpCgogICAgZm9yIGIgaW4gYmFkOgogICAgICAgIHByaW50KGYie2EuZHlsaWJ9OiB7Yn0iLCBmaWxlPXN5cy5zdGRlcnIpCiAgICBpZiBiYWQ6CiAgICAgICAgcmV0dXJuIDEKICAgIHByaW50KGYie29zLnBhdGguYmFzZW5hbWUoYS5keWxpYil9OiB7YS5wbGF0Zm9ybX0gYXJtNjQsIHtsZW4obGlicyl9IGxpYnJhcmllcywgIgogICAgICAgICAgZiJldmVyeSBpbXBvcnQgcmVzb2x2ZWR7JywgZXhwb3J0cyAnICsgYS5leHBvcnRzIGlmIGEuZXhwb3J0cyBlbHNlICcnfSIpCiAgICByZXR1cm4gMAoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICBzeXMuZXhpdChtYWluKCkpCg==',validate=True)
+        assert hashlib.sha256(value).hexdigest()=='cd155383b94a75c30876f420d27383b365503b772743540372729baf2bf032b4'
+        path=root/'tools/check-macho-imports.py'
+        assert not path.exists()
+        path.write_bytes(value)
+        PY
+    - name: Exercise graph CLI then real iPhone SwiftPM toolset cross-build
+      id: build
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import hashlib,json,os,pathlib,subprocess
+        root=pathlib.Path('.work/swiftpm-ios-entry').resolve();t=json.loads((root/'toolchain.json').read_text())
+        env=dict(os.environ)
+        for key in tuple(env):
+            if key in ('SDKROOT','SDK_NAME','SDK_VERSION','TOOLCHAINS','SWIFT_EXEC','DEVELOPER_DIR','IPHONEOS_DEPLOYMENT_TARGET','MACOSX_DEPLOYMENT_TARGET') or key.startswith(('SWIFTPM_','PLAYPORT_')):env.pop(key)
+        env.update(DEVELOPER_DIR=t['developer'],TMPDIR=str(root/'tmp'),LC_ALL='C',PLAYPORT_VARIANT='release')
+        env['PATH']=t['llvm']+os.pathsep+env.get('PATH','');swift=t['swift'];release=root/'fixtures/RootPackage';commands=[]
+        def run(args,check=True):
+            args=list(map(str,args));log=root/('command-'+str(len(commands)).zfill(2)+'.log')
+            print('COMMAND',json.dumps(args),flush=True)
+            with log.open('w') as output:result=subprocess.run(args,cwd=root/'work',env=env,stdout=output,stderr=subprocess.STDOUT)
+            text=log.read_text();print(text,flush=True)
+            commands.append({'arguments':args,'returncode':result.returncode,'log':log.name,'sha256':hashlib.sha256(log.read_bytes()).hexdigest()})
+            if check:assert result.returncode==0,'Exact CLI command failed: '+json.dumps(args)
+            return result.returncode,text
+        def package_args(path):
+            return [swift,'package','--configuration','release','--build-system','native','--swift-sdk','arm64-apple-ios',
+                '--package-path',str(path),'--cache-path',str(root/'work/swiftpm-cache'),'--config-path',str(root/'work/swiftpm-config'),
+                '--scratch-path',str(root/'work/package-scratch'/path.name)]
+        run(package_args(release)+['resolve'])
+        graph=root/'dependencies.json';run(package_args(release)+['-q','show-dependencies','--format','json','-o',str(graph)])
+        dependencies=json.loads(graph.read_text());descriptions={};paths={}
+        def visit(row):
+            identity=row['identity'];path=pathlib.Path(row['path']).resolve()
+            assert path.is_relative_to(root/'fixtures') and path.is_dir()
+            if identity in paths:assert paths[identity]==str(path);return
+            paths[identity]=str(path)
+            _,text=run(package_args(path)+['-q','describe','--type','json'])
+            descriptions[identity]=json.loads(text[text.index('{'):])
+            for child in row.get('dependencies',[]):visit(child)
+        visit(dependencies)
+        assert len(paths)==2 and set(pathlib.Path(p).name for p in paths.values())=={'RootPackage','LocalLeaf'}
+        products={p['name']:p for p in descriptions[dependencies['identity']]['products']}
+        assert set(products)=={'Playport','PlayportJIT'} and all(p['type']=={'library':['automatic']} for p in products.values())
+        args=[swift,'build','--configuration','release','--build-system','native','--swift-sdk','arm64-apple-ios',
+            '--package-path',str(root/'work/builder'),'--scratch-path',str(root/'work/scratch'),'--disable-automatic-resolution',
+            '--cache-path',str(root/'work/swiftpm-cache'),'--config-path',str(root/'work/swiftpm-config'),'--toolset',str(root/'work/native-linker/toolset.json')]
+        for original,replacement in ((str(root),'playport-source'),(str(root/'work'),'playport-builder')):
+            args+=['-Xswiftc','-debug-prefix-map','-Xswiftc',original+'='+replacement,'-Xswiftc','-file-prefix-map','-Xswiftc',original+'='+replacement,
+                '-Xcc','-ffile-prefix-map='+original+'='+replacement,'-Xcc','-fdebug-prefix-map='+original+'='+replacement]
+        # First test production sequence unchanged: only the library root was resolved.
+        status,text=run(args,check=False);needed=False
+        if status:
+            assert ('automatic dependency resolution is disabled' in text and ('resolved file is required' in text or 'out-of-date resolved file' in text)),text
+            needed=True
+            run(package_args(root/'work/builder')+['resolve'])
+            run(args)
+        _,output=run(args+['--show-bin-path']);bin_dir=pathlib.Path(output.strip()).resolve(strict=True)
+        assert bin_dir.is_relative_to(root/'work/scratch')
+        (root/'build-result.json').write_text(json.dumps({'commands':commands,'graph':dependencies,'descriptions':descriptions,
+            'binDirectory':str(bin_dir),'buildCommand':args,'productionSequencePassedWithoutBuilderResolve':not needed,
+            'builderResolveRequired':needed,'actualCompileLinkPassed':True,'targetExecuted':False,'fullPlayportCompiled':False},indent=2))
+        print('Actual builder resolution required:',needed)
+        PY
+    - name: Inspect actual unsigned iOS ARM64 entry points and SDK imports
+      id: inspect
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import hashlib,importlib.util,json,os,pathlib,re,subprocess
+        root=pathlib.Path('.work/swiftpm-ios-entry').resolve();t=json.loads((root/'toolchain.json').read_text())
+        record=json.loads((root/'build-result.json').read_text());assert record['actualCompileLinkPassed'] is True
+        helper=root/'tools/builder-mechanics.py';assert hashlib.sha256(helper.read_bytes()).hexdigest()==t['extractedHelperSha256']
+        spec=importlib.util.spec_from_file_location('mechanics',helper);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        env=dict(os.environ,DEVELOPER_DIR=t['developer'],TMPDIR=str(root/'tmp'),LC_ALL='C');env['PATH']=t['llvm']+os.pathsep+env.get('PATH','')
+        invocations=[json.loads(line) for line in (root/'linker-invocations.jsonl').read_text().splitlines()]
+        assert len(invocations)>=2,'Toolset did not invoke the exact native linker adapter for both executables'
+        for args in invocations:
+            assert args[:2]==['-oso_prefix',str(root)+'/']
+            assert '-no_adhoc_codesign' in args and '-platform_version' in args
+            position=args.index('-platform_version');assert args[position+1]=='ios'
+            for index,arg in enumerate(args[:-1]):
+                if arg in ('-rpath','-add_ast_path'):assert not (pathlib.Path(args[index+1]).is_absolute() and pathlib.Path(args[index+1]).resolve().is_relative_to(root))
+        binary_directory=pathlib.Path(record['binDirectory']);proof={}
+        for product,entry,required in [('Playport-App','_main',{'@executable_path/Frameworks'}),
+            ('PlayportJIT-Extension','_NSExtensionMain',{'@executable_path/Frameworks','@executable_path/../../Frameworks'})]:
+            path=binary_directory/product;data=path.read_bytes();metadata=m.macho(data)
+            assert metadata['type']==2 and metadata['build'][1]==26<<16 and metadata['signaturePresent'] is False
+            assert required<=set(metadata['rpaths'])<=required|{'/usr/lib/swift'}
+            assert all(name.startswith(('/System/Library/','/usr/lib/')) for name in metadata['dylibs'])
+            text=subprocess.check_output([str(pathlib.Path(t['llvm'])/'llvm-nm'),'--defined-only','-n',str(path)],env=env,text=True)
+            names={p[2]:int(p[0],16) for line in text.splitlines() if len(p:=line.split())==3}
+            assert entry in names and metadata['entryAddress']==names[entry]
+            if product=='PlayportJIT-Extension':
+                objc=subprocess.check_output([str(pathlib.Path(t['llvm'])/'llvm-objdump'),'--macho','--objc-meta-data',str(path)],env=env,text=True)
+                assert 'EntrySmokePrincipal' in objc
+            for prefix in (str(root),str(pathlib.Path.cwd()),str(pathlib.Path.home())):assert prefix.encode() not in data,('Fresh-output path',product,prefix)
+            checker=root/'tools/check-macho-imports.py';assert hashlib.sha256(checker.read_bytes()).hexdigest()=='cd155383b94a75c30876f420d27383b365503b772743540372729baf2bf032b4'
+            subprocess.run(['python3',str(checker),'--sdk',t['sdk'],'--platform','ios','--minos','26.0',str(path)],env=env,check=True)
+            proof[product]={'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),'metadata':metadata,
+                'entry':entry,'entryAddress':names[entry],'sdkImportsPassed':True,'executed':False}
+        result={'scope':'Own-source frontend/local graph/linker-toolset/entry mechanics only; not full Playport app or runtime closure',
+            'productionHelperSha256':t['productionHelperSha256'],'extractedHelperSha256':t['extractedHelperSha256'],
+            'linkerObserver':json.loads((root/'linker-observer.json').read_text()),'actualLinkerInvocations':invocations,
+            'productionSequencePassedWithoutBuilderResolve':record['productionSequencePassedWithoutBuilderResolve'],
+            'builderResolveRequired':record['builderResolveRequired'],'actualSwiftPMCrossCompileLinkPassed':True,'binaries':proof,
+            'fullPlayportCompiled':False,'artifactsUploaded':False,'targetExecuted':False,'signerInvoked':False,'deviceAccessed':False,'gameFilesSupplied':False}
+        (root/'entry-proof.json').write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))
+        PY
+    - name: Record honest bounded frontend mechanics outcomes
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        printf '%s\n' 'Own-source frontend/entry smoke: prepare ${{ steps.prepare.outcome }}; checker ${{ steps.checker.outcome }}; cross-build ${{ steps.build.outcome }}; audit ${{ steps.inspect.outcome }}.' 'No full Playport runtime/app compile claim, target execution, signing, account/game/phone input, SDK export or artifact/cache upload. Next: review actual builderResolveRequired and toolset/entry proof before modifying production or starting the full build. No new thread required.' >> "$GITHUB_STEP_SUMMARY"
