@@ -1,0 +1,612 @@
+name: CoD matched media Rust and JIT source probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-cod-media-jit-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-cod-media-jit-probe
+  cancel-in-progress: false
+
+jobs:
+  media-jit-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: "Check out the frozen Playport source"
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          repository: "playportdev/playport"
+          ref: "412de5f8c0bdd26d84e0127eb5776ba992e3b152"
+          persist-credentials: "false"
+          submodules: "false"
+          path: "source"
+      - name: "Prepare native and iPhone build tools"
+        id: "tools"
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install bash bison flex gettext coreutils gnu-sed llvm@22
+          cd source
+          mkdir -p .work/cod-media-jit/tmp
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          "$(brew --prefix bash)/bin/bash" --version | head -n 1
+          "$(brew --prefix bash)/bin/bash" -c 'test "${BASH_VERSINFO[0]}" -ge 5'
+          xcodebuild -version
+          xcrun --sdk iphoneos swiftc --version
+          python3 - <<'PY'
+          import json, pathlib, re, subprocess
+          root = pathlib.Path('.work/cod-media-jit').resolve()
+          def out(*args):
+              return subprocess.check_output(args, text=True).strip()
+          assert out('uname', '-m') == 'arm64'
+          sdk = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-path')
+          version = out('xcrun', '--sdk', 'iphoneos', '--show-sdk-version')
+          assert tuple(map(int, version.split('.')[:2])) >= (26, 0)
+          swift = out('xcrun', '--sdk', 'iphoneos', 'swiftc', '--version')
+          match = re.search(r'Swift version (\d+)\.(\d+)', swift)
+          assert match and tuple(map(int, match.groups())) >= (6, 4), swift
+          tools = {name: out('xcrun', '--sdk', 'iphoneos', '--find', name)
+                   for name in ('clang', 'clang++', 'ar', 'ld', 'swiftc')}
+          record = {'sdk': sdk, 'version': version, 'macsdk': out('xcrun', '--sdk', 'macosx', '--show-sdk-path'),
+                    'developer': out('xcode-select', '-p'), 'ios': tools,
+                    'macclang': out('xcrun', '--sdk', 'macosx', '--find', 'clang'),
+                    'macld': out('xcrun', '--sdk', 'macosx', '--find', 'ld'),
+                    'llvm': out('brew', '--prefix', 'llvm@22'), 'bash': out('brew', '--prefix', 'bash') + '/bin/bash'}
+          assert all(not re.search(r'\s', value) for value in [sdk, record['macsdk'], record['macld'], str(root)]), 'Recipe flags require whitespace-free runner tool paths'
+          (root / 'tools.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record, indent=2))
+          subprocess.run([record['macclang'], '-isysroot', record['macsdk'], '-fuse-ld=' + record['macld'],
+                          '-x', 'c', '-', '-o', str(root / 'host-link-probe')],
+                         input='int main(void) { return 0; }\n', text=True, check=True)
+          subprocess.run([tools['clang'], '-target', 'arm64-apple-ios26.0', '-isysroot', sdk,
+                          '-x', 'c', '-', '-c', '-o', str(root / 'ios-compile-probe.o')],
+                         input='int component_probe(void) { return 0; }\n', text=True, check=True)
+          PY
+      - name: "Prepare frozen matching Madeira and Unix Wine histories"
+        id: "sources"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          mkdir -p "$TMPDIR"
+          python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess
+          repo = pathlib.Path.cwd()
+          root = repo / '.work/cod-media-jit'
+          expected = {
+              'madeira': ('8c050d03f4d89096e1e2e2c8bb44479fffd86619', 'https://github.com/willfaust/Madeira.git'),
+              'wine': ('455e3509b98a6919fd4ad1def4803e08c41c03b2', 'https://gitlab.winehq.org/wine/wine.git'),
+              'wine-port': ('723d1bf5132768276cea9bc35ab59c83557bb5fb', 'https://github.com/willfaust/wine.git'),
+              'wine-valve': ('750fd011356cfcb28125c96d295ddef0d9e66dac', 'https://github.com/ValveSoftware/wine.git'),
+          }
+          pins = {p[0]: p[1:3] for line in pathlib.Path('pins.lock').read_text().splitlines()
+                  if (p := line.split()) and not line.startswith('#')}
+          for name, value in expected.items():
+              assert pins[name] == list(value), (name, pins[name])
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == '412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+          link = subprocess.check_output(['git', 'ls-tree', 'HEAD', 'upstream/madeira'], text=True).split()
+          assert link[0:3] == ['160000', 'commit', expected['madeira'][0]], link
+          record = {}
+          def prepare(name, revision, url, series):
+              import re
+              assert url.startswith('https://'), (name, url)
+              assert re.fullmatch(r'[0-9a-f]{40}', revision), (name, revision)
+              target = root / name
+              subprocess.run(['git', 'init', str(target)], check=True)
+              def git(*args):
+                  subprocess.run(['git', '-C', str(target), *args], check=True)
+              git('fetch', '--depth=1', url, revision)
+              git('checkout', '--detach', 'FETCH_HEAD')
+              actual = subprocess.check_output(['git', '-C', str(target), 'rev-parse', 'HEAD'], text=True).strip()
+              assert actual == revision, (name, actual)
+              count = 0
+              record[name] = {'base': actual, 'url': url, 'series': {}}
+              for component, expected_count in series:
+                  rows = [line.strip() for line in pathlib.Path('patches', component, 'series').read_text().splitlines()
+                          if line.strip() and not line.startswith('#')]
+                  assert len(rows) == expected_count and len(set(rows)) == expected_count, component
+                  paths = []
+                  hashes = []
+                  for entry in rows:
+                      assert pathlib.PurePosixPath(entry).name == entry, entry
+                      path = repo / 'patches' / component / entry
+                      digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                      print('patch', component, entry, digest, flush=True)
+                      hashes.append([entry, digest])
+                      paths.append(str(path))
+                  git('-c', 'user.name=CoD native source probe', '-c', 'user.email=probe@localhost',
+                      'am', '--committer-date-is-author-date', *paths)
+                  count += len(paths)
+                  record[name]['series'][component] = hashes
+              assert subprocess.check_output(['git', '-C', str(target), 'rev-parse', f'HEAD~{count}'], text=True).strip() == revision
+              git('diff', '--exit-code', '--ignore-submodules=all', 'HEAD')
+              record[name]['patched_head'] = subprocess.check_output(['git', '-C', str(target), 'rev-parse', 'HEAD'], text=True).strip()
+              return target
+          m = prepare('madeira', *expected['madeira'], [('madeira-unix', 143), ('madeira-winios', 5)])
+          w = prepare('wine', *expected['wine'], [('wine-port', 57), ('wine-valve', 132), ('wine-unix', 37)])
+          # The frozen port's relative includes must reach this same Madeira build tree.
+          for path, destination in ((m / 'wine', w), (root / 'build', m / 'build'), (root / 'mythic', m)):
+              if path.exists():
+                  assert path.is_dir() and not any(path.iterdir()), path
+                  path.rmdir()
+              path.symlink_to(destination, target_is_directory=True)
+          (root / 'sources.json').write_text(json.dumps(record, indent=2))
+          print('Prepared exact Madeira/Wine source histories for media headers; no production PE graph built.')
+          PY
+      - name: "Obtain the exact configure-only Mac cross-compiler"
+        id: "toolchain"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          mkdir -p "$TMPDIR"
+          root="$PWD/.work/cod-media-jit"
+          mkdir -p "$root/inputs"
+          # Official release API asset 581762292: digest independently read before this workflow was prepared.
+          # https://api.github.com/repos/mstorsjo/llvm-mingw/releases/assets/581762292
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+            -o "$root/inputs/llvm-mingw.tar.xz" \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz
+          printf '%s  %s\n' 52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3 "$root/inputs/llvm-mingw.tar.xz" | shasum -a 256 -c -
+          tar -xf "$root/inputs/llvm-mingw.tar.xz" -C "$root/inputs"
+          mingw="$root/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+          "$mingw/bin/clang" --version
+          printf 'int configure_probe(void) { return 0; }\n' | \
+            "$mingw/bin/clang" --target=aarch64-windows-gnu -x c - -c -o "$root/configure-probe.obj"
+          "$mingw/bin/llvm-readobj" --file-headers "$root/configure-probe.obj" | grep -q 'Machine: IMAGE_FILE_MACHINE_ARM64 '
+          printf 'Matching 20260922 toolchain verified for configure/header probes. No ARM64EC CRT or production PE/FEX build is claimed.\n'
+      - name: "Generate matching Wine headers without production PE targets"
+        id: "headers"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          mkdir -p "$TMPDIR"
+          root="$PWD/.work/cod-media-jit"
+          wine="$root/wine"
+          mingw="$root/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$(brew --prefix gettext)/bin:$PATH"
+          mkdir -p "$wine/build-macos"
+          macsdk="$(xcrun --sdk macosx --show-sdk-path)"
+          macld="$(xcrun --sdk macosx --find ld)"
+          # Pinned Wine configure rejects --without-mingw on aarch64 Darwin. Supply the matched PE compiler.
+          # No all-target make is used: only concrete generated include/*.h targets below are built.
+          (cd "$wine/build-macos" && \
+            CC="xcrun --sdk macosx clang" CXX="xcrun --sdk macosx clang++" \
+            OBJC="xcrun --sdk macosx clang -x objective-c" \
+            AR="$(xcrun --sdk macosx --find ar)" RANLIB="$(xcrun --sdk macosx --find ranlib)" \
+            LDFLAGS="-isysroot $macsdk -fuse-ld=$macld" \
+            ../configure --enable-archs=aarch64 --with-mingw="$mingw/bin/clang" \
+              --without-x --without-freetype --without-gnutls --without-gstreamer --disable-tests) || {
+                tail -n 160 "$wine/build-macos/config.log" || true
+                exit 1
+              }
+          python3 - <<'PY'
+          import hashlib, pathlib, re, subprocess
+          root = pathlib.Path('.work/cod-media-jit').resolve()
+          build = root / 'wine/build-macos'
+          text = (build / 'Makefile').read_text().replace('\\\n', ' ')
+          targets = set()
+          for line in text.splitlines():
+              if line.startswith(('\t', '#')) or ':' not in line:
+                  continue
+              for name in line.split(':', 1)[0].split():
+                  if re.fullmatch(r'include/[A-Za-z0-9_./-]+\.h', name):
+                      targets.add(name)
+          assert {'include/dshow.h', 'include/mfobjects.h', 'include/mftransform.h'} <= targets
+          print('Building', len(targets), 'actual Wine generated-header targets.', flush=True)
+          subprocess.run(['make', '-C', str(build), '-j3', *sorted(targets)], check=True)
+          config = build / 'include/config.h'
+          print('Generated Wine config SHA256:', hashlib.sha256(config.read_bytes()).hexdigest())
+          (root / 'headers.txt').write_text('\n'.join(sorted(targets)) + '\n')
+          PY
+      - name: "Install verified official Rust components into the private build root"
+        id: "rust"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess, urllib.request
+          root = pathlib.Path('.work/cod-media-jit').resolve()
+          tools = json.loads((root / 'tools.json').read_text())
+          inputs = root / 'inputs/rust-components'
+          inputs.mkdir(parents=True)
+          prefix = root / 'inputs/rust/cargo'
+          items = [
+              ('rustc-1.99.0-aarch64-apple-darwin', '334a66714ca316d71bbe5efe44f71762d0b276cea73be2987374693a837f7450'),
+              ('cargo-1.99.0-aarch64-apple-darwin', '76abff0ad79a10a3152dff640ea0d8b3c37637d9300bf55da41b95c3ddc069c1'),
+              ('rust-std-1.99.0-aarch64-apple-darwin', 'a7c6de8aa21e7c31163a7656295b321bb85f5dce55ed8ea95ac9ac561202bb5b'),
+              ('rust-std-1.99.0-aarch64-apple-ios', '1d566dbc70edab923310f9579aa1ca2563703e154c3217ff049b7021ff080a94'),
+          ]
+          # Digests were read from the official 1.99.0 release manifest, itself SHA256
+          # ce6dddc886364f8d786514771212cebe9b731ba82d6b859951c6b0ccc516b6a2.
+          records = []
+          for name, digest in items:
+              url = 'https://static.rust-lang.org/dist/2026-10-01/' + name + '.tar.xz'
+              archive = inputs / (name + '.tar.xz')
+              subprocess.run(['curl', '--proto', '=https', '--tlsv1.2', '-fL', '--retry', '3', '-o', str(archive), url], check=True)
+              actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+              assert actual == digest, name
+              subprocess.run(['tar', '-xf', str(archive), '-C', str(inputs)], check=True)
+              installer = inputs / name / 'install.sh'
+              assert installer.is_file()
+              subprocess.run([tools['bash'], str(installer), '--prefix=' + str(prefix), '--disable-ldconfig'], check=True)
+              records.append({'name': name, 'url': url, 'sha256': actual})
+          rustc = prefix / 'bin/rustc'
+          version = subprocess.check_output([str(rustc), '--version'], text=True).strip()
+          assert version.startswith('rustc 1.99.0 '), version
+          host = subprocess.check_output([str(rustc), '-vV'], text=True)
+          assert '\nhost: aarch64-apple-darwin\n' in '\n' + host
+          assert pathlib.Path(subprocess.check_output([str(rustc), '--print', 'sysroot'], text=True).strip()).resolve() == prefix
+          target = pathlib.Path(subprocess.check_output([str(rustc), '--print', 'target-libdir', '--target', 'aarch64-apple-ios'], text=True).strip())
+          assert target.is_dir() and target.is_relative_to(prefix)
+          (root / 'rust-components.json').write_text(json.dumps(records, indent=2))
+          print(version, 'with private Mac host and aarch64-apple-ios std; system Rust/profile unchanged')
+          PY
+      - name: "Create bounded Mac host adapters without changing frozen source"
+        id: "adapters"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re, shlex
+          repo = pathlib.Path.cwd()
+          root = repo / '.work/cod-media-jit'
+          tools = json.loads((root / 'tools.json').read_text())
+          pins = {p[0]: p[1:3] for line in pathlib.Path('pins.lock').read_text().splitlines()
+                  if (p := line.split()) and not line.startswith('#')}
+          expected = {
+              'gstreamer': ['1.28.7', 'https://gstreamer.freedesktop.org/data/pkg/ios'],
+              'stikjit': ['1.9.0', 'https://github.com/StikDebug/StikJIT.git'],
+              'idevice': ['d32c8189c51c2789496b0768039419c3705498c3', 'https://github.com/jkcoxson/idevice.git'],
+              'rust': ['1.99.0', 'https://static.rust-lang.org'],
+          }
+          assert all(pins[k] == v for k, v in expected.items()), pins
+          adapter = root / 'adapter'
+          (adapter / 'stages').mkdir(parents=True)
+          build = root / 'pipeline'
+          (build / 'cache').mkdir(parents=True)
+          values = {
+              'PLAYPORT_REPO': str(repo), 'PLAYPORT_BUILD': str(build), 'PLAYPORT_DEVICE_DIR': str(build),
+              'CACHE': str(build / 'cache'), 'MEDIA_ADAPTER': str(adapter), 'MEDIA_SDK_VERSION': tools['version'],
+              'DARWIN_SDK': tools['developer'], 'IOSSDK': tools['sdk'], 'MACSDK': tools['macsdk'],
+              'LD64': tools['macld'], 'RUST_ROOT': str(root / 'inputs/rust'),
+              'LLVM_MINGW': str(root / 'inputs/llvm-mingw-20260922-ucrt-macos-universal'),
+              'APPLE_IOS_CLANG': tools['ios']['clang'], 'APPLE_MAC_CLANG': tools['macclang'],
+              'APPLE_AR': tools['ios']['ar'],
+          }
+          (adapter / 'env.sh').write_text('\n'.join('export ' + name + '=' + shlex.quote(value) for name, value in values.items()) + '\n')
+          source_records = {}
+          def install(name, text):
+              original = (repo / 'build' / name).read_text()
+              output = adapter / name
+              output.write_text(text)
+              source_records[name] = {'sourceSha256': hashlib.sha256(original.encode()).hexdigest(),
+                                      'adapterSha256': hashlib.sha256(text.encode()).hexdigest()}
+          install('lib.sh', pathlib.Path('build/lib.sh').read_text())
+          gst = pathlib.Path('build/stages/gstreamer.sh').read_text()
+          assert 'SHA256=2b1233ba3d1f8166bfa85f664709ee5ff36b81e82b9652a1d3e79c1783da9584' in gst
+          assert gst.count('cc=(/usr/bin/clang ') == 1
+          gst = gst.replace('cc=(/usr/bin/clang ', 'cc=("$APPLE_IOS_CLANG" ')
+          assert gst.count('-platform_version ios 17.0 26.5') == 2
+          gst = gst.replace('-platform_version ios 17.0 26.5', '-platform_version ios 17.0 "$MEDIA_SDK_VERSION"')
+          install('stages/gstreamer.sh', gst)
+          idevice = pathlib.Path('build/stages/idevice.sh').read_text()
+          replacements = {
+              'CRATES=$PLAYPORT_REPO/build/idevice-crates.py': 'CRATES=$MEDIA_ADAPTER/idevice-crates.py',
+              'export SDKROOT=$IOSSDK IPHONEOS_DEPLOYMENT_TARGET=17.0': 'export SDKROOT=$MACSDK IPHONEOS_DEPLOYMENT_TARGET=17.0\nexport CC="$APPLE_MAC_CLANG" AR="$APPLE_AR"',
+              'export CC_aarch64_apple_ios=clang AR_aarch64_apple_ios=llvm-ar': 'export CC_aarch64_apple_ios="$APPLE_IOS_CLANG" AR_aarch64_apple_ios="$APPLE_AR"',
+              'export CARGO_TARGET_AARCH64_APPLE_IOS_LINKER=clang': 'export CARGO_TARGET_AARCH64_APPLE_IOS_LINKER="$APPLE_IOS_CLANG"',
+              '-C link-arg=-fuse-ld=lld': '-C link-arg=-fuse-ld=$LD64',
+          }
+          for before, after in replacements.items():
+              assert idevice.count(before) == 1, before
+              idevice = idevice.replace(before, after)
+          assert idevice.count('-platform_version ios 17.0 26.5') == 2
+          idevice = idevice.replace('-platform_version ios 17.0 26.5', '-platform_version ios 17.0 "$MEDIA_SDK_VERSION"')
+          install('stages/idevice.sh', idevice)
+          helper = pathlib.Path('build/idevice-crates.py').read_text()
+          assert helper.count('f"{version}-x86_64-unknown-linux-gnu"') == 1
+          install('idevice-crates.py', helper.replace('f"{version}-x86_64-unknown-linux-gnu"', 'f"{version}-aarch64-apple-darwin"'))
+          stik = pathlib.Path('build/stages/stikjit.sh').read_text()
+          assert 'SHA256=806664393770c68e75f2b6429955bfdd88cfaad09fec2ba70f8ed615ff90c060' in stik
+          assert 'COMMIT=32287268fa5824f9edce4cb359f5833ce0cf7b00' in stik
+          install('stages/stikjit.sh', stik)
+          (root / 'adapters.json').write_text(json.dumps(source_records, indent=2))
+          print(json.dumps(source_records, indent=2))
+          PY
+      - name: "Compile full frozen Wine GStreamer static-plugin closure"
+        id: "media"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-sed)/libexec/gnubin:$PATH"
+          export LC_ALL=C
+          unset CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS RUSTFLAGS
+          "$(brew --prefix bash)/bin/bash" .work/cod-media-jit/adapter/stages/gstreamer.sh unix "$PWD/.work/cod-media-jit"
+          test -s .work/cod-media-jit/gstreamer/libwinegstreamer_unix.a
+      - name: "Compile the locked idevice FFI for iPhone with Mac host tools"
+        id: "idevice"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-sed)/libexec/gnubin:$PATH"
+          export LC_ALL=C
+          unset CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS RUSTFLAGS
+          "$(brew --prefix bash)/bin/bash" .work/cod-media-jit/adapter/stages/idevice.sh "$PWD/.work/cod-media-jit/idevice"
+          python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess
+          root = pathlib.Path('.work/cod-media-jit')
+          src = root / 'idevice/src'
+          pin = 'd32c8189c51c2789496b0768039419c3705498c3'
+          base = subprocess.check_output(['git', '-C', str(src), 'rev-parse', 'HEAD~1'], text=True).strip()
+          assert base == pin, base
+          lock = src / 'Cargo.lock'
+          expected = subprocess.check_output(['git', '-C', str(src), 'show', 'HEAD:Cargo.lock'])
+          assert lock.read_bytes() == expected, 'Cargo.lock changed'
+          features = 'ring,tcp,core_device,core_device_proxy,tunnel_tcp_stack,rsd'
+          record = {'base': base, 'patches': 1, 'features': features,
+                    'cargoLockSha256': hashlib.sha256(expected).hexdigest(),
+                    'cratesInventorySha256': hashlib.sha256((root / 'idevice/crates.tsv').read_bytes()).hexdigest(),
+                    'cratesInventoryScope': 'resolved normal target graph; not a link-member/proc-macro/build graph'}
+          assert (root / 'idevice/crates.tsv').read_text().strip()
+          (root / 'idevice-build.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record, indent=2))
+          PY
+      - name: "Gate fresh archive architectures exports plugins and import inventories"
+        id: "archives"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          export PATH="$(brew --prefix llvm@22)/bin:$PATH"
+          python3 - <<'PY'
+          import hashlib, json, pathlib, re, subprocess
+          root = pathlib.Path('.work/cod-media-jit').resolve()
+          def out(*args):
+              return subprocess.check_output(list(map(str, args)), text=True)
+          exports = {
+              'libwinegstreamer_unix.a': {'_winegstreamer_unix_call_funcs', '_rust_eh_personality'},
+              'libidevice_ffi.a': {'_rp_pairing_file_from_bytes', '_tunnel_create_rppairing', '_app_service_connect_rsd',
+                                 '_app_service_launch_app', '_pairable_host_accept_bonjour', '_pairable_host_cancel_new',
+                                 '_pairable_host_cancel_signal', '_pairable_host_cancel_free', '_idevice_error_free'},
+          }
+          paths = [root / 'gstreamer/libwinegstreamer_unix.a', root / 'idevice/libidevice_ffi.a']
+          record = {}
+          for path in paths:
+              assert path.is_file() and path.stat().st_size > 0
+              assert out('xcrun', 'lipo', '-archs', path).split() == ['arm64']
+              members = out('llvm-ar', 't', path).splitlines()
+              assert len(members) == 1, (path.name, members)
+              heads = out('llvm-objdump', '--macho', '--private-headers', path)
+              assert 'ARM64' in heads and 'LC_VERSION_MIN_MACOSX' not in heads
+              platforms = re.findall(r'\bplatform\s+(\S+)', heads)
+              assert platforms and all(p.lower() in ('ios', '2') for p in platforms), (path, platforms)
+              defined = set(out('llvm-nm', '-g', '--defined-only', '-j', path).splitlines())
+              defined = {s for s in defined if s.startswith('_')}
+              assert defined == exports[path.name], (path.name, sorted(defined))
+              imports = sorted({s for s in out('llvm-nm', '-u', '-j', path).splitlines() if s.startswith('_')})
+              assert imports
+              data = path.read_bytes()
+              for forbidden in (str(pathlib.Path.cwd()).encode(), str(pathlib.Path.home()).encode(), str(root).encode()):
+                  assert forbidden not in data, (path.name, 'runner path embedded')
+              record[path.name] = {'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data),
+                                   'members': members, 'defined': sorted(defined), 'imports': imports,
+                                   'minos': sorted(set(re.findall(r'\bminos\s+(\S+)', heads)))}
+          symbols = out('llvm-nm', root / 'gstreamer/obj/winegstreamer_unix.o')
+          recipe = pathlib.Path('build/stages/gstreamer.sh').read_text()
+          plugins = re.search(r'PLUGINS="([^"]+)"', recipe, re.S).group(1).split()
+          assert len(plugins) == 20
+          for plugin in plugins:
+              assert re.search(r' _gst_plugin_' + re.escape(plugin) + r'_get_desc$', symbols, re.M), plugin
+          assert '_rust_eh_personality' not in record['libidevice_ffi.a']['defined']
+          record['mediaPlugins'] = plugins
+          record['scope'] = 'native object architecture/platform/export gate and honest static import inventory; media Wine/app hooks require the later complete app link'
+          (root / 'archive-inventory.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record, indent=2))
+          PY
+      - name: "Stage only the verified StikJIT component and original metadata fixes"
+        id: "stikjit"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-sed)/libexec/gnubin:$(brew --prefix llvm@22)/bin:$PATH"
+          export LC_ALL=C
+          "$(brew --prefix bash)/bin/bash" .work/cod-media-jit/adapter/stages/stikjit.sh
+          python3 - <<'PY'
+          import hashlib, json, pathlib, plistlib, subprocess
+          root = pathlib.Path('.work/cod-media-jit').resolve()
+          staged = pathlib.Path('app/Staged/StikJIT.xcframework')
+          cache = root / 'pipeline/cache/stikjit-1.9.0'
+          assert hashlib.sha256((cache / 'StikJIT.xcframework.zip').read_bytes()).hexdigest() == '806664393770c68e75f2b6429955bfdd88cfaad09fec2ba70f8ed615ff90c060'
+          assert subprocess.check_output(['git', '-C', str(cache / 'src'), 'rev-parse', 'HEAD'], text=True).strip() == '32287268fa5824f9edce4cb359f5833ce0cf7b00'
+          info = plistlib.loads((staged / 'Info.plist').read_bytes())
+          libraries = info['AvailableLibraries']
+          devices = [item for item in libraries if item.get('SupportedPlatform') == 'ios' and not item.get('SupportedPlatformVariant')]
+          assert len(devices) == 1
+          item = devices[0]
+          assert item['LibraryIdentifier'] == 'ios-arm64' and item['LibraryPath'] == 'StikJIT.framework'
+          assert item['SupportedArchitectures'] == ['arm64']
+          fw = staged / 'ios-arm64/StikJIT.framework'
+          meta = plistlib.loads((fw / 'Info.plist').read_bytes())
+          expected = {'CFBundleExecutable': 'StikJIT', 'CFBundleIdentifier': 'com.stik.StikJIT',
+                      'CFBundlePackageType': 'FMWK', 'CFBundleShortVersionString': '1.9.0',
+                      'CFBundleVersion': '1.9.0', 'MinimumOSVersion': '17.4',
+                      'CFBundleSupportedPlatforms': ['iPhoneOS']}
+          assert all(meta.get(key) == value for key, value in expected.items()), meta
+          assert not list(staged.rglob('universal.js')) and not list(staged.rglob('legacy.js'))
+          interfaces = list((fw / 'Modules/StikJIT.swiftmodule').glob('*.swiftinterface'))
+          assert interfaces
+          assert all(path.stat().st_size > 0 for path in interfaces)
+          binary_sha = hashlib.sha256((fw / 'StikJIT').read_bytes()).hexdigest()
+          record = {'source': '32287268fa5824f9edce4cb359f5833ce0cf7b00', 'componentZipSha256': '806664393770c68e75f2b6429955bfdd88cfaad09fec2ba70f8ed615ff90c060',
+                    'frameworkBinarySha256': binary_sha, 'deviceSlice': item, 'frameworkInfo': expected,
+                    'interfaceFiles': [str(path.relative_to(fw)) for path in interfaces],
+                    'binaryIsSourceBuiltByThisProbe': False}
+          (root / 'stikjit-component.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record, indent=2))
+          PY
+      - name: "Link original Relaunch against real idevice and audit SDK imports"
+        id: "audit"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          export PATH="$(brew --prefix llvm@22)/bin:$PATH"
+          python3 - <<'PY'
+          import json, pathlib, subprocess
+          root = pathlib.Path('.work/cod-media-jit').resolve()
+          tools = json.loads((root / 'tools.json').read_text())
+          out = root / 'idevice-audit'
+          out.mkdir()
+          flags = ['-target', 'arm64-apple-ios26.0', '-isysroot', tools['sdk'], '-O2',
+                   '-ffile-prefix-map=' + str(pathlib.Path.cwd()) + '=source',
+                   '-ffile-prefix-map=' + str(root) + '=media-jit']
+          source = pathlib.Path('app/Sources/Relaunch/relaunch.c')
+          subprocess.run([tools['ios']['clang'], *flags, '-Iapp/Sources/Relaunch/include',
+                          '-c', str(source), '-o', str(out / 'relaunch.o')], check=True)
+          binary = out / 'libidevice-closure-audit.dylib'
+          subprocess.run([tools['ios']['clang'], *flags, '-dynamiclib', '-fuse-ld=' + tools['macld'],
+                          '-Wl,-no_adhoc_codesign', '-Wl,-install_name,@rpath/libidevice-closure-audit.dylib',
+                          '-Wl,-force_load,' + str(root / 'idevice/libidevice_ffi.a'), str(out / 'relaunch.o'),
+                          '-framework', 'Foundation', '-framework', 'Security', '-framework', 'CoreFoundation',
+                          '-lc++', '-liconv', '-lresolv', '-o', str(binary)], check=True)
+          checker = ['python3', 'build/check-macho-imports.py', '--sdk', tools['sdk'], '--platform', 'ios', '--minos', '26.0']
+          subprocess.run(checker + ['--exports', 'playport_relaunch,rp_pairing_file_from_bytes,tunnel_create_rppairing,app_service_connect_rsd,app_service_launch_app', str(binary)], check=True)
+          print('Real idevice + unmodified Relaunch C source linked for SDK import auditing; the audit dylib was not run.')
+          PY
+      - name: "Compile original JIT helper and verify framework extension structure"
+        id: "jit"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          export TMPDIR="$PWD/.work/cod-media-jit/tmp"
+          export PATH="$(brew --prefix llvm@22)/bin:$PATH"
+          python3 - <<'PY'
+          import copy, hashlib, json, pathlib, plistlib, re, shutil, subprocess
+          repo = pathlib.Path.cwd()
+          root = pathlib.Path('.work/cod-media-jit').resolve()
+          tools = json.loads((root / 'tools.json').read_text())
+          work = root / 'jit-helper'
+          work.mkdir()
+          modules = work / 'modules'
+          modules.mkdir()
+          module_cache = work / 'module-cache'
+          module_cache.mkdir()
+          fw = repo / 'app/Staged/StikJIT.xcframework/ios-arm64/StikJIT.framework'
+          swift = tools['ios']['swiftc']
+          flags = ['-target', 'arm64-apple-ios26.0', '-sdk', tools['sdk'], '-swift-version', '5',
+                   '-DPLAYPORT_RELEASE', '-O', '-parse-as-library', '-application-extension',
+                   '-module-cache-path', str(module_cache),
+                   '-debug-prefix-map', str(repo) + '=source', '-debug-prefix-map', str(root) + '=media-jit',
+                   '-file-prefix-map', str(repo) + '=source', '-file-prefix-map', str(root) + '=media-jit']
+          probe = work / 'stikjit-import.swift'
+          probe.write_text('import StikJIT\nfunc componentImportProbe(_ paths: DDIPaths) { _ = paths }\n')
+          interface = fw / 'Modules/StikJIT.swiftmodule/arm64-apple-ios.swiftinterface'
+          assert interface.is_file(), 'Public device Swift interface is missing'
+          subprocess.run([swift, '-frontend', '-compile-module-from-interface', str(interface),
+                          '-module-name', 'StikJIT', '-target', 'arm64-apple-ios26.0', '-sdk', tools['sdk'],
+                          '-swift-version', '5', '-enable-objc-interop', '-module-cache-path', str(module_cache),
+                          '-o', str(modules / 'StikJIT.swiftmodule')], check=True)
+          subprocess.run([swift, *flags, '-I', str(modules), '-F', str(fw.parent), '-typecheck', str(probe)], check=True)
+          xpc_source = repo / 'app/Sources/JITHelperXPC/JITHelperXPC.swift'
+          helper_source = repo / 'app/Sources/PlayportJIT/JITHelper.swift'
+          entry_source = repo / 'app/Sources/PlayportJITEntry/entry.c'
+          subprocess.run([swift, *flags, '-module-name', 'JITHelperXPC', '-emit-module',
+                          '-emit-module-path', str(modules / 'JITHelperXPC.swiftmodule'),
+                          '-emit-object', str(xpc_source), '-o', str(work / 'JITHelperXPC.o')], check=True)
+          subprocess.run([swift, *flags, '-module-name', 'PlayportJIT', '-I', str(modules), '-F', str(fw.parent),
+                          '-emit-object', str(helper_source), '-o', str(work / 'JITHelper.o')], check=True)
+          subprocess.run([tools['ios']['clang'], '-target', 'arm64-apple-ios26.0', '-isysroot', tools['sdk'],
+                          '-O2', '-fapplication-extension', '-ffile-prefix-map=' + str(repo) + '=source',
+                          '-c', str(entry_source), '-o', str(work / 'entry.o')], check=True)
+          appex = work / 'PlayportJIT.appex'
+          (appex / 'Frameworks').mkdir(parents=True)
+          shutil.copytree(fw, appex / 'Frameworks/StikJIT.framework', symlinks=True)
+          binary = appex / 'PlayportJIT'
+          subprocess.run([swift, *flags, '-module-name', 'PlayportJIT', '-emit-executable',
+                          str(work / 'JITHelper.o'), str(work / 'JITHelperXPC.o'), str(work / 'entry.o'),
+                          '-F', str(fw.parent), '-framework', 'StikJIT', '-framework', 'Foundation',
+                          '-Xlinker', '-e', '-Xlinker', '_NSExtensionMain', '-Xlinker', '-ObjC',
+                          '-Xlinker', '-no_adhoc_codesign', '-Xlinker', '-rpath', '-Xlinker', '@executable_path/Frameworks',
+                          '-Xlinker', '-rpath', '-Xlinker', '@executable_path/../../Frameworks',
+                          '-o', str(binary)], check=True)
+          original = plistlib.loads((repo / 'app/PlayportJIT-Info.plist').read_bytes())
+          info = copy.deepcopy(original)
+          info.update({'CFBundleExecutable': 'PlayportJIT', 'CFBundleIdentifier': 'dev.playport.app.PlayportJIT',
+                       'CFBundleName': 'PlayportJIT', 'CFBundlePackageType': 'XPC!',
+                       'CFBundleSupportedPlatforms': ['iPhoneOS'], 'MinimumOSVersion': '26.0'})
+          assert info['NSExtension'] == original['NSExtension']
+          assert info['NSExtension']['NSExtensionPrincipalClass'] == 'PlayportJITHelper'
+          assert info['NSExtension']['NSExtensionPointIdentifier'] == 'com.apple.ar.viewer'
+          assert info['NSExtension']['NSExtensionAttributes']['NSExtensionActivationRule'] == 'FALSEPREDICATE'
+          (appex / 'Info.plist').write_bytes(plistlib.dumps(info))
+          script = repo / 'app/PlayportJIT/playport-universal.js'
+          shutil.copy2(script, appex / script.name)
+          assert (appex / script.name).read_bytes() == script.read_bytes()
+          copied_fw = appex / 'Frameworks/StikJIT.framework'
+          assert (copied_fw / 'StikJIT').read_bytes() == (fw / 'StikJIT').read_bytes(), 'Component binary changed'
+          identifiers = subprocess.check_output(['llvm-objdump', '--macho', '--dylib-id', str(copied_fw / 'StikJIT')], text=True).splitlines()[1:]
+          assert [line.strip() for line in identifiers] == ['@rpath/StikJIT.framework/StikJIT']
+          for path in appex.rglob('*'):
+              if path.is_symlink():
+                  assert path.resolve().is_relative_to(appex.resolve()), path
+          assert not (copied_fw / 'universal.js').exists() and not (copied_fw / 'legacy.js').exists()
+          metadata = subprocess.check_output(['llvm-objdump', '--macho', '--objc-meta-data', str(binary)], text=True)
+          assert 'PlayportJITHelper' in metadata, 'Principal class absent from actual Objective-C metadata'
+          checker = ['python3', 'build/check-macho-imports.py', '--sdk', tools['sdk'], '--platform', 'ios']
+          subprocess.run(checker + ['--minos', '17.4', str(copied_fw / 'StikJIT')], check=True)
+          subprocess.run(checker + ['--minos', '26.0', '--with', str(copied_fw / 'StikJIT'),
+                                    '--exports', 'NSExtensionMain', str(binary)], check=True)
+          record = {'helperSourceSha256': hashlib.sha256(helper_source.read_bytes()).hexdigest(),
+                    'xpcSourceSha256': hashlib.sha256(xpc_source.read_bytes()).hexdigest(),
+                    'entrySourceSha256': hashlib.sha256(entry_source.read_bytes()).hexdigest(),
+                    'helperBinarySha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+                    'frameworkBinarySha256': hashlib.sha256((copied_fw / 'StikJIT').read_bytes()).hexdigest(),
+                    'scriptSha256': hashlib.sha256(script.read_bytes()).hexdigest(),
+                    'extensionInfo': info, 'sourceExtensionDictionaryPreserved': True,
+                    'frameworkSourceBuiltByThisProbe': False, 'developerSigningPerformed': False,
+                    'phoneOrJitActionPerformed': False, 'fullMainAppLinked': False}
+          (root / 'jit-helper-inventory.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record, indent=2))
+          subprocess.run(['git', 'diff', '--exit-code', 'HEAD'], check=True)
+          print('PASS: original release JIT helper sources compiled/linked and unsigned extension layout + real SDK/framework imports checked; no extension or JIT API executed.')
+          PY
+      - name: "Record bounded component outcomes"
+        if: "${{ always() }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Frozen Playport media/Rust/JIT component gate; no complete main app, device, pairing, JIT enablement or gameplay result.' \
+            'No artifact/cache upload, signing operation, SDK export, game input or account material is part of this workflow.' \
+            'GStreamer and StikJIT are individually checksummed upstream component inputs; no blocked runtime package is fetched.' \
+            'Tools ${{ steps.tools.outcome }}; sources ${{ steps.sources.outcome }}; configure compiler ${{ steps.toolchain.outcome }}; headers ${{ steps.headers.outcome }}; Rust ${{ steps.rust.outcome }}; adapters ${{ steps.adapters.outcome }}.' \
+            'Media ${{ steps.media.outcome }}; idevice ${{ steps.idevice.outcome }}; archive inspection ${{ steps.archives.outcome }}; StikJIT component ${{ steps.stikjit.outcome }}; idevice SDK import link ${{ steps.audit.outcome }}; JIT helper compile/import/layout ${{ steps.jit.outcome }}.' \
+            'Media imports retain the explicit Wine/app boundary inventory; only the later complete app link can prove that closure.' \
+            'Next: review component results, then assemble the same-pin complete app and its 150-slot matching DXMT tree. Continue in the current thread; no new thread required.' >> "$GITHUB_STEP_SUMMARY"
+
