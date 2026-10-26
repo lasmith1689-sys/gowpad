@@ -623,7 +623,8 @@ jobs:
               'appleOptions': {'url': 'https://github.com/apple-oss-distributions/ld64/blob/main/src/ld/Options.cpp',
                                'gitBlob': '4b3020dd0c91333f563cfcd45ba9176c0cab538c', 'lines': [3543, 3544]},
               'llvmNm': {'url': 'https://github.com/llvm/llvm-project/blob/llvmorg-22.1.0/llvm/docs/CommandGuide/llvm-nm.rst',
-                         'gitBlob': '7067bb0a29a195ba5f1f2d166b770a0b25f2b246'},
+                         'gitBlob': '7067bb0a29a195ba5f1f2d166b770a0b25f2b246',
+                         'printerBlob': 'dcfc0f92590d5abb09c10d8d27c023125c62d99f', 'machOReaderBlob': 'e09d07f9020ef7940b557ba3bd84a5907f5646cf'},
               'archiveSelection': {'url': 'https://github.com/tpoechtrager/cctools-port/blob/904de2a71d4da6a9b30d2efaf912a10ddc7d9ddb/cctools/ld64/src/ld/parsers/archive_file.cpp',
                                    'gitBlob': 'ad728d71cf2629c10930d53b3f58cea530dc83ed'},
           }
@@ -637,7 +638,7 @@ jobs:
               fields = struct.unpack_from('<8I', data)
               assert fields[0] == 0xfeedfacf and fields[1] == 0x0100000c and fields[3] == 1, 'Unsupported native object: ' + name
               assert 32 + fields[5] <= len(data), 'Truncated Mach-O commands: ' + name
-              sections, symbols, table, position = [], [], None, 32
+              sections, symbols, empty_debug, table, position = [], [], [], None, 32
               for unused in range(fields[4]):
                   assert position + 8 <= 32 + fields[5]
                   command, size = struct.unpack_from('<II', data, position)
@@ -663,12 +664,14 @@ jobs:
                       assert string < len(strings)
                       end = strings.find(bytes([0]), string)
                       assert end >= string
-                      if kind & 0xe0 or end == string:
+                      if kind & 0xe0:
+                          if end == string:
+                              empty_debug.append({'type': kind, 'section': section, 'description': description, 'value': value})
                           continue
                       symbols.append({'name': strings[string:end].decode(), 'type': kind, 'section': section,
                                       'description': description, 'value': value})
               commons = [row for row in symbols if row['type'] & 0x0e == 0 and row['value'] > 0]
-              return {'sections': sections, 'symbols': symbols, 'commons': commons}
+              return {'sections': sections, 'symbols': symbols, 'commons': commons, 'emptyDebugSymbols': empty_debug}
 
           def inspect_native_input(path):
               data = path.read_bytes()
@@ -764,17 +767,28 @@ jobs:
               # LLVM's POSIX printer emits archive[member]: name TYPE value size.
               # Inspect all members, all visibility, definitions and undefineds.
               pattern = re.compile(re.escape(str(path)) + r'(?:\[[^\n]+\])?: (.+) ([A-Za-z?\-]) (?:[0-9a-f]+)? +[0-9a-f]+$')
+              objects, expected_debug = record.get('members', [record]), {}
+              for obj in objects:
+                  label = str(path) + ('[' + obj['name'] + ']' if 'members' in record else '')
+                  for symbol in obj['native']['emptyDebugSymbols']:
+                      line = f"{label}:  - {symbol['value']:x} 0"
+                      expected_debug[line] = expected_debug.get(line, 0) + 1
               counts = {}
               for line in result.stdout.splitlines():
-                  match = pattern.fullmatch(line)
-                  assert match, 'Unparsed native nm output: ' + line
-                  kind = match[2]
+                  if line in expected_debug:
+                      assert expected_debug[line] > 0, 'Extra empty STAB metadata: ' + line
+                      expected_debug[line] -= 1
+                      kind = '-'
+                  else:
+                      match = pattern.fullmatch(line)
+                      assert match, 'Unparsed native nm output: ' + line
+                      kind = match[2]
                   assert kind != '?', 'Unknown native symbol type'
                   counts[kind] = counts.get(kind, 0) + 1
+              assert not any(expected_debug.values()), 'Missing empty STAB metadata in native nm output'
               record.update(nmArguments=command, nmSha256=hashlib.sha256(result.stdout.encode()).hexdigest(),
                             nmDiagnostics=result.stderr, symbolTypes=counts,
                             commonCount=counts.get('C', 0) + counts.get('c', 0))
-              objects = record.get('members', [record])
               assert record['commonCount'] == sum(len(obj['native']['commons']) for obj in objects), 'Native nm/raw COMMON count disagreement'
               assert not result.stderr, 'Native nm diagnostic requires review: ' + result.stderr
               assert digest(path) == record['sha256'], 'Input changed during native inspection'
