@@ -94,6 +94,12 @@ jobs:
                   symbols[match[1]] = {'type': match[2], 'value': int(match[3] or '0', 16), 'size': int(match[4], 16)}
               return symbols
 
+          def candidate_first_args(name, arguments):
+              assert arguments and arguments[0] == '-r' and arguments.count('-d') == 1, 'Unexpected original first-link arguments'
+              if name == 'apple-default-without-d':
+                  return [arg for arg in arguments if arg != '-d']
+              return list(arguments)
+
           def validate_semantics(info, nm_symbols, mode, sdk_version):
               assert info['platform'] == 2
               assert info['minos'] == 0x110000
@@ -168,6 +174,7 @@ jobs:
                                  'ldSha256': hashlib.sha256(apple_ld.read_bytes()).hexdigest()}
               record['clangVersion'] = command([clang, '--version'])
               candidates = [('apple-default', [str(apple_ld)]),
+                            ('apple-default-without-d', [str(apple_ld)]),
                             ('apple-classic-selector', [str(apple_ld), '-ld_classic'])]
               for directory in sorted({clang.parent, apple_ld.parent}):
                   for name in ('ld-classic', 'ld64'):
@@ -208,6 +215,8 @@ jobs:
                   elif path.resolve() not in seen:
                       seen.add(path.resolve())
                       candidates.append(('installed-lld-' + str(len(seen)), [str(path)]))
+              assert len(candidates) >= 3
+              record['candidateCount'] = len(candidates)
               record['candidateInventory'] = []
               for name, prefix in candidates:
                   is_lld = pathlib.Path(prefix[0]).name == 'ld64.lld'
@@ -237,11 +246,14 @@ jobs:
                   directory = root / name
                   directory.mkdir()
                   first, final = directory / 'prelinked.o', directory / 'final.o'
-                  row = {'name': name, 'command': prefix, 'status': 'started'}
+                  row = {'name': name, 'command': prefix, 'status': 'started',
+                         'omittedLegacyD': name == 'apple-default-without-d',
+                         'intent': 'prove modern default COMMON allocation' if name == 'apple-default-without-d' else 'prove original explicit -d COMMON allocation'}
                   record['results'].append(row)
                   try:
                       first_args = ['-r', '-d', '-arch', 'arm64', '-platform_version', 'ios', '17.0', sdk_version,
                                     '-syslibroot', sdk, '-u', '_common_fn', '-o', str(first), str(input_object)]
+                      first_args = candidate_first_args(name, first_args)
                       row['firstLink'] = command(prefix + first_args, check=False)
                       assert row['firstLink']['returncode'] == 0, 'First -r -d link failed'
                       first_info, first_symbols = inspect(first)
@@ -260,7 +272,7 @@ jobs:
                       record['passedCandidates'].append(name)
                   except Exception as error:
                       row.update(status='failed', error=str(error))
-              assert record['passedCandidates'], 'No installed candidate preserved -r -d and the visibility pass'
+              assert record['passedCandidates'], 'No installed candidate proved COMMON allocation and the visibility pass'
               record['status'] = 'passed'
           except Exception as error:
               record.update(status='failed', error=str(error))
@@ -276,6 +288,6 @@ jobs:
           set -euo pipefail
           printf '%s\n' \
             'Native installed-linker capability probe: ${{ steps.probe.outcome }}.' \
-            'Synthetic ARM64 iPhone object only; explicit COMMON input, allocation and second-pass privacy/export checks.' \
+            'Synthetic ARM64 iPhone object only; explicit COMMON input, allocation and second-pass privacy/export checks; separate modern -r without -d and original -r -d candidates.' \
             'Selected Xcode SDK was used in place. No target object executed; no tool installation, account, signing, media build or SDK export.' \
             'Next: inspect per-candidate diagnostics before selecting a proven linker for the media recipe. Continue in the current thread; no new thread required.' >> "$GITHUB_STEP_SUMMARY"
