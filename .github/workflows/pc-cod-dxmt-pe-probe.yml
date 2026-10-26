@@ -1,0 +1,468 @@
+name: CoD matched DXMT PE and stock resource source probe
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - codex/pc-games-runtime-probe-20261025
+    paths:
+    - .github/workflows/pc-cod-dxmt-pe-probe.yml
+permissions:
+  contents: read
+concurrency:
+  group: pc-cod-dxmt-pe-probe
+  cancel-in-progress: false
+jobs:
+  cod-dxmt-pe-source-probe:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+    - name: "Check out fixed Playport source"
+      uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+      with:
+        repository: "playportdev/playport"
+        ref: "412de5f8c0bdd26d84e0127eb5776ba992e3b152"
+        persist-credentials: "false"
+        submodules: "false"
+        path: "source"
+    - name: "Provision native Mac tools and verify explicit Xcode SDKs"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        brew install glslang bash cmake ninja make bison flex pkgconf llvm@22 gettext coreutils autoconf automake libtool
+        cd source
+        root="$PWD/.work/cod-dxmt-pe"
+        mkdir -p "$root/tmp" "$root/inputs"
+        export TMPDIR="$root/tmp"
+        python3 -m venv "$root/venv"
+        "$root/venv/bin/python" -m pip install meson pefile packaging
+        "$root/venv/bin/python" -m pip list --format=freeze
+        "$root/venv/bin/python" - <<'PY'
+        import json,pathlib,shutil,subprocess
+        root=pathlib.Path('.work/cod-dxmt-pe').resolve()
+        assert subprocess.check_output(['uname','-m'],text=True).strip()=='arm64'
+        def out(*a):return subprocess.check_output(a,text=True).strip()
+        version=out('xcrun','--sdk','iphoneos','--show-sdk-version')
+        assert int(version.split('.')[0])>=26,version
+        free=shutil.disk_usage(root).free
+        assert free>=20*1024**3,'Need at least 20 GiB scratch disk for the source PE dependency closure'
+        record={
+         'iossdk':out('xcrun','--sdk','iphoneos','--show-sdk-path'),
+         'macsdk':out('xcrun','--sdk','macosx','--show-sdk-path'),
+         'macld':out('xcrun','--sdk','macosx','--find','ld'),
+         'bash':out('brew','--prefix','bash')+'/bin/bash',
+         'cc':out('xcrun','--sdk','macosx','--find','clang'),
+         'cpp':out('xcrun','--sdk','macosx','--find','clang++'),
+         'ar':out('xcrun','--sdk','macosx','--find','ar'),
+         'ranlib':out('xcrun','--sdk','macosx','--find','ranlib'),
+         'strip':out('xcrun','--sdk','macosx','--find','strip'),
+         'llvm':out('brew','--prefix','llvm@22'), 'sdk_version':version,'disk_free_bytes':free,
+        }
+        (root/'tools.json').write_text(json.dumps(record,indent=2))
+        print(json.dumps(record,indent=2))
+        subprocess.run([record['bash'],'-c','(( BASH_VERSINFO[0] >= 5 ))'],check=True)
+        subprocess.run(['glslangValidator','--version'],check=True)
+        subprocess.run(['xcodebuild','-version'],check=True)
+        subprocess.run(['xcrun','--sdk','macosx','clang','-isysroot',record['macsdk'],
+         '-fuse-ld='+record['macld'],'-x','c','-','-o',str(root/'native-link-probe')],
+         input='int main(void) { return 0; }\n',text=True,check=True)
+        PY
+        brew list --versions glslang bash cmake ninja make bison flex pkgconf llvm@22 gettext coreutils autoconf automake libtool
+      id: "tools"
+    - name: "Verify the official matching Mac PE compiler package"
+      id: "toolchain"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt-pe/tmp"
+        mkdir -p "$TMPDIR"
+        root="$PWD/.work/cod-dxmt-pe"
+        mkdir -p "$root/inputs"
+        # Official release API asset 581762292: digest independently read before this workflow was prepared.
+        # https://api.github.com/repos/mstorsjo/llvm-mingw/releases/assets/581762292
+        curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+          -o "$root/inputs/llvm-mingw.tar.xz" \
+          https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz
+        printf '%s  %s\n' 52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3 "$root/inputs/llvm-mingw.tar.xz" | shasum -a 256 -c -
+        tar -xf "$root/inputs/llvm-mingw.tar.xz" -C "$root/inputs"
+        mingw="$root/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+        "$mingw/bin/clang" --version
+        printf 'int configure_probe(void) { return 0; }\n' | \
+          "$mingw/bin/clang" --target=aarch64-windows-gnu -x c - -c -o "$root/configure-probe.obj"
+        "$mingw/bin/llvm-readobj" --file-headers "$root/configure-probe.obj" | grep -q 'Machine: IMAGE_FILE_MACHINE_ARM64 '
+        printf 'Matching 20260922 toolchain verified for configure/header probes. No ARM64EC CRT or production build is claimed.\n'
+    - name: "Prepare frozen Wine, DXMT, Vulkan and CRT source closure"
+      id: "sources"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt-pe/tmp"
+        python3 - <<'PY'
+        import hashlib,json,pathlib,re,shutil,subprocess
+        repo=pathlib.Path.cwd();root=repo/'.work/cod-dxmt-pe'
+        expected={
+         'madeira':('8c050d03f4d89096e1e2e2c8bb44479fffd86619','https://github.com/willfaust/Madeira.git'),
+         'wine':('455e3509b98a6919fd4ad1def4803e08c41c03b2','https://gitlab.winehq.org/wine/wine.git'),
+         'wine-port':('723d1bf5132768276cea9bc35ab59c83557bb5fb','https://github.com/willfaust/wine.git'),
+         'wine-valve':('750fd011356cfcb28125c96d295ddef0d9e66dac','https://github.com/ValveSoftware/wine.git'),
+         'dxmt':('68af85e96196e1cf9f50de9fe24c70f03a1db4a7','https://github.com/3Shain/dxmt.git'),
+         'dxmt-port':('ca8a2516d819e7e1f366981825ad1f0d26f80fdd','https://github.com/willfaust/dxmt.git'),
+         'dxvk':('e5ffd0fe5e5d62e68b2831d1285b51e61bb454d8','https://github.com/doitsujin/dxvk.git'),
+         'vkd3d-proton':('31d1f89ca5b3f2fd3b6f025c8e6f73ed3eaa852b','https://github.com/HansKristian-Work/vkd3d-proton.git'),
+        }
+        pins={p[0]:p[1:3] for line in (repo/'pins.lock').read_text().splitlines()
+              if (p:=line.split()) and not line.startswith('#')}
+        for name,value in expected.items():assert pins[name]==list(value),(name,pins[name])
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()=='412de5f8c0bdd26d84e0127eb5776ba992e3b152'
+        record={'pins':expected,'patches':{}}
+        def checkout(name,revision,url,series=()):
+         assert re.fullmatch(r'[0-9a-f]{40}',revision) and url.startswith('https://'),(name,revision,url)
+         tree=root/name;tree.parent.mkdir(parents=True,exist_ok=True)
+         subprocess.run(['git','init',str(tree)],check=True)
+         subprocess.run(['git','-C',str(tree),'fetch','--depth=1',url,revision],check=True)
+         subprocess.run(['git','-C',str(tree),'checkout','--detach','FETCH_HEAD'],check=True)
+         assert subprocess.check_output(['git','-C',str(tree),'rev-parse','HEAD'],text=True).strip()==revision
+         count=0
+         for component,total in series:
+          names=[l.strip() for l in (repo/'patches'/component/'series').read_text().splitlines()
+                 if l.strip() and not l.startswith('#')]
+          assert len(names)==total and len(set(names))==total,(component,len(names))
+          record['patches'][component]=[]
+          for name in names:
+           assert pathlib.PurePosixPath(name).name==name
+           patch=repo/'patches'/component/name;digest=hashlib.sha256(patch.read_bytes()).hexdigest()
+           record['patches'][component].append([name,digest]);print('patch',component,name,digest,flush=True)
+           subprocess.run(['git','-C',str(tree),'-c','user.name=CoD PE probe','-c','user.email=probe@localhost',
+                           'am','--committer-date-is-author-date',str(patch)],check=True)
+          count+=total
+         assert subprocess.check_output(['git','-C',str(tree),'rev-parse',f'HEAD~{count}'],text=True).strip()==revision
+         return tree
+        madeira=checkout('madeira',*expected['madeira'])
+        assert subprocess.check_output(['git','ls-tree','HEAD','upstream/madeira'],text=True).split()[2]==expected['madeira'][0]
+        for path,name in [('wine','wine-port'),('research/dxmt','dxmt-port')]:
+         assert subprocess.check_output(['git','-C',str(madeira),'ls-tree','HEAD',path],text=True).split()[2]==expected[name][0]
+        wine=checkout('wine',*expected['wine'],[('wine-port',57),('wine-valve',132),('wine-pe',42)])
+        dxmt=checkout('dxmt',*expected['dxmt'],[('dxmt-port',45),('dxmt',9)])
+        for name,series in [('dxvk',[('dxvk',5)]),('vkd3d-proton',[('vkd3d-proton',4)])]:
+         checkout('vulkan/'+name,*expected[name],series)
+         subprocess.run(['git','-C',str(root/'vulkan'/name),'submodule','update','--init','--recursive','--depth=1'],check=True)
+         print(subprocess.check_output(['git','-C',str(root/'vulkan'/name),'submodule','status','--recursive'],text=True))
+        subprocess.run(['git','-C',str(dxmt),'submodule','update','--init','--depth=1','include/native/directx'],check=True)
+        want='9df86f2341616ef1888ae59919feaa6d4fad693d'
+        assert subprocess.check_output(['git','-C',str(dxmt/'include/native/directx'),'rev-parse','HEAD'],text=True).strip()==want
+        (root/'build').symlink_to(madeira/'build',target_is_directory=True)
+        (root/'remote-metal').symlink_to(madeira/'research/remote-metal',target_is_directory=True)
+        checkout('mingw-w64','57b595039040eaa15bece85b7cc71d952281b269','https://github.com/mingw-w64/mingw-w64.git')
+        (root/'sources.json').write_text(json.dumps(record,indent=2))
+        print('Fresh matching Wine/DXMT/Vulkan sources, exact complete patch sequences and frozen config inputs prepared.')
+        PY
+    - name: "Inspect and rebuild exact EC-capable CRT, then link a real C++ probe DLL"
+      id: "crt"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-dxmt-pe"
+        mingw="$root/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+        export TMPDIR="$root/tmp"
+        export PATH="$mingw/bin:$(brew --prefix make)/libexec/gnubin:$PATH"
+        unset CC CXX OBJC CFLAGS CXXFLAGS CPPFLAGS LDFLAGS SDKROOT
+        "$mingw/bin/clang" --version
+        mkdir -p "$root/crt-build"
+        # Upstream Makefile.am installs ARM64 libraries under <prefix>/lib.
+        # Match llvm-mingw's per-target prefix so the rebuilt CRT is actually used.
+        # Inventory actual package symbols before the documented in-place EC CRT rebuild.
+        "$mingw/bin/llvm-nm" --defined-only -j "$mingw/aarch64-w64-mingw32/lib/libmingw32.a" > "$root/crt-before-symbols.txt"
+        (cd "$root/crt-build" && \
+         "$root/mingw-w64/mingw-w64-crt/configure" \
+         --prefix="$mingw/aarch64-w64-mingw32" --host=aarch64-w64-mingw32 \
+         --disable-lib32 --disable-lib64 --enable-libarm64 --enable-arm64x \
+         --with-default-msvcrt=ucrt --enable-cfguard --enable-silent-rules)
+        make -C "$root/crt-build" -j3
+        make -C "$root/crt-build" install
+        "$root/venv/bin/python" - <<'PY'
+        import hashlib,pathlib,re,shutil,subprocess
+        root=pathlib.Path('.work/cod-dxmt-pe').resolve()
+        m=root/'inputs/llvm-mingw-20260922-ucrt-macos-universal'
+        resource=pathlib.Path(subprocess.check_output([str(m/'bin/clang'),'--print-resource-dir'],text=True).strip())
+        builtins=resource/'lib/windows/libclang_rt.builtins-aarch64.a'
+        assert builtins.is_file(),builtins
+        lib=m/'aarch64-w64-mingw32/lib'
+        for name in ('libgcc.a','libgcc_eh.a','libgcc_s.a'):
+         shutil.copy2(builtins,lib/name)
+         print('Matching builtins alias:',name,hashlib.sha256((lib/name).read_bytes()).hexdigest())
+        for name in ('libc++.a','libc++abi.a','libunwind.a','libmingwex.a','libmingw32.a','libucrt.a','libmsvcrt.a'):
+         assert (lib/name).is_file(),name
+        before=(root/'crt-before-symbols.txt').read_text()
+        after=subprocess.check_output([str(m/'bin/llvm-nm'),'--defined-only','-j',str(lib/'libmingw32.a')],text=True)
+        (root/'crt-after-symbols.txt').write_text(after)
+        print('CRT symbols before/after:',len(before.splitlines()),len(after.splitlines()))
+        print('CRT EC/dispatch symbols:',[s for s in after.splitlines() if s.startswith('#') or 'arm64x' in s][:80])
+        probe=root/'ec-crt-probe.cpp'
+        probe.write_text('#include <string>\n#include <vector>\n#include <cstdlib>\n'
+         '__declspec(noinline) static int stack_probe(int n) { volatile unsigned char v[32768]; '
+         'for (int i=0;i<32768;++i) v[i]=(unsigned char)(n+i); return v[n & 32767]; }\n'
+         'extern "C" __declspec(dllexport) int crt_probe(const char *s) { '
+         'std::string text(s); std::vector<long long> values(64,::strtoll(text.c_str(),nullptr,10)); '
+         'return stack_probe((int)values[0]); }\n')
+        output=root/'ec-crt-probe.dll'
+        command=[str(m/'bin/aarch64-w64-mingw32-clang++'),'--target=arm64ec-windows-gnu',
+         '-fuse-ld=lld','-stdlib=libc++','-std=c++20','-fno-exceptions','-O2','-shared','-static','-Wl,--no-insert-timestamp',
+         str(probe),'-o',str(output),'-Wl,--start-group','-lc++','-lc++abi','-lunwind','-lgcc',
+         '-lmingwex','-lmingw32','-lucrt','-lmsvcrt','-Wl,--end-group']
+        subprocess.run(command,check=True)
+        headers=subprocess.check_output([str(m/'bin/llvm-readobj'),'--file-headers','--coff-load-config',str(output)],text=True)
+        print(headers)
+        assert 'IMAGE_FILE_MACHINE_ARM64EC' in headers,'Real EC C++/stack/CRT link did not produce ARM64EC'
+        print('PASS: exact-source ARM64X CRT and same-package builtins/C++ runtime linked a real ARM64EC probe DLL. DLL not executed.')
+        PY
+    - name: "Build only native Wine tools and exact DXMT import prerequisites"
+      id: "wine"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt-pe/tmp"
+        python3 - <<'PY'
+        import hashlib,json,os,pathlib,re,shlex,subprocess
+        root=pathlib.Path('.work/cod-dxmt-pe').resolve();t=json.loads((root/'tools.json').read_text());w=root/'wine'
+        mingw=root/'inputs/llvm-mingw-20260922-ucrt-macos-universal'
+        env=dict(os.environ)
+        for key in ('CC','CXX','OBJC','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT'):env.pop(key,None)
+        prefixes=[str(mingw/'bin')]
+        for formula,suffix in [('make','libexec/gnubin'),('bison','bin'),('flex','bin'),('gettext','bin'),('coreutils','libexec/gnubin')]:
+         prefixes.append(subprocess.check_output(['brew','--prefix',formula],text=True).strip()+'/'+suffix)
+        env['PATH']=':'.join(prefixes)+':'+env['PATH']
+        native={**env,'CC':shlex.join([t['cc'],'--target=aarch64-apple-darwin','-isysroot',t['macsdk']]),
+         'CXX':shlex.join([t['cpp'],'--target=aarch64-apple-darwin','-isysroot',t['macsdk']]),
+         'OBJC':shlex.join([t['cc'],'-x','objective-c','--target=aarch64-apple-darwin','-isysroot',t['macsdk']]),
+         'AR':t['ar'],'RANLIB':t['ranlib'],'STRIP':t['strip'],
+         'LDFLAGS':'-isysroot '+t['macsdk']+' -fuse-ld='+t['macld']}
+        def run(command,cwd,environment,log):
+         with open(root/log,'w') as output:
+          rc=subprocess.run(command,cwd=cwd,env=environment,stdout=output,stderr=subprocess.STDOUT).returncode
+         if rc:
+          print((root/log).read_text()[-16000:],flush=True)
+          raise RuntimeError((command,rc,log))
+        tools=w/'build-tools';tools.mkdir()
+        run([t['bash'],'../configure','--enable-archs=none','--without-x','--without-freetype','--disable-tests'],
+            tools,native,'configure-tools.log')
+        run(['make','-j3','__tooldeps__','nls/locale.nls'],tools,env,'build-tools.log')
+        assert (tools/'tools/winebuild/winebuild').is_file()
+        report={}
+        for tree,archs,arch in [('build-macos','i386,aarch64','aarch64'),('build-arm64ec','arm64ec','arm64ec')]:
+         build=w/tree;build.mkdir()
+         target={**native,'CROSSLDFLAGS':'-Wl,-Brepro',
+                 'CROSSCFLAGS':'-g -O2 -ffile-prefix-map='+str(w)+'=wine -ffile-prefix-map='+str(mingw)+'=llvm-mingw'}
+         run([t['bash'],'../configure','--host=aarch64-apple-darwin','--without-x','--without-freetype',
+              '--without-gstreamer','--disable-tests','--with-wine-tools='+str(tools),
+              '--with-mingw='+str(mingw/'bin/clang'),'--enable-archs='+archs],
+             build,target,'configure-'+tree+'.log')
+         # Primary: Wine tools/makedep.c output_import_lib emits libntdll/libdbghelp directly from .spec + implib objects.
+         # Primary: libs/winecrt0/Makefile.in declares STATICLIB=libwinecrt0.a.
+         targets=[f'libs/winecrt0/{arch}-windows/libwinecrt0.a',
+                  f'dlls/ntdll/{arch}-windows/libntdll.a',
+                  f'dlls/dbghelp/{arch}-windows/libdbghelp.a']
+         makefile=(build/'Makefile').read_text()
+         for name in targets:assert re.search(r'^'+re.escape(name)+r'\s*:',makefile,re.M),('Missing generated prerequisite target',name)
+         run(['make','-j3',*targets],build,env,'imports-'+tree+'.log')
+         report[arch]={name:hashlib.sha256((build/name).read_bytes()).hexdigest() for name in targets}
+         assert not list(build.glob('dlls/**/*.dll')) and not list(build.glob('programs/**/*.exe')),'Unexpected full Wine production output'
+         for name in targets:
+          subprocess.run([str(mingw/'bin/llvm-readobj'),'--file-headers',str(build/name)],check=True)
+        (root/'wine-prerequisites.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
+        print('PASS: native Wine tools and three exact archive prerequisites per arch; no full Wine production rebuild.')
+        PY
+    - name: "Build both complete DXMT PE sets with isolated Mac native generators"
+      id: "dxmt"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt-pe/tmp"
+        python3 - <<'PY'
+        import difflib,hashlib,json,os,pathlib,re,shlex,shutil,subprocess
+        repo=pathlib.Path.cwd();root=repo/'.work/cod-dxmt-pe';t=json.loads((root/'tools.json').read_text())
+        d=root/'dxmt';mingw=root/'inputs/llvm-mingw-20260922-ucrt-macos-universal'
+        s=(d/'src/winemetal/unix/winemetal_unix.c').read_text()
+        tables={}
+        for name in ('__wine_unix_call_funcs','__wine_unix_call_wow64_funcs'):
+         body=re.search(r'const void \*\s*'+name+r'\[\]\s*=\s*\{(.*?)\};',s,re.S).group(1)
+         body=re.sub(r'/\*.*?\*/|//[^\n]*','',body,flags=re.S)
+         entries=[item.strip() for item in body.split(',') if item.strip()]
+         assert len(entries)==150 and all(re.fullmatch(r'&[A-Za-z0-9_]+|NULL',v) for v in entries),(name,len(entries))
+         tables[name]=entries
+        assert tables['__wine_unix_call_funcs'][-4:]==['&_madeira_ir_convert','&_MTLDevice_newRenderPipelineStateVD',
+         '&_MTLDevice_newGeometryEmulationPipelineState','&_madeira_ctl']
+        thunks=(d/'src/winemetal/winemetal_thunks.c').read_text()
+        calls={int(n) for n in re.findall(r'UNIX_CALL\(\s*(\d+)\s*,',thunks)}
+        assert max(calls)==149 and {146,147,148,149}<=calls,calls
+        assert re.search(r'#define WMT_API_COUNT\s+150\b',(d/'src/winemetal/wmt_api_names.h').read_text())
+        abi_files=['src/winemetal/winemetal.h','src/winemetal/winemetal_thunks.h',
+                   'src/winemetal/winemetal_thunks.c','src/winemetal/airconv_thunks.h',
+                   'src/winemetal/unix/winemetal_unix.c','src/winemetal/wmt_api_names.h']
+        abi={'dxmt_tree':subprocess.check_output(['git','-C',str(d),'rev-parse','HEAD^{tree}'],text=True).strip(),
+             'tables':tables,'max_pe_slot':max(calls),
+             'sources':{name:hashlib.sha256((d/name).read_bytes()).hexdigest() for name in abi_files}}
+        (root/'dxmt-abi.json').write_text(json.dumps(abi,indent=2));print('Matching Unix/PE ABI identity',json.dumps(abi),flush=True)
+        native='[binaries]\n'
+        for name,value in {'c':[t['cc']],'cpp':[t['cpp']],'ar':[t['ar']]}.items():native+=name+' = '+repr(value)+'\n'
+        native+='\n[built-in options]\n'
+        for name in ('c_args','cpp_args'):native+=name+' = '+repr(['-isysroot',t['macsdk']])+'\n'
+        for name in ('c_link_args','cpp_link_args'):
+         native+=name+' = '+repr(['-isysroot',t['macsdk'],'-fuse-ld='+t['macld']])+'\n'
+        (root/'mac.native').write_text(native)
+        # Preserve frozen Meson sources and the Linux recipe guard: only the PE subprocess
+        # receives a curated host-tool PATH with no xcrun/metal/metallib.
+        host=root/'host-tools';host.mkdir()
+        wanted=['git','xxd','sed','awk','grep','ninja','glslangValidator']
+        for name in wanted:
+         executable=shutil.which(name);assert executable,name
+         (host/name).symlink_to(pathlib.Path(executable).resolve())
+        if shutil.which('glslang'):(host/'glslang').symlink_to(pathlib.Path(shutil.which('glslang')).resolve())
+        core=pathlib.Path(subprocess.check_output(['brew','--prefix','coreutils'],text=True).strip())/'libexec/gnubin'
+        path=':'.join(map(str,[mingw/'bin',root/'venv/bin',host,core]))
+        for name in ('xcrun','metal','metallib'):assert shutil.which(name,path=path) is None,(name,path)
+        env=dict(os.environ)
+        for key in ('CC','CXX','OBJC','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT'):env.pop(key,None)
+        env.update(PATH=path,JOBS='3')
+        a=root/'adapter';(a/'stages').mkdir(parents=True)
+        shutil.copy2(repo/'build/lib.sh',a/'lib.sh')
+        values={'PLAYPORT_REPO':str(repo),'PLAYPORT_BUILD':str(root),'PLAYPORT_RUN':str(root),
+         'LLVM_MINGW':str(mingw),'DXMT_BUILD_ROOT':str(root),'SHADER_HEADERS':str(root),
+         'WINE':str(root/'wine'),'WINEBUILD':str(root/'wine/build-tools/tools/winebuild/winebuild'),
+         'MACSDK':t['macsdk'],'IOSSDK':t['iossdk']}
+        (a/'env.sh').write_text('\n'.join(k+'='+shlex.quote(v) for k,v in values.items())+'\nexport '+' '.join(values)+'\n')
+        original=(repo/'build/stages/dxmt-patched.sh').read_text();adapted=original
+        old='printf "[binaries]\\nc = \'clang\'\\ncpp = \'clang++\'\\n" > "$ROOT/native-clang.txt"'
+        assert adapted.count(old)==1
+        adapted=adapted.replace(old,'cp "$ROOT/mac.native" "$ROOT/native-clang.txt"')
+        # No runtime or Meson source patch: retain the actual Apple-tool guard with a known-safe PATH.
+        assert 'if command -v xcrun metal metallib; then' in adapted
+        old='--native-file "$ROOT/native-clang.txt" -Dwine_build_path='
+        assert adapted.count(old)==1
+        adapted=adapted.replace(old,'--native-file "$ROOT/native-clang.txt" --wrap-mode=nodownload -Dwine_build_path=')
+        script=a/'stages/dxmt-patched.sh';script.write_text(adapted)
+        print(''.join(difflib.unified_diff(original.splitlines(True),adapted.splitlines(True),
+                                         fromfile='frozen dxmt-patched.sh',tofile='Mac PE host adapter')),flush=True)
+        print('Recipe hashes',hashlib.sha256(original.encode()).hexdigest(),hashlib.sha256(adapted.encode()).hexdigest(),flush=True)
+        subprocess.run([t['bash'],'-n',str(script)],check=True)
+        try:subprocess.run([t['bash'],str(script),str(root),'pe'],env=env,check=True)
+        finally:
+         for log in sorted(root.glob('*-a*.log')):
+          if log.exists():print(log.name,log.read_text()[-10000:],flush=True)
+        for arch in ('aarch64','arm64ec'):
+         target_data=json.loads(subprocess.check_output([str(root/'venv/bin/meson'),'introspect','--targets',str(root/('build-'+arch))],text=True))
+         outputs=[output for target in target_data for output in target.get('filename',[])]
+         assert not any(p.endswith(('.so','.metallib','.air')) or pathlib.Path(p).name=='airconv' for p in outputs),outputs
+         assert {p.name for p in (root/'pe'/(arch+'-windows')).glob('*.dll')}=={'d3d11.dll','dxgi.dll','winemetal.dll','d3d10core.dll'}
+        subprocess.run(['git','-C',str(d),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
+        (root/'pe-environment.json').write_text(json.dumps({'PATH':path,'native_file':native},indent=2))
+        print('PASS: both complete DXMT PE sets built from the exact 150-slot source; no Apple offline AIR targets or target execution.')
+        PY
+    - name: "Build all stock Vulkan overlay DLLs and both source PE helpers"
+      id: "resources"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        export TMPDIR="$PWD/.work/cod-dxmt-pe/tmp"
+        python3 - <<'PY'
+        import difflib,hashlib,json,os,pathlib,subprocess
+        repo=pathlib.Path.cwd();root=repo/'.work/cod-dxmt-pe';t=json.loads((root/'tools.json').read_text())
+        a=root/'adapter';env=dict(os.environ)
+        for key in ('CC','CXX','OBJC','CFLAGS','CXXFLAGS','CPPFLAGS','LDFLAGS','SDKROOT'):env.pop(key,None)
+        env.update(PATH=json.loads((root/'pe-environment.json').read_text())['PATH'],JOBS='3')
+        original=(repo/'build/stages/vulkan-pe.sh').read_text()
+        old='meson setup --cross-file'
+        assert original.count(old)==3
+        adapted=original.replace(old,'meson setup --native-file "'+str(root/'mac.native')+'" --wrap-mode=nodownload --cross-file')
+        script=a/'stages/vulkan-pe.sh';script.write_text(adapted)
+        print(''.join(difflib.unified_diff(original.splitlines(True),adapted.splitlines(True),
+                                         fromfile='frozen vulkan-pe.sh',tofile='Mac generator adapter')),flush=True)
+        print('Vulkan recipe hashes',hashlib.sha256(original.encode()).hexdigest(),hashlib.sha256(adapted.encode()).hexdigest(),flush=True)
+        subprocess.run([t['bash'],'-n',str(script)],check=True)
+        # Source checkout and all patch/submodule validation happened before this build.
+        try:subprocess.run([t['bash'],str(script),str(root/'vulkan'),'dxvk','dxvk32','vkd3d'],env=env,check=True)
+        finally:
+         for log in sorted((root/'vulkan').glob('*.log')):print(log.name,log.read_text()[-10000:],flush=True)
+        session=a/'stages/session-root.sh';session.write_bytes((repo/'build/stages/session-root.sh').read_bytes())
+        subprocess.run([t['bash'],'-n',str(session)],check=True)
+        subprocess.run([t['bash'],str(session),str(root/'session')],env=env,check=True)
+        print('PASS: complete frozen Vulkan overlay sets and both source-owned session/URL helpers built; no Windows image executed.')
+        PY
+    - name: "Inspect all PE machines builtins exports imports and complete resource sets"
+      id: "inspect"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-dxmt-pe"
+        export TMPDIR="$root/tmp"
+        "$root/venv/bin/python" - <<'PY'
+        import hashlib,json,pathlib,re,subprocess,pefile
+        repo=pathlib.Path.cwd();root=repo/'.work/cod-dxmt-pe'
+        m=root/'inputs/llvm-mingw-20260922-ucrt-macos-universal';readobj=m/'bin/llvm-readobj'
+        required={'d3d11.dll':{'D3D11CoreCreateDevice','D3D11CreateDevice','D3D11CreateDeviceAndSwapChain','D3D11On12CreateDevice'},
+                  'dxgi.dll':{'CreateDXGIFactory','CreateDXGIFactory1','CreateDXGIFactory2','DXGIGetDebugInterface1'},
+                  'd3d10core.dll':{'D3D10CoreCreateDevice','D3D10CoreRegisterLayers'},
+                  'winemetal.dll':{'SM50Initialize','SM50Compile','MadeiraCtl','MTLDevice_newLibraryWithSource'}}
+        result={}
+        def inspect(path,machine,builtin=False,exports=()):
+         data=path.read_bytes();image=pefile.PE(data=data)
+         header=subprocess.check_output([str(readobj),'--file-headers','--coff-load-config',str(path)],text=True)
+         assert 'Machine: IMAGE_FILE_MACHINE_'+machine+' ' in header,(path,header)
+         assert not any(section.Name.startswith(b'.debug_') for section in image.sections),path
+         assert image.FILE_HEADER.TimeDateStamp==0,(path,image.FILE_HEADER.TimeDateStamp)
+         if builtin:assert b'Wine builtin DLL' in data[:256],path
+         names={e.name.decode() for e in image.DIRECTORY_ENTRY_EXPORT.symbols if e.name} if hasattr(image,'DIRECTORY_ENTRY_EXPORT') else set()
+         assert set(exports)<=names,(path,set(exports)-names)
+         imports={entry.dll.decode().lower() for attr in ('DIRECTORY_ENTRY_IMPORT','DIRECTORY_ENTRY_DELAY_IMPORT')
+                  for entry in getattr(image,attr,[])}
+         if machine=='ARM64EC':
+          assert image.FILE_HEADER.Machine in (0x8664,0xa641),(path,image.FILE_HEADER.Machine)
+          if image.FILE_HEADER.Machine==0x8664:
+           pointer=getattr(image.DIRECTORY_ENTRY_LOAD_CONFIG.struct,'CHPEMetadataPointer',0)
+           rva=pointer-image.OPTIONAL_HEADER.ImageBase
+           assert pointer and 0<rva<image.OPTIONAL_HEADER.SizeOfImage and len(image.get_data(rva,4))==4,(path,pointer)
+         record={'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),'machine':machine,
+                 'raw_machine':hex(image.FILE_HEADER.Machine),'imports':sorted(imports),'exports':sorted(names)}
+         result[str(path.relative_to(root))]=record
+         return imports
+        for arch,machine in [('aarch64','ARM64'),('arm64ec','ARM64EC')]:
+         directory=root/'pe'/(arch+'-windows')
+         assert {p.name for p in directory.glob('*.dll')}==set(required)
+         for name,exports in required.items():inspect(directory/name,machine,True,exports)
+        for arch,machine,expected in [
+         ('arm64ec','ARM64EC',{'d3d8.dll','d3d9.dll','d3d10core.dll','d3d11.dll','dxgi.dll','d3d12.dll','d3d12core.dll'}),
+         ('i386','I386',{'d3d9.dll','d3d10core.dll','d3d11.dll','dxgi.dll'})]:
+         directory=root/'vulkan/pe'/(arch+'-windows')
+         assert {p.name for p in directory.glob('*.dll')}==expected,(arch,sorted(p.name for p in directory.glob('*.dll')))
+         for path in sorted(directory.glob('*.dll')):inspect(path,machine,True)
+        for name in ('playport-session.exe','playport-url-opener.exe'):
+         imports=inspect(root/'session'/name,'AMD64')
+         assert imports<={'kernel32.dll','user32.dll'},(name,imports)
+        assert len(result)==21,len(result)
+        for path,record in result.items():print(path,json.dumps(record),flush=True)
+        (root/'result.json').write_text(json.dumps({'files':result,'dxmt_abi':json.loads((root/'dxmt-abi.json').read_text()),
+         'scope':'full DXMT PE/Vulkan stock resource sets and helpers; no full Wine production rebuild, app link or execution'},indent=2))
+        for tree,count,pin in [('wine',231,'455e3509b98a6919fd4ad1def4803e08c41c03b2'),
+         ('dxmt',54,'68af85e96196e1cf9f50de9fe24c70f03a1db4a7'),
+         ('vulkan/dxvk',5,'e5ffd0fe5e5d62e68b2831d1285b51e61bb454d8'),
+         ('vulkan/vkd3d-proton',4,'31d1f89ca5b3f2fd3b6f025c8e6f73ed3eaa852b')]:
+         assert subprocess.check_output(['git','-C',str(root/tree),'rev-parse',f'HEAD~{count}'],text=True).strip()==pin
+         subprocess.run(['git','-C',str(root/tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
+        subprocess.run(['git','diff','--exit-code','HEAD'],check=True)
+        print('PASS: all 21 PE resources inspected, including both complete DXMT sets and matching 150-slot source identity. No app or gameplay claim.')
+        PY
+    - name: "Record source-only PE closure outcomes"
+      if: "${{ always() }}"
+      shell: "bash"
+      run: |
+        set -euo pipefail
+        printf '%s\n' \
+         'Matched source-only PE closure: verified 20260922 Mac compiler; exact rebuilt EC CRT; only Wine archive/tool prerequisites; complete DXMT and stock Vulkan/helper sets.' \
+         'Tools: ${{ steps.tools.outcome }}; compiler: ${{ steps.toolchain.outcome }}; sources: ${{ steps.sources.outcome }}; EC CRT: ${{ steps.crt.outcome }}; Wine prerequisites: ${{ steps.wine.outcome }}; DXMT: ${{ steps.dxmt.outcome }}; stock resources: ${{ steps.resources.outcome }}; PE inspection: ${{ steps.inspect.outcome }}.' \
+         'No cache, artifact upload, SDK export, independent Madeira binaries, signing, device or game inputs. No Windows image executed.' \
+         'Next: combine this matching source identity with the Unix/LLVM component and remaining media/Swift gates for full app staging and link review in this thread. No new thread required.' >> "$GITHUB_STEP_SUMMARY"
