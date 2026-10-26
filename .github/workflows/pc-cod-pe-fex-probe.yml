@@ -28,7 +28,7 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
-        brew install cmake ninja make bison flex pkgconf llvm@22 gettext coreutils autoconf automake libtool
+        brew install bash cmake ninja make bison flex pkgconf llvm@22 gettext coreutils autoconf automake libtool
         cd source
         root="$PWD/.work/cod-pe-fex"
         mkdir -p "$root/tmp" "$root/inputs"
@@ -57,7 +57,7 @@ jobs:
          '-fuse-ld='+record['macld'],'-x','c','-','-o',str(root/'native-link-probe')],
          input='int main(void) { return 0; }\n',text=True,check=True)
         PY
-        brew list --versions cmake ninja make bison flex pkgconf llvm@22 gettext coreutils autoconf automake libtool
+        brew list --versions bash cmake ninja make bison flex pkgconf llvm@22 gettext coreutils autoconf automake libtool
     - name: Verify the official matching Mac PE compiler package
       id: toolchain
       shell: bash
@@ -264,6 +264,35 @@ jobs:
         print(''.join(difflib.unified_diff(original.splitlines(True),pe.splitlines(True),fromfile='pinned wine-pe.sh',tofile='Mac host adapter')))
         print('No runtime source pin or runtime source patch changed by the host adapter.')
         PY
+    - name: Build both pinned FEX CPU modules and verify the submodule closure
+      id: fex
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd source
+        root="$PWD/.work/cod-pe-fex"
+        export TMPDIR="$root/tmp"
+        export PATH="$root/venv/bin:$(brew --prefix make)/libexec/gnubin:$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+        unset CC CXX OBJC CFLAGS CXXFLAGS CPPFLAGS LDFLAGS SDKROOT
+        export JOBS=3
+        # FEX consumes the matched compiler/CRT and its own source closure only.
+        # Run it before Wine PE so host/FEX failures do not repeat the long PE build.
+        # macOS /bin/bash 3 rejects the pinned lib.sh empty-array expansion under set -u.
+        modern_bash="$(brew --prefix bash)/bin/bash"
+        "$modern_bash" --version
+        "$modern_bash" -c '(( BASH_VERSINFO[0] >= 5 ))'
+        "$modern_bash" "$root/adapter/stages/fex.sh" "$root"
+        "$root/venv/bin/python" - <<'PY'
+        import json,pathlib,subprocess
+        root=pathlib.Path('.work/cod-pe-fex').resolve();f=root/'fex'
+        expected={'FEX':'3648ee97e8354bb2e6757da8bdb00c48439a561d','rpmalloc':'09142d726429416bfa7b459151515fe3ab7622dd'}
+        for tree,key,count in [(f,'FEX',103),(f/'External/rpmalloc','rpmalloc',19)]:
+         base=subprocess.check_output(['git','-C',str(tree),'rev-parse',f'HEAD~{count}'],text=True).strip()
+         assert base==expected[key],(key,base)
+         subprocess.run(['git','-C',str(tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
+        print(subprocess.check_output(['git','-C',str(f),'submodule','status','--recursive'],text=True))
+        print('FEX and rpmalloc complete patch sequences verified against their exact bases.')
+        PY
     - name: Build and machine-check complete production PE sets from matched Wine source
       id: pe
       shell: bash
@@ -278,29 +307,6 @@ jobs:
         OUT="$root/pe" bash "$root/adapter/stages/wine-pe.sh"
         "$root/venv/bin/python" "$root/adapter/stages/wine-pe-strip.py" "$root/pe/wine" "$root/pe/staged" \
          "$root/inputs/llvm-mingw-20260922-ucrt-macos-universal/bin/llvm-strip"
-    - name: Build both pinned FEX CPU modules and verify the submodule closure
-      id: fex
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd source
-        root="$PWD/.work/cod-pe-fex"
-        export TMPDIR="$root/tmp"
-        export PATH="$root/venv/bin:$(brew --prefix make)/libexec/gnubin:$(brew --prefix coreutils)/libexec/gnubin:$PATH"
-        unset CC CXX OBJC CFLAGS CXXFLAGS CPPFLAGS LDFLAGS SDKROOT
-        export JOBS=3
-        bash "$root/adapter/stages/fex.sh" "$root"
-        "$root/venv/bin/python" - <<'PY'
-        import json,pathlib,subprocess
-        root=pathlib.Path('.work/cod-pe-fex').resolve();f=root/'fex'
-        expected={'FEX':'3648ee97e8354bb2e6757da8bdb00c48439a561d','rpmalloc':'09142d726429416bfa7b459151515fe3ab7622dd'}
-        for tree,key,count in [(f,'FEX',103),(f/'External/rpmalloc','rpmalloc',19)]:
-         base=subprocess.check_output(['git','-C',str(tree),'rev-parse',f'HEAD~{count}'],text=True).strip()
-         assert base==expected[key],(key,base)
-         subprocess.run(['git','-C',str(tree),'diff','--exit-code','--ignore-submodules=all','HEAD'],check=True)
-        print(subprocess.check_output(['git','-C',str(f),'submodule','status','--recursive'],text=True))
-        print('FEX and rpmalloc complete patch sequences verified against their exact bases.')
-        PY
     - name: Inspect all PE sets and both CPU modules without executing Windows code
       id: inspect
       shell: bash
