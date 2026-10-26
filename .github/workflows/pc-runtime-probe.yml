@@ -1,0 +1,413 @@
+name: PC game runtime build probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pc-games-runtime-probe-20261025
+    paths:
+      - .github/workflows/pc-runtime-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-runtime-probe
+  cancel-in-progress: false
+
+jobs:
+  source-build-probe:
+    name: Check cloud Xcode and runtime build inputs
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - name: Check out pinned runtime source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: willfaust/Madeira
+          ref: e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          persist-credentials: false
+          submodules: false
+          path: runtime
+      - name: Verify cloud tools and cross-compiler
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhone SDK: $sdk_version"
+          test "${sdk_version%%.*}" -ge 26
+          xcrun clang --version | head -n 1
+          printf '#include <TargetConditionals.h>\nint probe(void) { return TARGET_OS_IPHONE; }\n' > "$RUNNER_TEMP/ios-sdk-probe.c"
+          xcrun clang -target arm64-apple-ios26.0 -isysroot "$sdk" -fsyntax-only "$RUNNER_TEMP/ios-sdk-probe.c"
+          printf 'Cloud Mac/Xcode iPhone SDK probe passed. No app has been built or signed.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'cache-context=%s-%s-%s\n' "$(xcodebuild -version | tr '\n ' '--')" "$sdk_version" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Build media decoding libraries from checked source
+        id: media
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          bash build/ffmpeg/build.sh || {
+            tail -n 80 build/ffmpeg/obj/configure.log 2>/dev/null || true
+            tail -n 80 build/ffmpeg/obj/make.log 2>/dev/null || true
+            exit 1
+          }
+          for lib in avformat avcodec swresample avutil; do
+            xcrun lipo -info "app/Madeira/lib$lib.a"
+          done
+      - name: Build on-device pairing library from locked source
+        id: pairing
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          cd runtime
+          bash build/rppairing-ios/build.sh
+          xcrun lipo -info app/Madeira/libmadeira_rppairing.a
+      - name: Build CPU translation core from pinned submodule
+        id: fex
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake ninja ccache
+          cd runtime
+          git submodule update --init --depth 1 --recursive FEX
+          export CMAKE_BUILD_PARALLEL_LEVEL=3
+          cmake -S FEX -B FEX/build-ios -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
+            -DTUNE_CPU=cortex-a78
+          bash build/fex-ios/build.sh
+          cmake --build FEX/build-ios --target JemallocLibs
+          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore.a
+          xcrun lipo -info FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
+      - name: Build native Windows API libraries from pinned source
+        id: nativewine
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install bison flex pkg-config llvm
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$(brew --prefix llvm)/bin:$PATH"
+          cd runtime
+          git submodule update --init --depth 1 wine
+          mkdir -p toolchains
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 \
+            -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz
+          printf '%s  %s\n' bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7 "$RUNNER_TEMP/llvm-mingw.tar.xz" | shasum -a 256 -c -
+          tar -xf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C toolchains
+          native_build_path="$PATH"
+          export PATH="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH"
+          mkdir -p wine/build-macos
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/wine-host-probe.c"
+          xcrun --sdk macosx clang "$RUNNER_TEMP/wine-host-probe.c" -o "$RUNNER_TEMP/wine-host-probe"
+          (cd wine/build-macos && CC="xcrun --sdk macosx clang" CXX="xcrun --sdk macosx clang++" \
+            ../configure --enable-archs=arm64ec --without-x --without-opengl --without-vulkan --disable-tests --enable-winegstreamer) || {
+              sed -n '1,280p' wine/build-macos/config.log
+              exit 1
+            }
+          python3 - <<'PY'
+          import re, subprocess
+          from pathlib import Path
+          source = Path('wine/include/Makefile.in').read_text()
+          targets = sorted(set('include/' + item[:-4] + '.h'
+                               for item in re.findall(r'[A-Za-z0-9_./]+\.idl', source)))
+          subprocess.run(['make', '-C', 'wine/build-macos', '-j3', *targets], check=True)
+          PY
+          mkdir -p wine/build-arm64ec
+          ln -s "$PWD/wine/build-macos/include" wine/build-arm64ec/include
+          export PATH="$native_build_path"
+          mkdir -p research/freetype
+          git -C research/freetype init
+          git -C research/freetype remote add origin https://github.com/freetype/freetype.git
+          git -C research/freetype fetch --depth 1 origin 42608f77f20749dd6ddc9e0536788eaad70ea4b5
+          git -C research/freetype checkout --detach FETCH_HEAD
+          CC="$(xcrun --sdk iphoneos --find clang)" CXX="$(xcrun --sdk iphoneos --find clang++)" bash build/freetype-ios/build.sh
+          bash build/gnutls-ios/build.sh || {
+            find build/gnutls-ios/obj -name '*.log' -exec tail -n 15 {} \;
+            exit 1
+          }
+          # Upstream only refreshes a missing prebuilt wineserver archive.
+          # Create its base members from the pinned server source list first.
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          path = Path('build/wineserver/build.sh')
+          text = path.read_text()
+          start = text.index('# Copy the base library if we don')
+          end = text.index('CC_FLAGS=(', start)
+          text = text[:start] + text[end:]
+          sources = re.findall(r'\b([A-Za-z0-9_]+\.c)\b', Path('wine/server/Makefile.in').read_text())
+          bootstrap = 'BASE_SOURCES=(' + ' '.join(sources) + ')\n' + r'''
+          if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
+              replaced=" "
+              for entry in "${PATCHED_FILES[@]}"; do replaced="$replaced${entry##*:} "; done
+              for source in "${BASE_SOURCES[@]}"; do
+                  name="${source%.c}"
+                  [[ "$replaced" == *" $name.o "* ]] && continue
+                  compile_one "$WINE_SRC/server/$source" "$name"
+              done
+              xcrun ar rcs "$OBJ_DIR/libwineserver.a" "$OBJ_DIR"/*.o
+          fi
+          '''
+          anchor = 'echo "=== Building kill wrapper (without kill macro) ==="'
+          assert text.count(anchor) == 1
+          path.write_text(text.replace(anchor, bootstrap + '\n' + anchor))
+          PY
+          bash build/wineserver/build.sh
+          bash build/ntdll-unix/build.sh || {
+            find build/ntdll-unix/obj -name '*.err' -size +0 -print -exec tail -n 12 {} \;
+            exit 1
+          }
+          bash build/win32u-unix/build.sh || {
+            find build/win32u-unix/obj -name '*.err' -size +0 -print -exec tail -n 12 {} \;
+            exit 1
+          }
+          for lib in wineserver ntdll_unix win32u_unix; do xcrun lipo -info "app/Madeira/lib$lib.a"; done
+          bash build/stage-licenses.sh
+      - name: Restore LLVM libraries built by this source recipe
+        id: llvm-cache
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            runtime/toolchains/llvm-ios-build/include
+            runtime/toolchains/llvm-ios-build/lib
+          key: pc-runtime-llvm-d213c58b94c5311b836e4ca3-${{ runner.os }}-${{ runner.arch }}-${{ steps.tools.outputs.cache-context }}
+      - name: Build pinned LLVM shader compiler
+        id: llvm
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          mkdir -p toolchains/llvm-project
+          git -C toolchains/llvm-project init
+          git -C toolchains/llvm-project remote add origin https://github.com/llvm/llvm-project.git
+          git -C toolchains/llvm-project config core.sparseCheckout true
+          printf '/llvm/\n/cmake/\n/third-party/\n' > toolchains/llvm-project/.git/info/sparse-checkout
+          git -C toolchains/llvm-project -c protocol.version=2 fetch --depth 1 --filter=blob:none origin 8dfdcc7b7bf66834a761bd8de445840ef68e4d1a
+          git -C toolchains/llvm-project checkout --detach FETCH_HEAD
+          test "$(git -C toolchains/llvm-project rev-parse HEAD)" = 8dfdcc7b7bf66834a761bd8de445840ef68e4d1a
+          if [ "${{ steps.llvm-cache.outputs.cache-hit }}" != true ]; then
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF
+          cmake --build toolchains/llvm-host-build --target llvm-tblgen llvm-config --parallel 3
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DLLVM_HOST_TRIPLE=arm64-apple-ios17.0 -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-ios17.0 \
+            -DLLVM_TARGET_ARCH=host -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen"
+          cmake --build toolchains/llvm-ios-build --target LLVMPasses LLVMBitWriter --parallel 3
+          fi
+          for lib in LLVMCore LLVMPasses LLVMBitWriter; do xcrun lipo -info "toolchains/llvm-ios-build/lib/lib$lib.a"; done
+      - name: Preserve successfully built LLVM libraries for source-build retries
+        if: ${{ !cancelled() && steps.llvm.outcome == 'success' && steps.llvm-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            runtime/toolchains/llvm-ios-build/include
+            runtime/toolchains/llvm-ios-build/lib
+          key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+      - name: Build D3D9-D3D11 graphics bridge from pinned source
+        id: graphics
+        if: ${{ steps.nativewine.outcome == 'success' && steps.llvm.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          git submodule update --init --depth 1 --recursive dxmt
+          if ! xcrun --sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          mkdir -p build/dxmt-ios/shader-headers
+          for shader in air_msad air_samplepos air_tessellation; do
+            xcrun --sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 \
+              -o "build/dxmt-ios/shader-headers/$shader.air" -c "dxmt/src/airconv/shaders/$shader.metal"
+            xxd -n "$shader" -i "build/dxmt-ios/shader-headers/$shader.air" "build/dxmt-ios/shader-headers/$shader.h"
+          done
+          # These PC games use D3D9/11 or OpenGL; the separate D3D12 converter is excluded.
+          export MADEIRA_ALLOW_NO_D3D12=1
+          bash build/dxmt-ios/build.sh || {
+            find build/dxmt-ios/obj -name '*.err' -size +0 -print -exec tail -n 15 {} \;
+            exit 1
+          }
+          xcrun libtool -static -o app/Madeira/libdxmt_combined.a \
+            build/dxmt-ios/libdxmt_unix.a toolchains/llvm-ios-build/lib/libLLVM*.a
+          xcrun lipo -info app/Madeira/libdxmt_combined.a
+      - name: Obtain unchanged Microsoft runtime files using upstream extractor
+        id: vcruntime
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install sevenzip
+          cd runtime
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('tools/unpack-burn-cabinets.py').write_text(r'''# Static extraction of CAB containers in a Microsoft-signed Burn installer.
+          # Never executes the installer or DLL payloads.
+          import hashlib
+          import json
+          import struct
+          import subprocess
+          import sys
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          
+          source, destination, sevenzip = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+          destination.mkdir(parents=True, exist_ok=True)
+          seen = set()
+          reports = []
+          def extract_containers(item):
+              data = item.read_bytes()
+              position = 0
+              outputs = []
+              while True:
+                  position = data.find(b'MSCF', position)
+                  if position < 0:
+                      break
+                  if position + 36 <= len(data):
+                      size = struct.unpack_from('<I', data, position + 8)[0]
+                      files_offset = struct.unpack_from('<I', data, position + 16)[0]
+                      folders, files = struct.unpack_from('<HH', data, position + 26)
+                      valid = (data[position + 24:position + 26] == b'\x03\x01'
+                               and 36 <= files_offset < size <= len(data) - position
+                               and folders > 0 and files > 0)
+                      if valid:
+                          payload = data[position:position + size]
+                          digest = hashlib.sha256(payload).hexdigest()
+                          if digest not in seen:
+                              if len(seen) >= 64:
+                                  raise SystemExit('Unexpected cabinet count')
+                              seen.add(digest)
+                              cabinet = destination / f'container-{len(seen)}.cab'
+                              output = destination / f'container-{len(seen)}'
+                              cabinet.write_bytes(payload)
+                              subprocess.run([sevenzip, 'x', str(cabinet), '-o' + str(output), '-y'],
+                                             check=True, stdout=subprocess.DEVNULL)
+                              outputs.append(output)
+                              reports.append({'source': item.name, 'offset': position,
+                                              'files': files, 'sha256': digest})
+                  position += 4
+              return outputs
+          
+          root_outputs = extract_containers(source)
+          manifests = [folder / '0' for folder in root_outputs if (folder / '0').is_file()]
+          if len(manifests) != 1:
+              raise SystemExit('Expected one embedded Burn manifest')
+          manifest = ET.fromstring(manifests[0].read_bytes())
+          selected = []
+          for node in manifest.iter():
+              path = node.attrib.get('FilePath', '').replace('\\', '/').lower()
+              if not (path.endswith('/cab1.cab') and
+                      ('/vcruntimeminimum_amd64/' in path or '/vcruntimeadditional_amd64/' in path)):
+                  continue
+              member = node.attrib['SourcePath']
+              if '/' in member or '\\' in member or member in ('.', '..'):
+                  raise SystemExit('Unexpected payload path')
+              matches = [folder / member for folder in root_outputs if (folder / member).is_file()]
+              if len(matches) != 1:
+                  raise SystemExit('Missing or ambiguous runtime cabinet')
+              selected.append(matches[0])
+          if len(selected) != 2:
+              raise SystemExit('Expected two x64 runtime cabinets')
+          for item in selected:
+              if not extract_containers(item):
+                  raise SystemExit('Runtime payload contains no cabinet')
+          print(json.dumps({'cabinets': reports}, indent=2))
+          ''')
+          path = Path('tools/fetch-vcruntime.sh')
+          text = path.read_text()
+          start = text.index('"$SEVENZIP" x "$TMP/VC_redist.x64.exe"')
+          end = text.index('WANTED=(', start)
+          text = text[:start] + 'python3 "$R/tools/unpack-burn-cabinets.py" "$TMP/VC_redist.x64.exe" "$TMP/cab_out" "$SEVENZIP"\n\n' + text[end:]
+          anchor = 'if command -v shasum >/dev/null 2>&1; then'
+          assert text.count(anchor) == 1
+          verification = 'printf "%s  %s\\n" cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b "$TMP/VC_redist.x64.exe" | shasum -a 256 -c -\n'
+          path.write_text(text.replace(anchor, verification + anchor))
+          PY
+          bash tools/fetch-vcruntime.sh
+          python3 tests/host/check-vcruntime.py --strict
+      - name: Inventory actual source-build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          test "$(git rev-parse HEAD)" = e3a88fddb8daed1f5ac28a45dcb4663d65192629
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          required = [
+              "FEX/build-ios/FEXCore/Source/libFEXCore.a",
+              "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a",
+              "FEX/build-ios/FEXCore/Source/libJemallocLibs.a",
+              "FEX/build-ios/External/fmt/libfmt.a",
+              "FEX/build-ios/External/cephes/libcephes_128bit.a",
+              "FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a",
+              "FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a",
+              "app/Madeira/libwineserver.a",
+              "app/Madeira/libntdll_unix.a",
+              "app/Madeira/libwin32u_unix.a",
+              "app/Madeira/libdxmt_combined.a",
+              "app/Madeira/libavformat.a",
+              "app/Madeira/libavcodec.a",
+              "app/Madeira/libswresample.a",
+              "app/Madeira/libavutil.a",
+              "app/Madeira/libmadeira_rppairing.a",
+              "app/Madeira/x86_64-vcruntime",
+          ]
+          missing = [path for path in required if not Path(path).exists()]
+          outcomes = {"media": "${{ steps.media.outcome }}", "pairing": "${{ steps.pairing.outcome }}",
+                      "fex": "${{ steps.fex.outcome }}", "nativewine": "${{ steps.nativewine.outcome }}",
+                      "llvm": "${{ steps.llvm.outcome }}", "graphics": "${{ steps.graphics.outcome }}",
+                      "vcruntime": "${{ steps.vcruntime.outcome }}"}
+          report = {"source": "e3a88fddb8daed1f5ac28a45dcb4663d65192629",
+                    "cloud_sdk_checked": True, "missing_build_inputs": missing,
+                    "dependency_step_outcomes": outcomes,
+                    "game_files_supplied": False, "signing_attempted": False,
+                    "iphone_gameplay_verified": False}
+          print(json.dumps(report, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
+              stream.write("\nRuntime source-build input check\n\n")
+              stream.write("Missing inputs: " + str(len(missing)) + "\n")
+              for path in missing:
+                  stream.write("- " + path + "\n")
+              stream.write("\nThis is a build prerequisite probe, not a playable game or signed IPA.\n")
+          if missing or any(value != 'success' for value in outcomes.values()):
+              raise SystemExit("Native runtime dependency builds are required before the app can compile.")
+          PY
+          git submodule status
+          xcodebuild -list -project app/Madeira.xcodeproj -json > "$RUNNER_TEMP/runtime-project.json"
+      - name: Attempt unsigned runtime build only when inputs exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project runtime/app/Madeira.xcodeproj -scheme Madeira -configuration Debug \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/pc-runtime-derived" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO build > "$RUNNER_TEMP/pc-runtime-build.log" 2>&1 || {
+              tail -n 100 "$RUNNER_TEMP/pc-runtime-build.log"
+              exit 1
+            }
+          printf '\nUnsigned runtime build passed. No game or device test has run.\n' >> "$GITHUB_STEP_SUMMARY"
+
+
