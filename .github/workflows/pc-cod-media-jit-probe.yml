@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   media-jit-source-probe:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 180
     steps:
       - name: "Check out the frozen Playport source"
@@ -56,7 +56,7 @@ jobs:
           tools = {name: out('xcrun', '--sdk', 'iphoneos', '--find', name)
                    for name in ('clang', 'clang++', 'ar', 'ld', 'swiftc')}
           record = {'sdk': sdk, 'version': version, 'macsdk': out('xcrun', '--sdk', 'macosx', '--show-sdk-path'),
-                    'developer': out('xcode-select', '-p'), 'ios': tools,
+                    'developer': str(next(path for path in pathlib.Path(tools['swiftc']).resolve().parents if path.name == 'Developer')), 'ios': tools,
                     'macclang': out('xcrun', '--sdk', 'macosx', '--find', 'clang'),
                     'macld': out('xcrun', '--sdk', 'macosx', '--find', 'ld'),
                     'llvm': out('brew', '--prefix', 'llvm@22'), 'bash': out('brew', '--prefix', 'bash') + '/bin/bash'}
@@ -494,6 +494,7 @@ jobs:
                           '-Wl,-force_load,' + str(root / 'idevice/libidevice_ffi.a'), str(out / 'relaunch.o'),
                           '-framework', 'Foundation', '-framework', 'Security', '-framework', 'CoreFoundation',
                           '-lc++', '-liconv', '-lresolv', '-o', str(binary)], check=True)
+          assert __import__('hashlib').sha256(pathlib.Path('build/check-macho-imports.py').read_bytes()).hexdigest() == 'cd155383b94a75c30876f420d27383b365503b772743540372729baf2bf032b4'
           checker = ['python3', 'build/check-macho-imports.py', '--sdk', tools['sdk'], '--platform', 'ios', '--minos', '26.0']
           subprocess.run(checker + ['--exports', 'playport_relaunch,rp_pairing_file_from_bytes,tunnel_create_rppairing,app_service_connect_rsd,app_service_launch_app', str(binary)], check=True)
           print('Real idevice + unmodified Relaunch C source linked for SDK import auditing; the audit dylib was not run.')
@@ -578,8 +579,102 @@ jobs:
           assert not (copied_fw / 'universal.js').exists() and not (copied_fw / 'legacy.js').exists()
           metadata = subprocess.check_output(['llvm-objdump', '--macho', '--objc-meta-data', str(binary)], text=True)
           assert 'PlayportJITHelper' in metadata, 'Principal class absent from actual Objective-C metadata'
+          def audit_load_paths(data, sdk):
+              import pathlib, struct
+              assert data[:4] == b'\xcf\xfa\xed\xfe', 'Expected thin Mach-O64'
+              _, cpu, subtype, kind, count, size, flags, reserved = struct.unpack_from('<8I', data)
+              assert cpu == 0x0100000c and kind == 6, (cpu, kind)
+              assert 32 + size <= len(data)
+              sdk = pathlib.Path(sdk).resolve()
+              dylibs = {0xc, 0xd, 0x80000018, 0x8000001f, 0x20, 0x80000023}
+              strings = dylibs | {0xe, 0xf, 0x8000001c, 0x27}
+              unsupported = {0x6, 0x7, 0x9, 0x10, 0x12, 0x13, 0x14, 0x15, 0x2d, 0x80000035}
+              rows = []
+              at = 32
+              for _ in range(count):
+                  assert at + 8 <= 32 + size
+                  command, length = struct.unpack_from('<II', data, at)
+                  assert length >= 8 and length % 8 == 0 and at + length <= 32 + size
+                  assert command not in unsupported, ('Unreviewed path-bearing load command', hex(command))
+                  if command in strings:
+                      header = 24 if command in dylibs else 12
+                      assert length >= header
+                      offset = struct.unpack_from('<I', data, at + 8)[0]
+                      assert header <= offset < length
+                      end = data.find(b'\0', at + offset, at + length)
+                      assert end >= 0, 'Unterminated loader path'
+                      value = data[at + offset:end].decode('utf-8')
+                      assert value and not any(c in value for c in ('\\', '$', '\n', '\r'))
+                      assert command != 0x27, 'LC_DYLD_ENVIRONMENT is not allowed'
+                      assert not any(part in ('.', '..') for part in value.split('/'))
+                      if value.startswith('/'):
+                          assert value.startswith(('/System/Library/', '/usr/lib/')) and not value.startswith('//'), value
+                          target = sdk / value.lstrip('/')
+                          if command == 0x8000001c:
+                              assert target.is_dir(), ('RPATH absent from SDK', value)
+                          else:
+                              candidates = [target, pathlib.Path(str(target) + '.tbd')]
+                              if str(target).endswith('.dylib'):
+                                  candidates.append(pathlib.Path(str(target)[:-6] + '.tbd'))
+                              assert any(path.is_file() for path in candidates), ('Path absent from SDK', value)
+                      else:
+                          assert value.startswith(('@rpath/', '@loader_path/', '@executable_path/')), value
+                          assert value.split('/', 1)[1] and ':' not in value, value
+                      rows.append({'command': hex(command), 'path': value, 'fileOffset': at + offset})
+                  at += length
+              assert at == 32 + size, 'Load-command byte count mismatch'
+              assert rows, 'No loader paths audited'
+              return rows
+
+          def write_stikjit_checker_adapter(checker, component, sdk):
+              import hashlib, json, pathlib
+              expected_checker = 'cd155383b94a75c30876f420d27383b365503b772743540372729baf2bf032b4'
+              expected_binary = 'f15ad5c6766fa07d545be283c1c99eccde6a8baa97d73978a09ec080ca6381df'
+              checker, component = pathlib.Path(checker).resolve(), pathlib.Path(component).resolve()
+              original = checker.read_bytes()
+              assert hashlib.sha256(original).hexdigest() == expected_checker, 'Pinned checker digest mismatch'
+              data = component.read_bytes()
+              actual = hashlib.sha256(data).hexdigest()
+              print(json.dumps({'fixedStikJITPath': str(component), 'actualBinarySha256': actual, 'requiredBinarySha256': expected_binary}))
+              assert actual == expected_binary, 'Different StikJIT bytes require fresh upstream-path review'
+              rows = audit_load_paths(data, sdk)
+              prefix = b'/Users/runner'
+              offsets = []
+              at = 0
+              while (at := data.find(prefix, at)) >= 0:
+                  offsets.append(at)
+                  at += len(prefix)
+              assert len(data) == 3177960 and len(offsets) == 242, 'Known upstream build-string identity mismatch'
+              print(json.dumps({'finding': 'Known fixed upstream Rust build paths; loader paths separately audited',
+                                'rawPathPrefix': prefix.decode(), 'rawPathOffsets': offsets, 'loaderPaths': rows}, indent=2))
+              # Keep the adapter beside the pinned checker: its repository-root path audit is unchanged.
+              adapter = checker.with_name('check-macho-imports-stikjit-adapter.py')
+              assert adapter.parent == checker.parent and adapter != checker
+              source = original.decode()
+              marker = '            bad.append(f"names the path {p}")'
+              assert source.count(marker) == 1
+              replacement = '            if not verified_stikjit_build_path(a.dylib, p):\n    ' + marker
+              source = source.replace(marker, replacement)
+              audit_source = "def audit_load_paths(data, sdk):\n    import pathlib, struct\n    assert data[:4] == b'\\xcf\\xfa\\xed\\xfe', 'Expected thin Mach-O64'\n    _, cpu, subtype, kind, count, size, flags, reserved = struct.unpack_from('<8I', data)\n    assert cpu == 0x0100000c and kind == 6, (cpu, kind)\n    assert 32 + size <= len(data)\n    sdk = pathlib.Path(sdk).resolve()\n    dylibs = {0xc, 0xd, 0x80000018, 0x8000001f, 0x20, 0x80000023}\n    strings = dylibs | {0xe, 0xf, 0x8000001c, 0x27}\n    unsupported = {0x6, 0x7, 0x9, 0x10, 0x12, 0x13, 0x14, 0x15, 0x2d, 0x80000035}\n    rows = []\n    at = 32\n    for _ in range(count):\n        assert at + 8 <= 32 + size\n        command, length = struct.unpack_from('<II', data, at)\n        assert length >= 8 and length % 8 == 0 and at + length <= 32 + size\n        assert command not in unsupported, ('Unreviewed path-bearing load command', hex(command))\n        if command in strings:\n            header = 24 if command in dylibs else 12\n            assert length >= header\n            offset = struct.unpack_from('<I', data, at + 8)[0]\n            assert header <= offset < length\n            end = data.find(b'\\0', at + offset, at + length)\n            assert end >= 0, 'Unterminated loader path'\n            value = data[at + offset:end].decode('utf-8')\n            assert value and not any(c in value for c in ('\\\\', '$', '\\n', '\\r'))\n            assert command != 0x27, 'LC_DYLD_ENVIRONMENT is not allowed'\n            assert not any(part in ('.', '..') for part in value.split('/'))\n            if value.startswith('/'):\n                assert value.startswith(('/System/Library/', '/usr/lib/')) and not value.startswith('//'), value\n                target = sdk / value.lstrip('/')\n                if command == 0x8000001c:\n                    assert target.is_dir(), ('RPATH absent from SDK', value)\n                else:\n                    candidates = [target, pathlib.Path(str(target) + '.tbd')]\n                    if str(target).endswith('.dylib'):\n                        candidates.append(pathlib.Path(str(target)[:-6] + '.tbd'))\n                    assert any(path.is_file() for path in candidates), ('Path absent from SDK', value)\n            else:\n                assert value.startswith(('@rpath/', '@loader_path/', '@executable_path/')), value\n                assert value.split('/', 1)[1] and ':' not in value, value\n            rows.append({'command': hex(command), 'path': value, 'fileOffset': at + offset})\n        at += length\n    assert at == 32 + size, 'Load-command byte count mismatch'\n    assert rows, 'No loader paths audited'\n    return rows\n\n"
+              injected = audit_source + '\n' + (
+                  'def verified_stikjit_build_path(candidate, prefix):\n'
+                  '    import hashlib, pathlib\n'
+                  '    if pathlib.Path(candidate).resolve() != pathlib.Path(' + repr(str(component)) + ') or prefix != "/Users/runner":\n'
+                  '        return False\n'
+                  '    data = pathlib.Path(candidate).read_bytes()\n'
+                  '    assert hashlib.sha256(data).hexdigest() == "' + expected_binary + '", "StikJIT changed before audit"\n'
+                  '    audit_load_paths(data, ' + repr(str(pathlib.Path(sdk).resolve())) + ')\n'
+                  '    return True\n\n')
+              sentinel = 'PLATFORM_ID = {"macos": 1, "ios": 2}\n'
+              assert source.count(sentinel) == 1
+              source = source.replace(sentinel, sentinel + '\n' + injected)
+              compile(source, str(adapter), 'exec')
+              adapter.write_text(source)
+              assert checker.read_bytes() == original and component.read_bytes() == data
+              return adapter
+          adapter = write_stikjit_checker_adapter(pathlib.Path('build/check-macho-imports.py'), copied_fw / 'StikJIT', tools['sdk'])
           checker = ['python3', 'build/check-macho-imports.py', '--sdk', tools['sdk'], '--platform', 'ios']
-          subprocess.run(checker + ['--minos', '17.4', str(copied_fw / 'StikJIT')], check=True)
+          subprocess.run(['python3', str(adapter), '--sdk', tools['sdk'], '--platform', 'ios', '--minos', '17.4', str(copied_fw / 'StikJIT')], check=True)
           subprocess.run(checker + ['--minos', '26.0', '--with', str(copied_fw / 'StikJIT'),
                                     '--exports', 'NSExtensionMain', str(binary)], check=True)
           record = {'helperSourceSha256': hashlib.sha256(helper_source.read_bytes()).hexdigest(),
