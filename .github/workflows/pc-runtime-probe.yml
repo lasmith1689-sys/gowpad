@@ -30,6 +30,7 @@ jobs:
           submodules: false
           path: runtime
       - name: Verify cloud tools and cross-compiler
+        id: tools
         shell: bash
         run: |
           set -euo pipefail
@@ -42,6 +43,7 @@ jobs:
           printf '#include <TargetConditionals.h>\nint probe(void) { return TARGET_OS_IPHONE; }\n' > "$RUNNER_TEMP/ios-sdk-probe.c"
           xcrun clang -target arm64-apple-ios26.0 -isysroot "$sdk" -fsyntax-only "$RUNNER_TEMP/ios-sdk-probe.c"
           printf 'Cloud Mac/Xcode iPhone SDK probe passed. No app has been built or signed.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'cache-context=%s-%s-%s\n' "$(xcodebuild -version | tr '\n ' '--')" "$sdk_version" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Build media decoding libraries from checked source
         id: media
         continue-on-error: true
@@ -98,9 +100,11 @@ jobs:
           cd runtime
           git submodule update --init --depth 1 wine
           mkdir -p wine/build-macos
-          (cd wine/build-macos && CC="$(xcrun --find clang)" CXX="$(xcrun --find clang++)" \
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/wine-host-probe.c"
+          xcrun --sdk macosx clang "$RUNNER_TEMP/wine-host-probe.c" -o "$RUNNER_TEMP/wine-host-probe"
+          (cd wine/build-macos && CC="xcrun --sdk macosx clang" CXX="xcrun --sdk macosx clang++" \
             ../configure --without-mingw --without-x --without-opengl --without-vulkan --disable-tests) || {
-              tail -n 80 wine/build-macos/config.log
+              sed -n '1,280p' wine/build-macos/config.log
               exit 1
             }
           python3 - <<'PY'
@@ -161,14 +165,23 @@ jobs:
           }
           for lib in wineserver ntdll_unix win32u_unix; do xcrun lipo -info "app/Madeira/lib$lib.a"; done
           bash build/stage-licenses.sh
-      - name: Build pinned graphics compiler and D3D9-D3D11 bridge
-        id: graphics
+      - name: Restore LLVM libraries built by this source recipe
+        id: llvm-cache
+        if: ${{ steps.nativewine.outcome == 'success' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            runtime/toolchains/llvm-ios-build/include
+            runtime/toolchains/llvm-ios-build/lib
+          key: pc-runtime-llvm-d213c58b94c5311b836e4ca3-${{ runner.os }}-${{ runner.arch }}-${{ steps.tools.outputs.cache-context }}
+      - name: Build pinned LLVM shader compiler
+        id: llvm
+        if: ${{ steps.nativewine.outcome == 'success' }}
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           cd runtime
-          git submodule update --init --depth 1 dxmt
           mkdir -p toolchains/llvm-project
           git -C toolchains/llvm-project init
           git -C toolchains/llvm-project remote add origin https://github.com/llvm/llvm-project.git
@@ -177,6 +190,7 @@ jobs:
           git -C toolchains/llvm-project -c protocol.version=2 fetch --depth 1 --filter=blob:none origin 8dfdcc7b7bf66834a761bd8de445840ef68e4d1a
           git -C toolchains/llvm-project checkout --detach FETCH_HEAD
           test "$(git -C toolchains/llvm-project rev-parse HEAD)" = 8dfdcc7b7bf66834a761bd8de445840ef68e4d1a
+          if [ "${{ steps.llvm-cache.outputs.cache-hit }}" != true ]; then
           cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD= -DLLVM_ENABLE_PROJECTS= \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
@@ -192,6 +206,25 @@ jobs:
             -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF \
             -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen"
           cmake --build toolchains/llvm-ios-build --target LLVMPasses LLVMBitWriter --parallel 3
+          fi
+          for lib in LLVMCore LLVMPasses LLVMBitWriter; do xcrun lipo -info "toolchains/llvm-ios-build/lib/lib$lib.a"; done
+      - name: Preserve successfully built LLVM libraries for source-build retries
+        if: ${{ !cancelled() && steps.llvm.outcome == 'success' && steps.llvm-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            runtime/toolchains/llvm-ios-build/include
+            runtime/toolchains/llvm-ios-build/lib
+          key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+      - name: Build D3D9-D3D11 graphics bridge from pinned source
+        id: graphics
+        if: ${{ steps.nativewine.outcome == 'success' && steps.llvm.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd runtime
+          git submodule update --init --depth 1 --recursive dxmt
           if ! xcrun --sdk macosx metal --version; then
             xcodebuild -downloadComponent MetalToolchain
           fi
@@ -335,7 +368,8 @@ jobs:
           missing = [path for path in required if not Path(path).exists()]
           outcomes = {"media": "${{ steps.media.outcome }}", "pairing": "${{ steps.pairing.outcome }}",
                       "fex": "${{ steps.fex.outcome }}", "nativewine": "${{ steps.nativewine.outcome }}",
-                      "graphics": "${{ steps.graphics.outcome }}", "vcruntime": "${{ steps.vcruntime.outcome }}"}
+                      "llvm": "${{ steps.llvm.outcome }}", "graphics": "${{ steps.graphics.outcome }}",
+                      "vcruntime": "${{ steps.vcruntime.outcome }}"}
           report = {"source": "e3a88fddb8daed1f5ac28a45dcb4663d65192629",
                     "cloud_sdk_checked": True, "missing_build_inputs": missing,
                     "dependency_step_outcomes": outcomes,
