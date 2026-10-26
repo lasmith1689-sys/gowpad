@@ -35,8 +35,9 @@ jobs:
         \          'cmake':run('cmake-version',['cmake','--version']),'make':run('make-version',['make','--version'])}\n\
         frameworks=sdk/'System/Library/Frameworks'\nneeded=['UIKit.framework/Headers/UIKit.h','UIKit.framework/UIKit.tbd',\n\
         \  'QuartzCore.framework/Headers/CAEAGLLayer.h','QuartzCore.framework/QuartzCore.tbd',\n  'OpenGLES.framework/Headers/EAGL.h','OpenGLES.framework/Headers/ES2/gl.h','OpenGLES.framework/OpenGLES.tbd',\n\
-        \  'Foundation.framework/Foundation.tbd']\nsdkinputs={}\nfor relative in needed:\n    p=frameworks/relative;assert\
-        \ p.is_file(),('Required in-place Apple SDK input absent',relative)\n    sdkinputs[relative]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}\n\
+        \  'Foundation.framework/Foundation.tbd','CoreFoundation.framework/CoreFoundation.tbd']\nsdkinputs={}\n\
+        for relative in needed:\n    p=frameworks/relative;assert p.is_file(),('Required in-place Apple SDK input\
+        \ absent',relative)\n    sdkinputs[relative]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}\n\
         pin='2037865590d410bcd7b8d1f22b841472ed6d39ac';url='https://github.com/ptitSeb/gl4es.git'\nassert re.fullmatch('[0-9a-f]{40}',pin)\
         \ and url=='https://github.com/ptitSeb/gl4es.git'\nsource=root/'source';source.mkdir()\ngit=['git','-c','credential.helper=','-c','core.hooksPath=/dev/null','-c','core.autocrlf=false','-C',source]\n\
         run('source-init',git+['init','--quiet'])\nrun('source-fetch',git+['fetch','--depth=1','--no-tags',url,pin])\n\
@@ -108,7 +109,7 @@ jobs:
         run('compile-desktop-fixture',[tools['clang'],*flags,'-c',root/'desktop_probe.c','-o',root/'desktop_probe.o'])\n\
         run('compile-native-surface',[tools['clang'],*flags,'-fobjc-arc','-c',root/'ios_surface.m','-o',root/'ios_surface.o'])\n\
         dylib=root/'libOwnGL4ESIOSSurface.dylib'\nrun('link-whole-library-and-surface',[tools['clang'],'-target','arm64-apple-ios26.0','-isysroot',sdk,\n\
-        \  '-dynamiclib',root/'ios_surface.o',root/'desktop_probe.o','-Wl,-force_load,'+str(archive),\n  '-framework','UIKit','-framework','QuartzCore','-framework','OpenGLES','-framework','Foundation',\n\
+        \  '-dynamiclib',root/'ios_surface.o',root/'desktop_probe.o','-Wl,-force_load,'+str(archive),\n  '-framework','UIKit','-framework','QuartzCore','-framework','OpenGLES','-framework','Foundation','-framework','CoreFoundation',\n\
         \  '-Wl,-no_adhoc_codesign','-install_name','@rpath/libOwnGL4ESIOSSurface.dylib','-o',dylib])\nrun('upstream-tracked-files-unchanged',['git','-C',source,'diff','--exit-code'])\n\
         print(json.dumps({'archiveBytes':archive.stat().st_size,'archiveSha256':hashlib.sha256(archive.read_bytes()).hexdigest(),\n\
         \  'dylibBytes':dylib.stat().st_size,'dylibSha256':hashlib.sha256(dylib.read_bytes()).hexdigest()},indent=2))\n\
@@ -143,8 +144,8 @@ jobs:
         \ member mismatch',actual_members,expected_members)\nmetadata=macho(dylib.read_bytes(),6)\nassert metadata['installIds']==['@rpath/libOwnGL4ESIOSSurface.dylib']\
         \ and not metadata['rpaths'] and not metadata['signaturePresent']\nallowed={'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/QuartzCore.framework/QuartzCore',\n\
         \  '/System/Library/Frameworks/OpenGLES.framework/OpenGLES','/System/Library/Frameworks/Foundation.framework/Foundation',\n\
-        \  '/usr/lib/libobjc.A.dylib','/usr/lib/libSystem.B.dylib'}\nassert set(metadata['loads'])<=allowed and\
-        \ {'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/OpenGLES.framework/OpenGLES'}<=set(metadata['loads']),metadata\n\
+        \  '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation',\n  '/usr/lib/libobjc.A.dylib','/usr/lib/libSystem.B.dylib'}\n\
+        assert set(metadata['loads'])<=allowed and {'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/OpenGLES.framework/OpenGLES'}<=set(metadata['loads']),metadata\n\
         env=dict(os.environ,DEVELOPER_DIR=plan['developer'])\ndef symbols(label,args):\n    p=subprocess.run([plan['tools']['nm'],*map(str,args)],env=env,capture_output=True,timeout=60)\n\
         \    (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)\n\
         \    assert p.returncode==0,(label,p.stderr.decode(errors='replace'))\n    return set(line.strip() for line\
