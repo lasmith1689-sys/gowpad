@@ -83,7 +83,10 @@ jobs:
         link = subprocess.check_output(['git', 'ls-tree', 'HEAD', 'upstream/madeira'], text=True).split()
         assert link[0:3] == ['160000', 'commit', expected['madeira'][0]], link
         record = {}
-        def prepare(name, url, revision, series):
+        def prepare(name, revision, url, series):
+            import re
+            assert url.startswith('https://'), (name, url)
+            assert re.fullmatch(r'[0-9a-f]{40}', revision), (name, revision)
             target = root / name
             subprocess.run(['git', 'init', str(target)], check=True)
             def git(*args):
