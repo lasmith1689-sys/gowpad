@@ -269,7 +269,7 @@ jobs:
           cd source
           export TMPDIR="$PWD/.work/cod-media-jit/tmp"
           python3 - <<'PY'
-          import hashlib, json, pathlib, re, shlex
+          import hashlib, json, pathlib, re, shlex, sys
           repo = pathlib.Path.cwd()
           root = repo / '.work/cod-media-jit'
           tools = json.loads((root / 'tools.json').read_text())
@@ -286,17 +286,192 @@ jobs:
           (adapter / 'stages').mkdir(parents=True)
           build = root / 'pipeline'
           (build / 'cache').mkdir(parents=True)
+          # Apple documents -d solely as conversion of common/tentative definitions.
+          # Modern Apple ld rejects it. Only a proven zero-COMMON prelink may omit it.
+          # Keep LD64 real for Cargo; intercept precisely the four original -r calls.
+          prelink_evidence = {
+              'appleMan': {'url': 'https://github.com/apple-oss-distributions/ld64/blob/main/doc/man/man1/ld-classic.1',
+                           'gitBlob': '257ffde35eacb8914648618acc357a88aa948270', 'lines': [410, 416]},
+              'appleOptions': {'url': 'https://github.com/apple-oss-distributions/ld64/blob/main/src/ld/Options.cpp',
+                               'gitBlob': '4b3020dd0c91333f563cfcd45ba9176c0cab538c', 'lines': [3543, 3544]},
+              'llvmNm': {'url': 'https://github.com/llvm/llvm-project/blob/llvmorg-22.1.0/llvm/docs/CommandGuide/llvm-nm.rst',
+                         'gitBlob': '7067bb0a29a195ba5f1f2d166b770a0b25f2b246'},
+          }
+          prelink_wrapper = r'''import hashlib, json, pathlib, re, struct, subprocess, sys
+
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def object_header(data, name):
+              assert len(data) >= 32, 'Truncated native input: ' + name
+              fields = struct.unpack_from('<8I', data)
+              assert fields[0] == 0xfeedfacf and fields[1] == 0x0100000c and fields[3] == 1, 'Unsupported native object: ' + name
+              assert 32 + fields[5] <= len(data), 'Truncated Mach-O commands: ' + name
+
+          def inspect_native_input(path):
+              data = path.read_bytes()
+              result = {'path': str(path), 'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
+              if data[:8] != b'!<arch>\n':
+                  object_header(data, str(path))
+                  result['format'] = 'arm64-Mach-O-MH_OBJECT'
+                  return result
+              members = []
+              position = 8
+              strings = b''
+              while position < len(data):
+                  assert position + 60 <= len(data), 'Truncated archive header'
+                  header = data[position:position + 60]
+                  assert header[58:60] == b'`\n', 'Invalid archive header'
+                  assert re.fullmatch(rb'[0-9]+ *', header[48:58]), 'Invalid archive size'
+                  size = int(header[48:58])
+                  position += 60
+                  assert position + size <= len(data), 'Truncated archive member'
+                  payload = data[position:position + size]
+                  position += size + (size % 2)
+                  assert position <= len(data), 'Missing archive alignment byte'
+                  name = header[:16].decode('ascii').rstrip()
+                  if name.startswith('#1/'):
+                      assert name[3:].isdigit(), 'Invalid BSD archive name length'
+                      count = int(name[3:])
+                      assert 0 < count <= len(payload), 'Truncated BSD archive name'
+                      name = payload[:count].rstrip(bytes([0])).decode('utf-8')
+                      payload = payload[count:]
+                  elif name == '//':
+                      strings = payload
+                      continue
+                  elif name.startswith('/') and name[1:].isdigit():
+                      offset = int(name[1:])
+                      end = strings.find(b'/\n', offset)
+                      assert 0 <= offset < end, 'Invalid GNU archive string reference'
+                      name = strings[offset:end].decode('utf-8')
+                  elif name not in ('/', '/SYM64/'):
+                      name = name.removesuffix('/')
+                  if name in ('/', '/SYM64/', '__.SYMDEF', '__.SYMDEF SORTED', '__.SYMDEF_64', '__.SYMDEF_64 SORTED'):
+                      continue
+                  object_header(payload, str(path) + '[' + name + ']')
+                  members.append({'name': name, 'bytes': len(payload), 'sha256': hashlib.sha256(payload).hexdigest()})
+              assert position == len(data) and members, 'Empty or malformed native archive'
+              result.update(format='archive-of-arm64-Mach-O-MH_OBJECT', members=members)
+              return result
+
+          def parse_arguments(arguments, config):
+              widths = {'-arch': 1, '-platform_version': 3, '-syslibroot': 1, '-o': 1,
+                        '-u': 1, '-exported_symbol': 1, '-unexported_symbol': 1,
+                        '-exported_symbols_list': 1, '-unexported_symbols_list': 1, '-force_load': 1}
+              flags = {'-r', '-d', '-S', '-keep_private_externs', '-all_load'}
+              options, inputs, auxiliary, adapted = {}, [], [], []
+              position = 0
+              while position < len(arguments):
+                  token = arguments[position]
+                  if token in flags:
+                      options.setdefault(token, []).append([])
+                      if token != '-d':
+                          adapted.append(token)
+                      position += 1
+                  elif token in widths:
+                      width = widths[token]
+                      values = arguments[position + 1:position + 1 + width]
+                      assert len(values) == width and all(value and not value.startswith(('-', '@')) for value in values), 'Invalid prelink option value'
+                      options.setdefault(token, []).append(values)
+                      adapted.extend([token, *values])
+                      position += 1 + width
+                      if token == '-force_load':
+                          inputs.append(pathlib.Path(values[0]))
+                      elif token in ('-exported_symbols_list', '-unexported_symbols_list'):
+                          auxiliary.append(pathlib.Path(values[0]))
+                  else:
+                      assert not token.startswith(('-', '@')), 'Unsupported or hidden prelink input: ' + token
+                      inputs.append(pathlib.Path(token))
+                      adapted.append(token)
+                      position += 1
+              assert options.get('-r') == [[]] and len(options.get('-d', [])) <= 1, 'Only a single relocatable prelink is supported'
+              assert options.get('-arch') == [['arm64']], 'Unverified prelink architecture'
+              assert options.get('-platform_version') == [['ios', '17.0', config['sdkVersion']]], 'Unverified prelink platform'
+              assert options.get('-syslibroot') == [[config['sdk']]], 'Unverified prelink SDK'
+              assert len(options.get('-o', [])) == 1, 'Exactly one prelink output required'
+              output = pathlib.Path(options['-o'][0][0])
+              assert output.is_absolute() and output.suffix == '.o' and output.resolve().is_relative_to(pathlib.Path(config['root']).resolve()), 'Output outside private probe'
+              assert inputs and all(path.is_absolute() and path.is_file() and path.suffix in ('.o', '.a') and path.resolve() != output.resolve() for path in inputs), 'Unsupported prelink input path'
+              assert all(path.is_absolute() and path.is_file() for path in auxiliary), 'Unsupported symbol-list path'
+              return output, inputs, auxiliary, adapted
+
+          def audit_symbols(path, nm, record):
+              command = [nm, '--no-llvm-bc', '--quiet', '--no-demangle', '--debug-syms', '--special-syms', '--no-sort', '--print-file-name', '--format=posix', str(path)]
+              result = subprocess.run(command, capture_output=True, text=True, check=True)
+              # LLVM's POSIX printer emits archive[member]: name TYPE value size.
+              # Inspect all members, all visibility, definitions and undefineds.
+              pattern = re.compile(re.escape(str(path)) + r'(?:\[[^\n]+\])?: (.+) ([A-Za-z?\-]) (?:[0-9a-f]+)? +[0-9a-f]+$')
+              counts = {}
+              for line in result.stdout.splitlines():
+                  match = pattern.fullmatch(line)
+                  assert match, 'Unparsed native nm output: ' + line
+                  kind = match[2]
+                  assert kind != '?', 'Unknown native symbol type'
+                  counts[kind] = counts.get(kind, 0) + 1
+              record.update(nmArguments=command, nmSha256=hashlib.sha256(result.stdout.encode()).hexdigest(),
+                            nmDiagnostics=result.stderr, symbolTypes=counts,
+                            commonCount=counts.get('C', 0) + counts.get('c', 0))
+              assert not result.stderr, 'Native nm diagnostic requires review: ' + result.stderr
+              assert digest(path) == record['sha256'], 'Input changed during native inspection'
+
+          def run_prelink(arguments, config):
+              output, inputs, auxiliary, adapted = parse_arguments(arguments, config)
+              assert not output.exists(), 'Stale native prelink output'
+              assert all(pathlib.Path(config[name]).is_absolute() and pathlib.Path(config[name]).is_file() for name in ('ld', 'nm')), 'Absolute native tools required'
+              record = {'rawArguments': arguments, 'adaptedArguments': adapted, 'removedD': '-d' in arguments,
+                        'status': 'started', 'inputs': [], 'auxiliaryInputs': [], 'configuration': config,
+                        'linkerSha256': digest(pathlib.Path(config['ld'])), 'nmToolSha256': digest(pathlib.Path(config['nm']))}
+              audit = output.with_name(output.name + '.prelink-audit.json')
+              try:
+                  version = subprocess.run([config['nm'], '--version'], capture_output=True, text=True, check=True).stdout
+                  assert re.search(r'\bversion 22\.', version), 'Unverified native LLVM nm version'
+                  record['nmVersion'] = version
+                  for path in inputs:
+                      row = inspect_native_input(path)
+                      record['inputs'].append(row)
+                      audit_symbols(path, config['nm'], row)
+                      assert row['commonCount'] == 0, 'COMMON input requires original -d semantics: ' + str(path)
+                  record['auxiliaryInputs'] = [{'path': str(path), 'sha256': digest(path)} for path in auxiliary]
+                  record['status'] = 'zero-COMMON-inputs-verified'
+                  audit.write_text(json.dumps(record, indent=2))
+                  subprocess.run([config['ld'], *adapted], check=True)
+                  record['output'] = inspect_native_input(output)
+                  audit_symbols(output, config['nm'], record['output'])
+                  assert record['output']['commonCount'] == 0, 'COMMON output invalidates prelink adaptation'
+                  for row in record['inputs'] + record['auxiliaryInputs']:
+                      assert digest(pathlib.Path(row['path'])) == row['sha256'], 'Prelink input changed'
+                  record['status'] = 'passed'
+              except Exception as error:
+                  record.update(status='failed', error=str(error))
+                  raise
+              finally:
+                  audit.write_text(json.dumps(record, indent=2))
+                  print(json.dumps({'prelinkAudit': str(audit), 'status': record['status'], 'removedD': record['removedD']}))
+
+          if __name__ == '__main__':
+              run_prelink(sys.argv[1:], json.loads(pathlib.Path(__file__).with_suffix('.json').read_text()))
+          '''
+          prelink = adapter / 'native-prelink.py'
+          assert pathlib.Path(sys.executable).is_absolute() and not re.search(r'\s', sys.executable)
+          prelink.write_text('#!' + sys.executable + '\n' + prelink_wrapper)
+          prelink.chmod(0o755)
+          prelink.with_suffix('.json').write_text(json.dumps({
+              'root': str(root), 'sdk': tools['sdk'], 'sdkVersion': tools['version'],
+              'ld': tools['macld'], 'nm': str(pathlib.Path(tools['llvm']) / 'bin/llvm-nm'),
+              'semanticsEvidence': prelink_evidence,
+          }, indent=2))
           values = {
               'PLAYPORT_REPO': str(repo), 'PLAYPORT_BUILD': str(build), 'PLAYPORT_DEVICE_DIR': str(build),
               'CACHE': str(build / 'cache'), 'MEDIA_ADAPTER': str(adapter), 'MEDIA_SDK_VERSION': tools['version'],
               'DARWIN_SDK': tools['developer'], 'IOSSDK': tools['sdk'], 'MACSDK': tools['macsdk'],
-              'LD64': tools['macld'], 'RUST_ROOT': str(root / 'inputs/rust'),
+              'LD64': tools['macld'], 'PRELINK_LD': str(prelink), 'RUST_ROOT': str(root / 'inputs/rust'),
               'LLVM_MINGW': str(root / 'inputs/llvm-mingw-20260922-ucrt-macos-universal'),
               'APPLE_IOS_CLANG': tools['ios']['clang'], 'APPLE_MAC_CLANG': tools['macclang'],
               'APPLE_AR': tools['ios']['ar'],
           }
           (adapter / 'env.sh').write_text('\n'.join('export ' + name + '=' + shlex.quote(value) for name, value in values.items()) + '\n')
-          source_records = {}
+          source_records = {'native-prelink.py': {'adapterSha256': hashlib.sha256(prelink.read_bytes()).hexdigest(),
+                                                 'semanticsEvidence': prelink_evidence}}
           def install(name, text):
               original = (repo / 'build' / name).read_text()
               output = adapter / name
@@ -310,6 +485,8 @@ jobs:
           gst = gst.replace('cc=(/usr/bin/clang ', 'cc=("$APPLE_IOS_CLANG" ')
           assert gst.count('-platform_version ios 17.0 26.5') == 2
           gst = gst.replace('-platform_version ios 17.0 26.5', '-platform_version ios 17.0 "$MEDIA_SDK_VERSION"')
+          assert gst.count('"$LD64" -r') == 2 and gst.count('"$LD64" -r -d') == 1
+          gst = gst.replace('"$LD64" -r', '"$PRELINK_LD" -r')
           install('stages/gstreamer.sh', gst)
           idevice = pathlib.Path('build/stages/idevice.sh').read_text()
           replacements = {
@@ -324,6 +501,8 @@ jobs:
               idevice = idevice.replace(before, after)
           assert idevice.count('-platform_version ios 17.0 26.5') == 2
           idevice = idevice.replace('-platform_version ios 17.0 26.5', '-platform_version ios 17.0 "$MEDIA_SDK_VERSION"')
+          assert idevice.count('"$LD64" -r') == 2 and '"$LD64" -r -d' not in idevice
+          idevice = idevice.replace('"$LD64" -r', '"$PRELINK_LD" -r')
           install('stages/idevice.sh', idevice)
           helper = pathlib.Path('build/idevice-crates.py').read_text()
           assert helper.count('f"{version}-x86_64-unknown-linux-gnu"') == 1
@@ -398,6 +577,22 @@ jobs:
           }
           paths = [root / 'gstreamer/libwinegstreamer_unix.a', root / 'idevice/libidevice_ffi.a']
           record = {}
+          prelinks = {}
+          for component, final_object in [('gstreamer', 'winegstreamer_unix.o'), ('idevice', 'idevice_ffi.o')]:
+              obj = root / component / 'obj'
+              audits = []
+              for name in ('prelinked.o', final_object):
+                  path = obj / (name + '.prelink-audit.json')
+                  row = json.loads(path.read_text())
+                  assert row['status'] == 'passed' and row['inputs']
+                  assert all(item['commonCount'] == 0 for item in row['inputs'] + [row['output']])
+                  assert row['removedD'] == (component == 'gstreamer' and name == 'prelinked.o')
+                  assert row['adaptedArguments'] == [arg for arg in row['rawArguments'] if arg != '-d']
+                  audits.append(row)
+              assert len(audits[1]['inputs']) == 1 and audits[1]['inputs'][0]['sha256'] == audits[0]['output']['sha256']
+              assert hashlib.sha256((obj / final_object).read_bytes()).hexdigest() == audits[1]['output']['sha256']
+              prelinks[component] = audits
+          record['nativePrelinkAudits'] = prelinks
           for path in paths:
               assert path.is_file() and path.stat().st_size > 0
               assert out('xcrun', 'lipo', '-archs', path).split() == ['arm64']
