@@ -122,8 +122,8 @@ jobs:
         \  '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics','/usr/lib/libSystem.B.dylib','/usr/lib/libobjc.A.dylib'}\n\
         def macho(b,filetype):\n    h=struct.unpack_from('<8I',b);assert h[0]==0xfeedfacf and h[1]==0x100000c and\
         \ h[3]==filetype\n    p=32;platforms=[];loads=[];ids=[]\n    for _ in range(h[4]):\n        cmd,size=struct.unpack_from('<II',b,p);assert\
-        \ size>=8 and p+size<=32+h[5]<=len(b)\n        assert cmd not in [0x1d,0x21,0x2c,0x8000001c]\n        if\
-        \ cmd==0x32:\n            platform,minimum,sdk=struct.unpack_from('<III',b,p+8);platforms.append([platform,minimum,sdk])\n\
+        \ size>=8 and p+size<=32+h[5]<=len(b)\n        assert cmd not in [0x1d,0x21,0x2c,0x8000001c],('forbidden-load-command',filetype,hex(cmd),size)\n\
+        \        if cmd==0x32:\n            platform,minimum,sdk=struct.unpack_from('<III',b,p+8);platforms.append([platform,minimum,sdk])\n\
         \            assert platform==2 and minimum==26<<16 and (filetype!=6 or sdk>=26<<16)\n        if cmd in\
         \ [0xc,0x80000018,0x8000001f,0x80000023,0x20,0xd]:\n            start=struct.unpack_from('<I',b,p+8)[0];assert\
         \ 24<=start<size\n            name=b[p+start:p+size].split(b'\\0',1)[0].decode()\n            if cmd==0xd:ids.append(name)\n\
