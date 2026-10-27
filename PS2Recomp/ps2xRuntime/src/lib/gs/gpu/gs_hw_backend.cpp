@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <functional>
 #include <initializer_list>
 #include <memory>
@@ -1019,7 +1020,41 @@ void main()
         return static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     }
+    // the texture setup's parts, for the slow-draw detail: decode, GL upload, palette, self copy, reinterpret, hash, find
+    enum TexPart { TexDecode, TexUpload, TexPalette, TexCopy, TexReinterp, TexHash, TexFind, TexGen, TexEvict, kTexParts };
+    uint64_t texParts[kTexParts] = {};
+    struct TexSpan
+    {
+        uint64_t &slot;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~TexSpan() { slot += nanosSince(start); }
+    };
+    // texture names for the texture cache, made in batches (PS2X_GS_NAME_POOL=0: one glGenTextures per texture)
+    std::vector<GLuint> namePool;
+    GLuint newTextureName()
+    {
+        static const bool pooled = [] { const char *v = std::getenv("PS2X_GS_NAME_POOL"); return !(v && *v == '0'); }();
+        GLuint id = 0;
+        if (!pooled)
+        {
+            gl().GenTextures(1, &id);
+            return id;
+        }
+        if (namePool.empty())
+        {
+            namePool.resize(1024);
+            gl().GenTextures(static_cast<GLsizei>(namePool.size()), namePool.data());
+        }
+        id = namePool.back();
+        namePool.pop_back();
+        return id;
+    }
     uint64_t decodes = 0;
+    char lastDecode[48] = {}; // the latest decode's size and format (slow-draw detail)
+    void noteDecode(const GSDrawState &s, uint32_t w, uint32_t h)
+    {
+        std::snprintf(lastDecode, sizeof(lastDecode), " %ux%u psm %x tbw %u", w, h, s.context.tex0.psm, s.context.tex0.tbw);
+    }
     void reportCpu()
     {
         static const bool timed = ps2_perf::countFrames();
@@ -1490,6 +1525,7 @@ void main()
         }
         {
             const uint32_t h = std::max<uint32_t>(1u, s.textureHeight);
+            TexSpan span{texParts[TexHash]};
             if (unchangedSinceDecode(tex, t.tbp0, t.tbp0 + spanBlocks(t.psm, t.tbw, h), std::max<uint32_t>(1u, s.textureWidth), h))
                 return tex;
         }
@@ -1498,7 +1534,11 @@ void main()
         classifyTexture(s);
         const Api &g = gl();
         std::vector<uint32_t> pixels;
-        decodeDirect(s, pixels);
+        noteDecode(s, std::max<uint32_t>(1u, s.textureWidth), std::max<uint32_t>(1u, s.textureHeight));
+        {
+            TexSpan span{texParts[TexDecode]};
+            decodeDirect(s, pixels);
+        }
         static const int texDumpLimit = std::getenv("GOW_GS_HW_TEXDUMP") ? std::atoi(std::getenv("GOW_GS_HW_TEXDUMP")) : 0;
         static int texDumped = 0;
         if (texDumped < texDumpLimit && s.textureWidth > 16)
@@ -1520,15 +1560,30 @@ void main()
         tex.height = std::max<uint32_t>(1u, s.textureHeight);
         tex.blockLo = t.tbp0;
         tex.blockHi = t.tbp0 + spanBlocks(t.psm, t.tbw, tex.height);
-        if (!tex.id)
-            g.GenTextures(1, &tex.id);
-        g.BindTexture(kTexture2D, tex.id);
-        g.PixelStorei(kUnpackAlignment, 4);
-        g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), tex.width, tex.height, 0, kRgba, kUnsignedByte, pixels.data());
+        {
+            TexSpan span{texParts[TexGen]};
+            if (!tex.id)
+                tex.id = newTextureName();
+        }
+        {
+            TexSpan span{texParts[TexEvict]};
+            g.BindTexture(kTexture2D, tex.id);
+            g.PixelStorei(kUnpackAlignment, 4);
+        }
+        {
+            TexSpan span{texParts[TexUpload]};
+            g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), tex.width, tex.height, 0, kRgba, kUnsignedByte, pixels.data());
+        }
         tex.valid = true;
-        tex.contentHash = blockHash(tex.blockLo, tex.blockHi);
+        {
+            TexSpan span{texParts[TexHash]};
+            tex.contentHash = blockHash(tex.blockLo, tex.blockHi);
+        }
         if (textures.size() > 6000u)
+        {
+            TexSpan span{texParts[TexEvict]};
             evictOld();
+        }
         return tex;
     }
 
@@ -1614,6 +1669,7 @@ void main()
         }
         {
             const uint32_t h = std::max<uint32_t>(1u, s.textureHeight);
+            TexSpan span{texParts[TexHash]};
             if (unchangedSinceDecode(tex, t.tbp0, t.tbp0 + spanBlocks(t.psm, t.tbw, h), std::max<uint32_t>(1u, s.textureWidth), h))
                 return tex;
         }
@@ -1623,9 +1679,13 @@ void main()
         tex.width = std::max<uint32_t>(1u, s.textureWidth);
         tex.height = std::max<uint32_t>(1u, s.textureHeight);
         std::vector<uint8_t> indices(static_cast<size_t>(tex.width) * tex.height);
-        for (uint32_t y = 0; y < tex.height; ++y)
-            GSMem::ReadIndexRun(vram, t.psm, t.tbp0, t.tbw, 0u, y, tex.width,
-                                indices.data() + static_cast<size_t>(y) * tex.width);
+        noteDecode(s, tex.width, tex.height);
+        {
+            TexSpan span{texParts[TexDecode]};
+            for (uint32_t y = 0; y < tex.height; ++y)
+                GSMem::ReadIndexRun(vram, t.psm, t.tbp0, t.tbw, 0u, y, tex.width,
+                                    indices.data() + static_cast<size_t>(y) * tex.width);
+        }
         static const long idxDumpTbp = std::getenv("GOW_GS_HW_PALDUMP") ? std::strtol(std::getenv("GOW_GS_HW_PALDUMP"), nullptr, 16) : -1;
         static int idxDumped = 0;
         // GOW_GS_HW_PALDUMPMAX=<n>: dump the first n decodes of that block's index texture (default 4)
@@ -1656,17 +1716,32 @@ void main()
         tex.blockLo = t.tbp0;
         tex.blockHi = t.tbp0 + spanBlocks(t.psm, t.tbw, tex.height);
         const Api &g = gl();
-        if (!tex.id)
-            g.GenTextures(1, &tex.id);
-        g.BindTexture(kTexture2D, tex.id);
-        g.PixelStorei(kUnpackAlignment, 1);
-        g.TexImage2D(kTexture2D, 0, 0x8229 /*R8*/, tex.width, tex.height, 0, 0x1903 /*RED*/, kUnsignedByte, indices.data());
+        {
+            TexSpan span{texParts[TexGen]};
+            if (!tex.id)
+                tex.id = newTextureName();
+        }
+        {
+            TexSpan span{texParts[TexEvict]};
+            g.BindTexture(kTexture2D, tex.id);
+            g.PixelStorei(kUnpackAlignment, 1);
+        }
+        {
+            TexSpan span{texParts[TexUpload]};
+            g.TexImage2D(kTexture2D, 0, 0x8229 /*R8*/, tex.width, tex.height, 0, 0x1903 /*RED*/, kUnsignedByte, indices.data());
+        }
         g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
         g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
         tex.valid = true;
-        tex.contentHash = blockHash(tex.blockLo, tex.blockHi);
+        {
+            TexSpan span{texParts[TexHash]};
+            tex.contentHash = blockHash(tex.blockLo, tex.blockHi);
+        }
         if (textures.size() > 6000u)
+        {
+            TexSpan span{texParts[TexEvict]};
             evictOld();
+        }
         return tex;
     }
 
@@ -1705,7 +1780,7 @@ void main()
         uint32_t colors[256];
         store.BuildPalette(s, colors);
         GLuint id = 0;
-        g.GenTextures(1, &id);
+        id = newTextureName();
         g.BindTexture(kTexture2D, id);
         g.PixelStorei(kUnpackAlignment, 4);
         g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), 256, 1, 0, kRgba, kUnsignedByte, colors);
@@ -2526,20 +2601,28 @@ void main()
         const uint64_t decodesBefore = decodes, selfCopiesBefore = stats.selfCopies;
         uint64_t partsBefore[4];
         std::memcpy(partsBefore, cpuTiming.parts, sizeof(partsBefore));
+        uint64_t texBefore[kTexParts];
+        std::memcpy(texBefore, texParts, sizeof(texBefore));
         drawFirstProgram = drawFirstPipeline = false;
         draw(pendingState, pending);
         const uint64_t spent = nanosSince(drawStart);
         cpuTiming.drawNanos += spent;
         // GOW-Port: a draw over 10 ms says what it did, for the readout's hitch line (gs_threaded_backend op timer)
-        if (spent > 10000000u)
+        static const uint64_t slowNanos = std::getenv("GOW_SLOW_DRAW_MS") ? std::strtoull(std::getenv("GOW_SLOW_DRAW_MS"), nullptr, 10) * 1000000u : 10000000u;
+        if (spent > slowNanos)
         {
-            char detail[240];
+            char detail[320];
             // the draw's phases (cpuMark: before the target bind, fixed state, texture setup, upload + draw calls)
             const auto ms = [&](int part) { return (cpuTiming.parts[part] - partsBefore[part]) * 1e-6; };
             std::snprintf(detail, sizeof(detail), "draw %.0f ms, %zu verts [setup %.0f state %.0f tex %.0f calls %.0f]%s%s%s%s",
                           spent * 1e-6, pending.size(), ms(0), ms(1), ms(2), ms(3),
                           drawFirstProgram ? ", first use of a shader" : "", drawFirstPipeline ? ", new pipeline" : "",
                           decodes > decodesBefore ? ", texture decode" : "", stats.selfCopies > selfCopiesBefore ? ", target copy" : "");
+            const auto tx = [&](int part) { return (texParts[part] - texBefore[part]) * 1e-6; };
+            const size_t used = std::strlen(detail);
+            std::snprintf(detail + used, sizeof(detail) - used, " {dec %.0f up %.0f pal %.0f copy %.0f reint %.0f hash %.0f find %.0f gen %.0f bind/evict %.0f}%s", tx(TexDecode),
+                          tx(TexUpload), tx(TexPalette), tx(TexCopy), tx(TexReinterp), tx(TexHash), tx(TexFind), tx(TexGen), tx(TexEvict),
+                          decodes > decodesBefore ? lastDecode : "");
             ps2_perf::slowDrawDetail = detail;
         }
         pending.clear();
@@ -3396,6 +3479,7 @@ void main()
         if (s.prim.tme)
         {
             // a texture that lives in a render target of the same format is sampled straight from it
+            std::optional<TexSpan> findSpan(std::in_place, texParts[TexFind]);
             RenderTarget *src = nullptr;
             const auto family = [](uint8_t psm) { return (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S) ? 16 : (psm == GS_PSM_CT32 || psm == GS_PSM_CT24) ? 32 : 0; };
             if (family(c.tex0.psm) != 0 && (c.tex0.tbp0 % 32u) == 0u)
@@ -3407,7 +3491,10 @@ void main()
             if (src == &rt)
             {
                 if (g.es)
+                {
+                    TexSpan span{texParts[TexCopy]};
                     selfTex = selfCopy(rt, true);
+                }
                 else
                     g.TextureBarrier(), ++stats.barriers;
             }
@@ -3426,10 +3513,14 @@ void main()
             if (rsrc == &rt)
             {
                 if (g.es)
+                {
+                    TexSpan span{texParts[TexCopy]};
                     selfTex = selfCopy(rt, true);
+                }
                 else
                     g.TextureBarrier(), ++stats.barriers;
             }
+            findSpan.reset();
             const bool indexed = !(src || rsrc || zsrc) && isIndexed(c.tex0.psm) && vram != nullptr;
             Texture &tex = (src || rsrc || zsrc) ? dummy : indexed ? indexTextureFor(s) : textureFor(s);
             u1i(locIndexed, indexed ? 1 : 0);
@@ -3440,6 +3531,7 @@ void main()
             if (indexed)
             {
                 g.ActiveTexture(kTexture0 + 5);
+                TexSpan span{texParts[TexPalette]};
                 g.BindTexture(kTexture2D, paletteFor(s));
                 u1i(locIdxPalette, 5);
             }
@@ -3450,7 +3542,10 @@ void main()
             u1i(locRtTex24, !(src || rsrc) ? 0 : c.tex0.psm == GS_PSM_CT24 ? 1 : family16(c.tex0.psm) ? 2 : 0);
             u1i(locReinterp, rsrc ? 1 : 0);
             if (rsrc)
+            {
+                TexSpan span{texParts[TexReinterp]};
                 setupReinterpret(s, *rsrc, selfTex);
+            }
             u1f(locTa0, static_cast<float>(s.texa.ta0));
             u1f(locTa1, static_cast<float>(s.texa.ta1));
             u1i(locAem, s.texa.aem ? 1 : 0);

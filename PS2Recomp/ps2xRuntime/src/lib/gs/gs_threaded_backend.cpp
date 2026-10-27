@@ -368,11 +368,12 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBa
                 s_glTiming.nanos[index] += spent;
                 ++s_glTiming.count[index];
                 // one op over 25 ms stalls the frame: on the readout's hitch line (a draw inside it may name the cause)
-                if (spent > 25000000)
+                static const long long hitchNanos = std::getenv("GOW_HITCH_MS") ? std::atoll(std::getenv("GOW_HITCH_MS")) * 1000000ll : 25000000ll;
+                if (spent > hitchNanos)
                 {
                     static const char *const names[GlOpTiming::kOps] = {"mxcsr", "submit", "clut", "begintx", "upload", "texflush", "wvram", "sync",
                                                                          "present", "state", "verts", "vrun", "call", "pad", "?", "?"};
-                    char note[320];
+                    char note[480];
                     std::snprintf(note, sizeof(note), "%.0f ms in %s%s%s", spent * 1e-6, names[index],
                                   ps2_perf::slowDrawDetail.empty() ? "" : ": ", ps2_perf::slowDrawDetail.c_str());
                     ps2_perf::noteHitch(spent * 1e-6, note);
