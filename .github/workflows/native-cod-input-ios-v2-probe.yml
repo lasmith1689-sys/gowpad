@@ -121,14 +121,18 @@ jobs:
         for n,h in plan['sourceHashes'].items():assert hashlib.sha256((root/n).read_bytes()).hexdigest()==h\nallowed={'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/Foundation.framework/Foundation',\n\
         \  '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics','/usr/lib/libSystem.B.dylib','/usr/lib/libobjc.A.dylib'}\n\
         def macho(b,filetype):\n    h=struct.unpack_from('<8I',b);assert h[0]==0xfeedfacf and h[1]==0x100000c and\
-        \ h[3]==filetype\n    p=32;platforms=[];loads=[];ids=[]\n    for _ in range(h[4]):\n        cmd,size=struct.unpack_from('<II',b,p);assert\
-        \ size>=8 and p+size<=32+h[5]<=len(b)\n        assert cmd not in [0x1d,0x21,0x2c,0x8000001c],('forbidden-load-command',filetype,hex(cmd),size)\n\
-        \        if cmd==0x32:\n            platform,minimum,sdk=struct.unpack_from('<III',b,p+8);platforms.append([platform,minimum,sdk])\n\
+        \ h[3]==filetype\n    p=32;platforms=[];loads=[];ids=[];encryption=[]\n    for _ in range(h[4]):\n     \
+        \   cmd,size=struct.unpack_from('<II',b,p);assert size>=8 and p+size<=32+h[5]<=len(b)\n        assert cmd\
+        \ not in [0x1d,0x21,0x8000001c],('forbidden-load-command',filetype,hex(cmd),size)\n        if cmd==0x2c:\n\
+        \            assert filetype==6 and size==24 and not encryption\n            cryptoff,cryptsize,cryptid,pad=struct.unpack_from('<4I',b,p+8)\n\
+        \            assert cryptid==0 and pad==0 and cryptoff<=len(b) and cryptsize<=len(b)-cryptoff\n        \
+        \    encryption.append(dict(cryptoff=cryptoff,cryptsize=cryptsize,cryptid=cryptid,pad=pad))\n        if\
+        \ cmd==0x32:\n            platform,minimum,sdk=struct.unpack_from('<III',b,p+8);platforms.append([platform,minimum,sdk])\n\
         \            assert platform==2 and minimum==26<<16 and (filetype!=6 or sdk>=26<<16)\n        if cmd in\
         \ [0xc,0x80000018,0x8000001f,0x80000023,0x20,0xd]:\n            start=struct.unpack_from('<I',b,p+8)[0];assert\
         \ 24<=start<size\n            name=b[p+start:p+size].split(b'\\0',1)[0].decode()\n            if cmd==0xd:ids.append(name)\n\
         \            else:assert name in allowed,name;loads.append(name)\n        p+=size\n    assert p==32+h[5]\
-        \ and len(platforms)==1\n    return {'platforms':platforms,'loads':loads,'ids':ids,'signaturePresent':False,'rpaths':[]}\n\
+        \ and len(platforms)==1\n    return {'platforms':platforms,'loads':loads,'ids':ids,'encryption':encryption,'signaturePresent':False,'rpaths':[]}\n\
         reports={}\nfor name,filetype in [('queue.o',1),('input.o',1),('libCodNativeInputIOSV2.dylib',6)]:\n   \
         \ b=(root/name).read_bytes();assert str(root).encode() not in b and str(pathlib.Path.cwd()).encode() not\
         \ in b\n    reports[name]={'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest(),'metadata':macho(b,filetype)}\n\
