@@ -69,7 +69,8 @@ jobs:
         \    for name,b in [('stdout',p.stdout),('stderr',p.stderr)]:\n        (root/(label+'.'+name+'.txt')).write_bytes(b)\n\
         \        print(label,name,b.decode(errors='replace'))\n    logs.append({'label':label,'argv':args,'exitCode':p.returncode,'stdoutSha256':hashlib.sha256(p.stdout).hexdigest(),'stderrSha256':hashlib.sha256(p.stderr).hexdigest()})\n\
         \    (root/'commands.json').write_text(json.dumps(logs,indent=2));assert p.returncode==0,label\ntools=plan['tools'];flags=['--target=arm64-apple-ios26.0','-isysroot',plan['sdk'],'-O2','-fno-fast-math','-fvisibility=hidden','-Wall','-Wextra','-Werror']\n\
-        source=root/'native/platform/cod-gl-ios/input-v1'\nrun('compile-real-input-queue',[tools['clang'],*flags,'-std=c11','-c',source/'cod_input_queue_v2.c','-o',root/'queue.o'])\n\
+        source=root/'native/platform/cod-gl-ios/input-v2'\nassert source.is_dir() and all((source/n).is_file() for\
+        \ n in ('cod_input_queue_v2.c','cod_uikit_input_v2.m'))\nrun('compile-real-input-queue',[tools['clang'],*flags,'-std=c11','-c',source/'cod_input_queue_v2.c','-o',root/'queue.o'])\n\
         run('compile-real-uikit-input-view',[tools['clang'],*flags,'-fobjc-arc','-fblocks','-c',source/'cod_uikit_input_v2.m','-o',root/'input.o'])\n\
         run('link-input-production-closure',[tools['clang'],*flags,'-dynamiclib',root/'queue.o',root/'input.o',\n\
         \  '-framework','UIKit','-framework','Foundation','-framework','CoreGraphics',\n  '-Wl,-install_name,@rpath/libCodNativeInputIOSV2.dylib','-Wl,-no_uuid','-Wl,-no_adhoc_codesign','-Wl,-fatal_warnings',\n\
