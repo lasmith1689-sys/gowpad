@@ -119,12 +119,12 @@ jobs:
         \ in functions),(name,'Wrong code/data export region')\n        result[name]={**entry,'vmAddress':address,'segment':matches[0]['name']}\n\
         \    return result\n\n\nimport hashlib,json,pathlib,struct\nroot=pathlib.Path('.work/cod-uikit-input-v2').absolute();plan=json.loads((root/'plan.json').read_text())\n\
         for n,h in plan['sourceHashes'].items():assert hashlib.sha256((root/n).read_bytes()).hexdigest()==h\nallowed={'/System/Library/Frameworks/UIKit.framework/UIKit','/System/Library/Frameworks/Foundation.framework/Foundation',\n\
-        \  '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics','/usr/lib/libSystem.B.dylib','/usr/lib/libobjc.A.dylib'}\n\
-        def macho(b,filetype):\n    h=struct.unpack_from('<8I',b);assert h[0]==0xfeedfacf and h[1]==0x100000c and\
-        \ h[3]==filetype\n    p=32;platforms=[];loads=[];ids=[];encryption=[]\n    for _ in range(h[4]):\n     \
-        \   cmd,size=struct.unpack_from('<II',b,p);assert size>=8 and p+size<=32+h[5]<=len(b)\n        assert cmd\
-        \ not in [0x1d,0x21,0x8000001c],('forbidden-load-command',filetype,hex(cmd),size)\n        if cmd==0x2c:\n\
-        \            assert filetype==6 and size==24 and not encryption\n            cryptoff,cryptsize,cryptid,pad=struct.unpack_from('<4I',b,p+8)\n\
+        \  '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics','/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation',\n\
+        \  '/usr/lib/libSystem.B.dylib','/usr/lib/libobjc.A.dylib'}\ndef macho(b,filetype):\n    h=struct.unpack_from('<8I',b);assert\
+        \ h[0]==0xfeedfacf and h[1]==0x100000c and h[3]==filetype\n    p=32;platforms=[];loads=[];ids=[];encryption=[]\n\
+        \    for _ in range(h[4]):\n        cmd,size=struct.unpack_from('<II',b,p);assert size>=8 and p+size<=32+h[5]<=len(b)\n\
+        \        assert cmd not in [0x1d,0x21,0x8000001c],('forbidden-load-command',filetype,hex(cmd),size)\n  \
+        \      if cmd==0x2c:\n            assert filetype==6 and size==24 and not encryption\n            cryptoff,cryptsize,cryptid,pad=struct.unpack_from('<4I',b,p+8)\n\
         \            assert cryptid==0 and pad==0 and cryptoff<=len(b) and cryptsize<=len(b)-cryptoff\n        \
         \    encryption.append(dict(cryptoff=cryptoff,cryptsize=cryptsize,cryptid=cryptid,pad=pad))\n        if\
         \ cmd==0x32:\n            platform,minimum,sdk=struct.unpack_from('<III',b,p+8);platforms.append([platform,minimum,sdk])\n\
