@@ -385,22 +385,33 @@ jobs:
     - name: Run actual UIKit GL bridge, check pixels and remove owned simulator
       id: functional
       shell: bash
-      run: "set -euo pipefail\npython3 - <<'PY'\nimport hashlib,importlib.util,json,os,pathlib,re,subprocess\nroot=pathlib.Path('.work/cod-gl-v4-functional').absolute();plan=json.loads((root/'plan.json').read_text());build=json.loads((root/'app-build-proof.json').read_text())\n\
+      run: "set -euo pipefail\npython3 - <<'PY'\nimport hashlib,importlib.util,json,os,pathlib,re,subprocess,time\n\
+        root=pathlib.Path('.work/cod-gl-v4-functional').absolute();plan=json.loads((root/'plan.json').read_text());build=json.loads((root/'app-build-proof.json').read_text())\n\
         for name,digest in plan['fixtureSourceHashes'].items():assert hashlib.sha256((root/name).read_bytes()).hexdigest()==digest\n\
         spec=importlib.util.spec_from_file_location('independent_bridge_pixel_checker',root/'check_pixels.py');checker=importlib.util.module_from_spec(spec);spec.loader.exec_module(checker)\n\
         selected=plan['simulatorSelection'];env=dict(os.environ,DEVELOPER_DIR=plan['developer']);created=None;owned=False;records=[];failure=None;capture=None;checks=None\n\
         app=root/'NativeGLBridgeProof.app';assert hashlib.sha256((app/'NativeGLBridgeProof').read_bytes()).hexdigest()==build['appExecutableSha256']\n\
-        def run(label,args,timeout=60,check=True,environment=None):\n argv=list(map(str,args));timed=False\n try:p=subprocess.run(argv,env=environment\
-        \ or env,capture_output=True,timeout=timeout)\n except subprocess.TimeoutExpired as error:p=subprocess.CompletedProcess(argv,124,error.stdout\
-        \ or b'',error.stderr or b'');timed=True\n (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)\n\
-        \ records.append({'label':label,'argv':argv,'exitCode':p.returncode,'timedOut':timed,'stdoutSha256':hashlib.sha256(p.stdout).hexdigest(),'stderrSha256':hashlib.sha256(p.stderr).hexdigest()})\n\
-        \ print(label,'exit',p.returncode,flush=True)\n if check and p.returncode:print(p.stdout.decode(errors='replace')[-8000:]);print(p.stderr.decode(errors='replace')[-8000:]);raise\
+        def run(label,args,timeout=60,check=True,environment=None):\n argv=list(map(str,args));timed=False;started=time.monotonic()\n\
+        \ try:p=subprocess.run(argv,env=environment or env,capture_output=True,timeout=timeout)\n except subprocess.TimeoutExpired\
+        \ as error:p=subprocess.CompletedProcess(argv,124,error.stdout or b'',error.stderr or b'');timed=True\n\
+        \ (root/(label+'.stdout.txt')).write_bytes(p.stdout);(root/(label+'.stderr.txt')).write_bytes(p.stderr)\n\
+        \ elapsed=time.monotonic()-started\n records.append({'label':label,'argv':argv,'exitCode':p.returncode,'timedOut':timed,'elapsedSeconds':elapsed,'stdoutSha256':hashlib.sha256(p.stdout).hexdigest(),'stderrSha256':hashlib.sha256(p.stderr).hexdigest()})\n\
+        \ print(label,'exit',p.returncode,'elapsedSeconds',round(elapsed,3),flush=True)\n if label=='wait-owned-bridge-boot':print('OWNED_SIMULATOR_BOOT_STATUS='+p.stdout.decode(errors='replace')[-12000:],flush=True)\n\
+        \ if label=='install-only-own-bridge-fixture' and p.returncode:\n  try:\n   health=subprocess.run(['xcrun','simctl','list','devices','--json'],env=env,capture_output=True,timeout=15)\n\
+        \   if not health.returncode:\n    inventory=json.loads(health.stdout);owned_rows=[{'runtime':rt,'name':d.get('name'),'state':d.get('state'),'isAvailable':d.get('isAvailable')}\
+        \ for rt,ds in inventory['devices'].items() for d in ds if d.get('udid')==created]\n    print('OWNED_SIMULATOR_FAILURE_STATE='+json.dumps(owned_rows),flush=True)\n\
+        \   else:print('OWNED_SIMULATOR_HEALTH_EXIT='+str(health.returncode),flush=True)\n  except (subprocess.TimeoutExpired,ValueError,KeyError)\
+        \ as diagnostic:print('OWNED_SIMULATOR_HEALTH_FAILURE='+type(diagnostic).__name__,flush=True)\n  try:\n\
+        \   processes=subprocess.run(['/bin/ps','-axo','pid,ppid,pcpu,pmem,stat,etime,comm'],env=env,capture_output=True,text=True,timeout=10)\n\
+        \   relevant=[line for line in processes.stdout.splitlines() if any(word in line for word in ('CoreSimulator','Simulator','installd','launchd_sim'))]\n\
+        \   print('SIMULATOR_HOST_PROCESSES='+json.dumps(relevant[:60]),flush=True)\n  except subprocess.TimeoutExpired:print('SIMULATOR_HOST_PROCESS_QUERY_TIMEOUT',flush=True)\n\
+        \ if check and p.returncode:print(p.stdout.decode(errors='replace')[-8000:]);print(p.stderr.decode(errors='replace')[-8000:]);raise\
         \ RuntimeError(label)\n return p\ntry:\n runid=os.environ['GITHUB_RUN_ID'];assert re.fullmatch('[0-9]+',runid)\n\
         \ created=run('create-owned-bridge-simulator',['xcrun','simctl','create','NativeGL-Bridge-'+runid,selected['deviceTypeIdentifier'],selected['runtimeIdentifier']]).stdout.decode().strip()\n\
         \ assert re.fullmatch('[0-9A-Fa-f-]{36}',created)\n live=json.loads(run('verify-owned-bridge-simulator',['xcrun','simctl','list','devices','--json']).stdout)\n\
         \ rows=[d for d in live['devices'].get(selected['runtimeIdentifier'],[]) if d.get('udid')==created]\n assert\
         \ len(rows)==1 and rows[0]['name']=='NativeGL-Bridge-'+runid;owned=True\n run('boot-owned-bridge-simulator',['xcrun','simctl','boot',created]);run('wait-owned-bridge-boot',['xcrun','simctl','bootstatus',created,'-b'],180)\n\
-        \ run('install-only-own-bridge-fixture',['xcrun','simctl','install',created,app])\n nonce=os.urandom(32).hex();child=dict(env,SIMCTL_CHILD_LIBGL_NOBANNER='1',SIMCTL_CHILD_LIBGL_NOPSA='1')\n\
+        \ run('install-only-own-bridge-fixture',['xcrun','simctl','install',created,app],180)\n nonce=os.urandom(32).hex();child=dict(env,SIMCTL_CHILD_LIBGL_NOBANNER='1',SIMCTL_CHILD_LIBGL_NOPSA='1')\n\
         \ process=run('actual-uikit-bridge-execution',['xcrun','simctl','launch','--console','--terminate-running-process',created,'com.lsmith.native-gl-bridge-proof',nonce],120,False,child)\n\
         \ lines=[line[len('COD_GL_BRIDGE_RESULT='):] for line in process.stdout.decode(errors='replace').splitlines()\
         \ if line.startswith('COD_GL_BRIDGE_RESULT=')]\n assert len(lines)==1,'No unique actual UIKit bridge report'\n\
