@@ -2582,7 +2582,18 @@ void main()
             GSGL::SetStateCacheEnabled(ab >= 0 ? ab == 1 : cacheSetting);
         }
         ++batchSerial; // the next sprite starts a new batch: no seam with the previous one
-        flushShuffle();
+        if (haveShuffle) // (timed only when a shuffle is queued: most batches have none)
+        {
+            const auto shuffleStart = std::chrono::steady_clock::now();
+            flushShuffle();
+            static const uint64_t slowShuffle = std::getenv("GOW_SLOW_DRAW_MS") ? std::strtoull(std::getenv("GOW_SLOW_DRAW_MS"), nullptr, 10) * 1000000u : 10000000u;
+            if (const uint64_t spent = nanosSince(shuffleStart); spent > slowShuffle)
+            {
+                char detail[64];
+                std::snprintf(detail, sizeof(detail), "shuffle pass %.0f ms", spent * 1e-6);
+                ps2_perf::slowDrawDetail = detail;
+            }
+        }
         if (!havePending || pending.empty())
         {
             havePending = false;
@@ -2980,7 +2991,55 @@ void main()
                 std::fprintf(stderr, "[gs-hw] preparing graphics %d/%zu\n", warmed, lines.size());
             }
         }
+        // the passes outside the recorded draw pipelines, built lazily before (a ~110 ms hitch on the iPhone the first
+        // time an effect used one): the 16-bit shuffle (own program and vertex layout, one colour mask per half, targets
+        // with and without depth: all 32 combinations), the CLUT-from-target pass, and a target-to-target blit
+        int extra = 0;
+        g.Disable(kBlend);
+        if (shuffleProgram)
+        {
+            g.BindVertexArray(shuffleVao);
+            g.BindBuffer(kArrayBuffer, shuffleVbo);
+            const std::vector<ShuffleVertex> zeroShuffle(3);
+            g.BufferData(kArrayBuffer, static_cast<GLsizeiptr>(sizeof(ShuffleVertex) * zeroShuffle.size()), zeroShuffle.data(), kStreamDraw);
+            shuffleStream.size = shuffleStream.used = 0;
+            g.UseProgram(shuffleProgram);
+            for (int withDepth = 0; withDepth < 2; ++withDepth)
+            {
+                g.BindFramebuffer(kFramebuffer, fbo[withDepth]);
+                for (unsigned mask = 0; mask < 16u; ++mask)
+                {
+                    g.ColorMask((mask & 1u) ? kTrue : kFalse, (mask & 2u) ? kTrue : kFalse, (mask & 4u) ? kTrue : kFalse, (mask & 8u) ? kTrue : kFalse);
+                    g.DrawArrays(kTriangles, 0, 3);
+                    ++extra;
+                }
+            }
+            g.BindVertexArray(vao);
+            g.BindBuffer(kArrayBuffer, vbo);
+        }
+        g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+        if (presentVao && ensureClutProgram())
+        {
+            g.UseProgram(clutProgram);
+            g.BindFramebuffer(kFramebuffer, clutFbo);
+            g.Viewport(0, 0, 256, 1);
+            g.BindVertexArray(presentVao);
+            g.DrawArrays(kTriangles, 0, 3);
+            g.BindVertexArray(vao);
+            g.BindBuffer(kArrayBuffer, vbo);
+            g.Viewport(0, 0, kSize, kSize);
+            ++extra;
+        }
+        if (g.BlitFramebuffer)
+        {
+            constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9;
+            g.BindFramebuffer(kReadFramebuffer, fbo[0]);
+            g.BindFramebuffer(kDrawFramebuffer, fbo[1]);
+            g.BlitFramebuffer(0, 0, kSize, kSize, 0, 0, kSize, kSize, kColorBufferBit, kNearest);
+            ++extra;
+        }
         g.Finish(); // every pipeline built before the game draws
+        std::fprintf(stderr, "[gs-hw] pre-warmed %d other passes (shuffle, CLUT, blit)\n", extra);
         g.ColorMask(kTrue, kTrue, kTrue, kTrue);
         g.Disable(kBlend);
         g.BindFramebuffer(kFramebuffer, 0u);
@@ -3905,12 +3964,26 @@ void GSHwBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
     Impl &d = *m_impl;
     d.flushPending();
+    const auto start = std::chrono::steady_clock::now();
+    const uint64_t readbacksBefore = d.stats.clutReadbacks;
+    const bool hadClutProgram = d.clutProgram != 0u;
     if (d.initialized)
         d.store.LoadClut(tex0, texclut, [&d](const GSTex0Reg &t, uint32_t width, const uint16_t *xy, uint32_t count, uint32_t *words)
                          { return d.clutFromTarget(t, width, xy, count, words); });
     else
         d.store.LoadClut(tex0, texclut);
     d.clutHash = d.store.ClutHash();
+    // GOW-Port: a slow CLUT load says why, for the readout's hitch line (a palette read back from a render target)
+    const uint64_t spent = Impl::nanosSince(start);
+    static const uint64_t slowNanos = std::getenv("GOW_SLOW_DRAW_MS") ? std::strtoull(std::getenv("GOW_SLOW_DRAW_MS"), nullptr, 10) * 1000000u : 10000000u;
+    if (spent > slowNanos)
+    {
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), "palette load %.0f ms%s%s", spent * 1e-6,
+                      d.stats.clutReadbacks > readbacksBefore ? ", read back from a render target" : "",
+                      !hadClutProgram && d.clutProgram != 0u ? ", first use of its shader" : "");
+        ps2_perf::slowDrawDetail = detail;
+    }
 }
 
 void GSHwBackend::BeginTransfer(const GSTransferCommand &command)
