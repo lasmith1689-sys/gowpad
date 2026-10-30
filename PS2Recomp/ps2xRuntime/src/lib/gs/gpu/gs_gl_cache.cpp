@@ -83,6 +83,9 @@ namespace GSGL
         // bumped whenever the program, blending, colour mask or draw framebuffer actually changes (CurrentPipelineState users
         // can skip a draw whose pipeline cannot have changed since the previous one)
         thread_local uint64_t t_pipelineGeneration = 0;
+        // draw framebuffer changes (each one ends a render pass on a tile-based GPU), for GOW_GS_HW_STATS
+        thread_local uint64_t t_drawFbChanges = 0;
+        thread_local std::vector<uint32_t> *t_fbTrace = nullptr; // PS2X_GS_FBTRACE: the framebuffers switched to, in order
 
         struct Verify
         {
@@ -151,6 +154,9 @@ namespace GSGL
             {
                 const bool drawSame = t_state.drawFb.same({fb});
                 t_pipelineGeneration += drawSame ? 0u : 1u;
+                t_drawFbChanges += drawSame ? 0u : 1u;
+                if (!drawSame && t_fbTrace)
+                    t_fbTrace->push_back(fb);
                 same = drawSame && same;
             }
             if (!skip(same))
@@ -437,6 +443,19 @@ namespace GSGL
     uint64_t PipelineGeneration()
     {
         return t_pipelineGeneration;
+    }
+    uint64_t DrawFramebufferChanges()
+    {
+        return t_drawFbChanges;
+    }
+    bool CurrentDrawFramebuffer(GLuint &fb)
+    {
+        fb = t_state.drawFb.value[0];
+        return t_state.drawFb.known;
+    }
+    void TraceFramebufferChanges(std::vector<uint32_t> *sink)
+    {
+        t_fbTrace = sink;
     }
 
     PipelineState CurrentPipelineState()

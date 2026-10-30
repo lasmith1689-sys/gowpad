@@ -142,7 +142,7 @@ fs::path ps2xIosPrepare()
     setenv("GOW_PERF_DIAG", "1", 0);
     setenv("GOW_PERF_FRAME_PC", "0x001837B8", 0);
     setenv("GOW_DELTA_DIAG", "1", 0);
-    setenv("GOW_PERF_HUD", "1", 0);
+    // (no on-screen readout: the counters and [gs-hitch] causes go to log.txt only; GOW_PERF_HUD=1 in env.txt shows it)
     // one bilinear tap to present (as on the Switch): the bicubic + sharpen pass now runs on every panel pixel (2622x1206)
     // and its GPU time competes with the GS renderer's; the 2x frame is only magnified ~1.35x
     setenv("GOW_SCALER", "bilinear", 0);

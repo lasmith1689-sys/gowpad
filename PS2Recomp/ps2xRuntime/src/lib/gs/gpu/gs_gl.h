@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace GSGL
 {
@@ -242,4 +243,7 @@ namespace GSGL
     };
     PipelineState CurrentPipelineState();
     uint64_t PipelineGeneration(); // changes whenever a part of the pipeline state does (this thread)
+    uint64_t DrawFramebufferChanges(); // draw framebuffer binds that changed it (this thread, state cache on)
+    void TraceFramebufferChanges(std::vector<uint32_t> *sink); // records them into sink (nullptr stops)
+    bool CurrentDrawFramebuffer(GLuint &fb); // false: not known (state cache not installed)
 }

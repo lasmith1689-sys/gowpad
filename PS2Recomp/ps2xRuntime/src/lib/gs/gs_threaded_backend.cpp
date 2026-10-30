@@ -60,6 +60,10 @@ namespace
                 if (count[i])
                     at += std::snprintf(line + at, sizeof(line) - at, " %s=%.1fms/%llu", names[i], nanos[i] * 1e-6,
                                         static_cast<unsigned long long>(count[i]));
+            // frames the GPU still owed at each present (0: the GL thread's CPU work is the limit; 2-3: the GPU is)
+            if (at > 0 && at < static_cast<int>(sizeof(line)))
+                std::snprintf(line + at, sizeof(line) - at, " gpu_behind=%.1f",
+                              ps2_perf::latest.gpuFramesBehind.load(std::memory_order_relaxed));
             std::fprintf(stderr, "%s\n", line);
             // the on-screen readout's second line: busy share of the GL thread and its four largest ops, in % of the window
             {

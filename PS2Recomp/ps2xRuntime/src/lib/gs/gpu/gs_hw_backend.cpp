@@ -509,6 +509,7 @@ void main()
     struct RenderTarget
     {
         GLuint color = 0, depth = 0, fbo = 0;
+        GLuint colorFbo = 0; // the colour alone (shuffles on ES: see shuffleFramebuffer)
         uint32_t fbp = 0, fbw = 1; // PS2 page base and width in 64 px units
         uint8_t psm = 0;
         uint32_t zbp = ~0u;
@@ -692,6 +693,27 @@ void main()
     GLuint shuffleProgram = 0, shuffleVao = 0, shuffleVbo = 0;
     GLint locShTexa = -1;
     GLint locShInvSize = -1, locShSrc = -1, locShSrcZ = -1, locShZMax = -1, locShHs = -1, locShHd = -1, locShScale = -1;
+    // GOW-Port: ES with framebuffer fetch (iOS): a shuffle whose source is its own destination reads exactly the pixel it
+    // writes (mapShuffle rejects anything else), so it reads that pixel from the framebuffer instead of from a copy of
+    // the whole target. Each copy was a full-target blit and, on Apple's tile-based GPU, a store and reload of the
+    // target's colour and depth: ~9 per frame in the ship fights, the GPU time that held build 601 at ~35 fps there.
+    // A batch where one quad reads a half-pixel another quad of the batch writes still uses the copy (everything it
+    // reads must be the batch's input, as with the copy). PS2X_GS_SHUFFLE_FETCH=0 disables; =1 forces it on desktop GL
+    // (testing: the target is sampled directly behind a texture barrier per pass, the same reads).
+    GLuint shuffleFetchProgram = 0;
+    GLint locShfInvSize = -1, locShfSrcZ = -1, locShfZMax = -1, locShfHs = -1, locShfHd = -1, locShfScale = -1, locShfTexa = -1, locShfDest = -1;
+    bool shuffleFetchForced = false;
+    // PS2X_GS_SHUFFLE_VERIFY=1 (desktop test): every batch through the fetch path is also drawn the copy way into a
+    // scratch target from the same input, and the two are compared pixel by pixel ([gs-hw-verify] every 5 s)
+    bool shuffleVerify = false;
+    struct VerifyTarget { GLuint texture = 0, fbo = 0; };
+    std::unordered_map<uint64_t, VerifyTarget> verifyTargets;
+    uint64_t verifyBatches = 0, verifyBadBatches = 0, verifyBadPixels = 0, verifyPixels = 0;
+    std::vector<uint32_t> shuffleBlockGen; // per 8x8 owner block of the destination: shuffleGen when last touched
+    std::vector<uint8_t> shuffleBlockRead, shuffleBlockWrite; // halves (bit 0 low, bit 1 high) read / written this batch
+    uint32_t shuffleGen = 0;
+    bool shuffleConflict = false;
+    std::string *opTrace = nullptr; // PS2X_GS_FBTRACE frame: the draw batches and shuffle passes, in order
     // queued shuffle sprites of one state, as owner-space quads per (source half, destination half)
     std::vector<ShuffleVertex> shuffleQuads[4];
     GSDrawState shuffleState{};
@@ -797,6 +819,8 @@ void main()
         uint64_t draws = 0, batches = 0, skippedPsm = 0, unsupportedBlend = 0, texDecodes = 0, texHits = 0, skippedPrim = 0;
         uint64_t glDraws = 0, barriers = 0, uploadBytes = 0, orphans = 0, clutReadbacks = 0, paletteUploads = 0; // GL calls the driver sees (GOW_GS_HW_STATS)
         uint64_t selfCopies = 0; // ES: render targets copied because a draw samples the target it draws into
+        uint64_t shuffleSelfCopies = 0, shuffleFetches = 0; // ES: self-sourced shuffle batches through a copy / through fetch
+        uint64_t fbChangesAtLast = 0;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     } stats;
     bool statsEnabled = [] { const char *v = std::getenv("GOW_GS_HW_STATS"); return v && *v && *v != '0'; }();
@@ -1322,6 +1346,38 @@ void main()
                 g.BindVertexArray(vao);
                 g.BindBuffer(kArrayBuffer, vbo);
             }
+            const char *fetchEnv = std::getenv("PS2X_GS_SHUFFLE_FETCH");
+            const char *verifyEnv = std::getenv("PS2X_GS_SHUFFLE_VERIFY");
+            shuffleVerify = verifyEnv && *verifyEnv == '1' && !g.fbFetch;
+            shuffleFetchForced = ((fetchEnv && *fetchEnv == '1') || shuffleVerify) && !g.fbFetch && g.TextureBarrier;
+            if (shuffleProgram && ((g.es && g.fbFetch && !(fetchEnv && *fetchEnv == '0')) || shuffleFetchForced))
+            {
+                // the source read becomes the destination pixel (toEs turns it into the framebuffer-fetch input), and
+                // the half not written keeps the pixel's value (the colour mask keeps it too)
+                std::string fs = kShuffleFs;
+                const auto swap = [&fs](const char *from, const char *to) {
+                    const size_t at = fs.find(from);
+                    if (at != std::string::npos)
+                        fs.replace(at, std::strlen(from), to);
+                    return at != std::string::npos;
+                };
+                const bool ok = swap("out vec4 oColor;", "layout(location = 0, index = 0) out vec4 oColor;\nuniform sampler2D uDest;") &&
+                                swap("        c = texelFetch(uSrc, p, 0);", "        c = texelFetch(uDest, ivec2(gl_FragCoord.xy), 0);") &&
+                                swap("oColor = (uHd == 0) ? vec4(h, 0.0, 0.0) : vec4(0.0, 0.0, h);", "oColor = (uHd == 0) ? vec4(h, c.ba) : vec4(c.rg, h);");
+                const GLuint fv = ok ? compile(GSGL::kVertexShader, kShuffleVs) : 0u, ff = ok ? compile(GSGL::kFragmentShader, fs.c_str()) : 0u;
+                if (fv && ff)
+                {
+                    shuffleFetchProgram = g.CreateProgram();
+                    g.AttachShader(shuffleFetchProgram, fv);
+                    g.AttachShader(shuffleFetchProgram, ff);
+                    g.LinkProgram(shuffleFetchProgram);
+                    const auto floc = [&](const char *name) { return g.GetUniformLocation(shuffleFetchProgram, name); };
+                    locShfInvSize = floc("uInvSize"); locShfSrcZ = floc("uSrcZ"); locShfZMax = floc("uZMax"); locShfHs = floc("uHs");
+                    locShfHd = floc("uHd"); locShfScale = floc("uScale"); locShfTexa = floc("uTexa"); locShfDest = floc("uDest");
+                    std::fprintf(stderr, "[gs-hw] self-sourced shuffles read the framebuffer (no target copy)%s\n",
+                                 shuffleFetchForced ? " [desktop test: direct reads behind barriers]" : "");
+                }
+            }
         }
         {
             const GLuint pv = compile(GSGL::kVertexShader, kPresentVs), pf = compile(GSGL::kFragmentShader, kPresentFs);
@@ -1413,6 +1469,7 @@ void main()
     {
         const Api &g = gl();
         if (t.fbo) g.DeleteFramebuffers(1, &t.fbo);
+        if (t.colorFbo) g.DeleteFramebuffers(1, &t.colorFbo);
         if (t.color) g.DeleteTextures(1, &t.color);
         if (t.depth) g.DeleteTextures(1, &t.depth);
         t = {};
@@ -1447,6 +1504,9 @@ void main()
         if (g.es)
         {
             selfCopyFor(t);
+            t.colorFbo = newFramebufferName();
+            g.BindFramebuffer(kFramebuffer, t.colorFbo);
+            g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, t.color, 0);
             g.BindFramebuffer(kFramebuffer, t.fbo);
         }
         std::fprintf(stderr, "[gs-hw] render target fbp=%u fbw=%u -> %ux%u\n", fbp, t.fbw, t.glW, t.glH);
@@ -2331,6 +2391,38 @@ void main()
             shuffleDst = dst;
             shuffleSrc = src;
             shuffleSrcZ = srcDepth;
+            ++shuffleGen;
+            shuffleConflict = false;
+        }
+        if (shuffleFetchProgram && src == dst && !srcDepth && !shuffleConflict)
+        {
+            // a quad reads half hs of its 8x8 owner block and writes half hd of the same block: through the framebuffer
+            // a read sees what earlier quads of the batch wrote, which a copy does not, so such a batch keeps the copy
+            const uint32_t bw = (dst->pxW + 7u) / 8u, blocks = bw * ((dst->pxH + 7u) / 8u);
+            if (shuffleBlockGen.size() < blocks)
+            {
+                shuffleBlockGen.resize(blocks, 0u);
+                shuffleBlockRead.resize(blocks, 0u);
+                shuffleBlockWrite.resize(blocks, 0u);
+            }
+            for (uint32_t i = 0; i < 4u && !shuffleConflict; ++i)
+            {
+                const uint8_t rd = static_cast<uint8_t>(1u << (i >> 1)), wr = static_cast<uint8_t>(1u << (i & 1u));
+                const std::vector<ShuffleVertex> &q = map.quads[i];
+                for (size_t v = 0; v < q.size(); v += 6)
+                {
+                    const uint32_t at = static_cast<uint32_t>(q[v].y) / 8u * bw + static_cast<uint32_t>(q[v].x) / 8u;
+                    if (shuffleBlockGen[at] != shuffleGen)
+                        shuffleBlockGen[at] = shuffleGen, shuffleBlockRead[at] = shuffleBlockWrite[at] = 0u;
+                    if ((shuffleBlockWrite[at] & rd) || (shuffleBlockRead[at] & wr))
+                    {
+                        shuffleConflict = true;
+                        break;
+                    }
+                    shuffleBlockRead[at] |= rd;
+                    shuffleBlockWrite[at] |= wr;
+                }
+            }
         }
         for (int i = 0; i < 4; ++i)
             shuffleQuads[i].insert(shuffleQuads[i].end(), map.quads[i].begin(), map.quads[i].end());
@@ -2338,6 +2430,20 @@ void main()
         dst->usedH = std::max(dst->usedH, std::min(maxY, dst->pxH));
         ++stats.shuffles;
         return true;
+    }
+
+    // GOW-Port: ES (Apple's tile-based GPUs): every switch between framebuffers stores the attachments of the one left
+    // and reloads those of the next, and a shuffle uses no depth. When a shuffle needs a switch anyway it goes to the
+    // target's colour-only framebuffer, so the game's strip-by-strip shuffle chains (the ship fights: the 1536x1536 main
+    // target <-> a 64 px scratch target 16 times a frame) move the colour alone, not the depth buffer as well. In the
+    // target's pass already (either framebuffer), it stays there. PS2X_GS_COLOR_FBO=0 disables.
+    GLuint shuffleFramebuffer(const RenderTarget &t)
+    {
+        static const bool on = [] { const char *v = std::getenv("PS2X_GS_COLOR_FBO"); return !(v && *v == '0'); }();
+        GLuint current = 0;
+        if (!on || !t.colorFbo || !GSGL::CurrentDrawFramebuffer(current) || current == t.fbo)
+            return t.fbo;
+        return t.colorFbo;
     }
 
     void flushShuffle()
@@ -2354,29 +2460,70 @@ void main()
         }
         RenderTarget &dst = *shuffleDst, &src = *shuffleSrc;
         const GSContext &c = shuffleState.context;
+        if (opTrace)
+        {
+            size_t quads = 0;
+            for (const auto &q : shuffleQuads)
+                quads += q.size() / 6u;
+            char op[64];
+            std::snprintf(op, sizeof(op), " S%u%s>%u:%zu", src.fbp, shuffleSrcZ ? "z" : "", dst.fbp, quads);
+            *opTrace += op;
+        }
         const Api &g = gl();
         ++dst.version;
         dst.lastDrawSeq = ++writeSeq;
         const uint32_t m16 = fbmsk16(c.frame.fbmsk);
         const GLboolean lo = (m16 & 0xFFu) == 0u ? kTrue : kFalse, hi = (m16 & 0xFF00u) == 0u ? kTrue : kFalse;
-        g.BindFramebuffer(kFramebuffer, dst.fbo);
+        g.BindFramebuffer(kFramebuffer, shuffleFramebuffer(dst));
         g.Viewport(0, 0, dst.glW, dst.glH);
         g.Disable(kScissorTest);
         g.Disable(kBlend);
         g.Disable(kDepthTest);
         g.DepthMask(kFalse);
-        g.UseProgram(shuffleProgram);
-        const GLuint srcColor = (g.es && &src == &dst && !shuffleSrcZ) ? selfCopy(dst, false) : src.color;
-        g.ActiveTexture(kTexture0);
-        g.BindTexture(kTexture2D, shuffleSrcZ ? src.depth : srcColor);
-        g.Uniform1i(locShSrc, 0);
-        g.Uniform1i(locShSrcZ, shuffleSrcZ ? 1 : 0);
-        g.Uniform1f(locShZMax, zMaxFor(c.zbuf.psm));
-        g.Uniform1f(locShScale, scale);
-        g.Uniform4i(locShTexa, shuffleState.texa.ta0 >> 7, shuffleState.texa.ta1 >> 7, shuffleState.texa.aem ? 1 : 0, 0);
-        g.Uniform2f(locShInvSize, 1.0f / dst.pxW, 1.0f / dst.pxH);
-        if (&src == &dst && !(g.es && !shuffleSrcZ) && g.TextureBarrier) // (ES: no barrier exists; depth is not written)
-            g.TextureBarrier(), ++stats.barriers;
+        const bool fetch = shuffleFetchProgram && &src == &dst && !shuffleSrcZ && !shuffleConflict;
+        if (fetch)
+        {
+            ++stats.shuffleFetches;
+            g.UseProgram(shuffleFetchProgram);
+            if (shuffleFetchForced)
+            {
+                g.ActiveTexture(kTexture0 + 6);
+                g.BindTexture(kTexture2D, dst.color);
+                g.Uniform1i(locShfDest, 6);
+                g.ActiveTexture(kTexture0);
+            }
+            g.Uniform1i(locShfSrcZ, 0);
+            g.Uniform1f(locShfZMax, zMaxFor(c.zbuf.psm));
+            g.Uniform1f(locShfScale, scale);
+            g.Uniform4i(locShfTexa, shuffleState.texa.ta0 >> 7, shuffleState.texa.ta1 >> 7, shuffleState.texa.aem ? 1 : 0, 0);
+            g.Uniform2f(locShfInvSize, 1.0f / dst.pxW, 1.0f / dst.pxH);
+        }
+        else
+        {
+            g.UseProgram(shuffleProgram);
+            const bool copied = g.es && &src == &dst && !shuffleSrcZ;
+            const GLuint srcColor = copied ? selfCopy(dst, false) : src.color;
+            stats.shuffleSelfCopies += (&src == &dst && !shuffleSrcZ) ? 1u : 0u; // (forced desktop test: the batches fetch would not take)
+            g.ActiveTexture(kTexture0);
+            g.BindTexture(kTexture2D, shuffleSrcZ ? src.depth : srcColor);
+            g.Uniform1i(locShSrc, 0);
+            g.Uniform1i(locShSrcZ, shuffleSrcZ ? 1 : 0);
+            g.Uniform1f(locShZMax, zMaxFor(c.zbuf.psm));
+            g.Uniform1f(locShScale, scale);
+            g.Uniform4i(locShTexa, shuffleState.texa.ta0 >> 7, shuffleState.texa.ta1 >> 7, shuffleState.texa.aem ? 1 : 0, 0);
+            g.Uniform2f(locShInvSize, 1.0f / dst.pxW, 1.0f / dst.pxH);
+            if (&src == &dst && !(g.es && !shuffleSrcZ) && g.TextureBarrier) // (ES: no barrier exists; depth is not written)
+                g.TextureBarrier(), ++stats.barriers;
+        }
+        const GLint locHs = fetch ? locShfHs : locShHs, locHd = fetch ? locShfHd : locShHd;
+        std::vector<ShuffleVertex> verifyQuads[4];
+        if (fetch && shuffleVerify)
+        {
+            for (int i = 0; i < 4; ++i)
+                verifyQuads[i] = shuffleQuads[i];
+            selfCopy(dst, false); // the batch's input
+            g.UseProgram(shuffleFetchProgram);
+        }
         g.BindVertexArray(shuffleVao);
         g.BindBuffer(kArrayBuffer, shuffleVbo);
         for (uint32_t i = 0; i < 4; ++i)
@@ -2385,18 +2532,91 @@ void main()
             if (q.empty())
                 continue;
             const uint32_t hs = i >> 1, hd = i & 1u;
-            g.Uniform1i(locShHs, static_cast<GLint>(hs));
-            g.Uniform1i(locShHd, static_cast<GLint>(hd));
+            g.Uniform1i(locHs, static_cast<GLint>(hs));
+            g.Uniform1i(locHd, static_cast<GLint>(hd));
+            if (fetch && shuffleFetchForced && g.TextureBarrier)
+                g.TextureBarrier(), ++stats.barriers; // (desktop test: each pass sees the previous one's writes, as fetch does)
             g.ColorMask(hd == 0u ? lo : kFalse, hd == 0u ? hi : kFalse, hd == 1u ? lo : kFalse, hd == 1u ? hi : kFalse);
             const GLint first = streamVertices(shuffleStream, q.data(), q.size() * sizeof(ShuffleVertex), sizeof(ShuffleVertex));
             g.DrawArrays(kTriangles, first, static_cast<GLsizei>(q.size()));
             ++stats.glDraws;
             q.clear();
         }
+        if (fetch && shuffleVerify)
+            verifyShuffle(verifyQuads, dst, lo, hi);
         g.ColorMask(kTrue, kTrue, kTrue, kTrue);
         g.BindVertexArray(vao);
         g.BindBuffer(kArrayBuffer, vbo);
         ++stats.batches;
+    }
+
+    // the copy-path result of the batch just drawn through the fetch path: the input (the self copy) copied into a
+    // scratch target, the same quads drawn there by the copy-path program from the input, then both read back
+    void verifyShuffle(const std::vector<ShuffleVertex> (&quads)[4], RenderTarget &dst, GLboolean lo, GLboolean hi)
+    {
+        constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9;
+        const Api &g = gl();
+        const SelfCopy &input = selfCopyFor(dst);
+        VerifyTarget &ref = verifyTargets[(static_cast<uint64_t>(dst.glW) << 32) | dst.glH];
+        if (!ref.texture)
+        {
+            g.GenTextures(1, &ref.texture);
+            g.BindTexture(kTexture2D, ref.texture);
+            g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), dst.glW, dst.glH, 0, kRgba, kUnsignedByte, nullptr);
+            g.GenFramebuffers(1, &ref.fbo);
+            g.BindFramebuffer(kFramebuffer, ref.fbo);
+            g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, ref.texture, 0);
+        }
+        const GLint w = static_cast<GLint>(dst.glW), h = static_cast<GLint>(dst.glH);
+        g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+        g.BindFramebuffer(kReadFramebuffer, input.fbo);
+        g.BindFramebuffer(kDrawFramebuffer, ref.fbo);
+        g.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, kColorBufferBit, kNearest);
+        g.BindFramebuffer(kFramebuffer, ref.fbo);
+        const GSContext &c = shuffleState.context;
+        g.UseProgram(shuffleProgram);
+        g.ActiveTexture(kTexture0);
+        g.BindTexture(kTexture2D, input.texture);
+        g.Uniform1i(locShSrc, 0);
+        g.Uniform1i(locShSrcZ, 0);
+        g.Uniform1f(locShZMax, zMaxFor(c.zbuf.psm));
+        g.Uniform1f(locShScale, scale);
+        g.Uniform4i(locShTexa, shuffleState.texa.ta0 >> 7, shuffleState.texa.ta1 >> 7, shuffleState.texa.aem ? 1 : 0, 0);
+        g.Uniform2f(locShInvSize, 1.0f / dst.pxW, 1.0f / dst.pxH);
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            const std::vector<ShuffleVertex> &q = quads[i];
+            if (q.empty())
+                continue;
+            const uint32_t hs = i >> 1, hd = i & 1u;
+            g.Uniform1i(locShHs, static_cast<GLint>(hs));
+            g.Uniform1i(locShHd, static_cast<GLint>(hd));
+            g.ColorMask(hd == 0u ? lo : kFalse, hd == 0u ? hi : kFalse, hd == 1u ? lo : kFalse, hd == 1u ? hi : kFalse);
+            const GLint first = streamVertices(shuffleStream, q.data(), q.size() * sizeof(ShuffleVertex), sizeof(ShuffleVertex));
+            g.DrawArrays(kTriangles, first, static_cast<GLsizei>(q.size()));
+        }
+        g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+        std::vector<uint8_t> a(static_cast<size_t>(w) * h * 4u), b(a.size());
+        g.PixelStorei(kPackAlignment, 1);
+        g.ReadPixels(0, 0, w, h, kRgba, kUnsignedByte, b.data());
+        g.BindFramebuffer(kFramebuffer, dst.fbo);
+        g.ReadPixels(0, 0, w, h, kRgba, kUnsignedByte, a.data());
+        uint64_t bad = 0;
+        for (size_t i = 0; i < a.size(); i += 4)
+            bad += std::memcmp(&a[i], &b[i], 4) != 0 ? 1u : 0u;
+        ++verifyBatches;
+        verifyPixels += static_cast<uint64_t>(w) * h;
+        if (bad)
+            ++verifyBadBatches, verifyBadPixels += bad;
+        static auto last = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - last >= std::chrono::seconds(5))
+        {
+            last = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[gs-hw-verify] shuffle batches=%llu differing=%llu differing_px=%llu of %llu\n",
+                         (unsigned long long)verifyBatches, (unsigned long long)verifyBadBatches,
+                         (unsigned long long)verifyBadPixels, (unsigned long long)verifyPixels);
+        }
+        g.UseProgram(shuffleFetchProgram);
     }
 
     // GOW_GS_HW_DUMP window: skipped batches are listed in order with the drawn ones
@@ -3047,15 +3267,20 @@ void main()
             const std::vector<ShuffleVertex> zeroShuffle(3);
             g.BufferData(kArrayBuffer, static_cast<GLsizeiptr>(sizeof(ShuffleVertex) * zeroShuffle.size()), zeroShuffle.data(), kStreamDraw);
             shuffleStream.size = shuffleStream.used = 0;
-            g.UseProgram(shuffleProgram);
-            for (int withDepth = 0; withDepth < 2; ++withDepth)
+            for (const GLuint program : {shuffleProgram, shuffleFetchProgram})
             {
-                g.BindFramebuffer(kFramebuffer, fbo[withDepth]);
-                for (unsigned mask = 0; mask < 16u; ++mask)
+                if (!program)
+                    continue;
+                g.UseProgram(program);
+                for (int withDepth = 0; withDepth < 2; ++withDepth)
                 {
-                    g.ColorMask((mask & 1u) ? kTrue : kFalse, (mask & 2u) ? kTrue : kFalse, (mask & 4u) ? kTrue : kFalse, (mask & 8u) ? kTrue : kFalse);
-                    g.DrawArrays(kTriangles, 0, 3);
-                    ++extra;
+                    g.BindFramebuffer(kFramebuffer, fbo[withDepth]);
+                    for (unsigned mask = 0; mask < 16u; ++mask)
+                    {
+                        g.ColorMask((mask & 1u) ? kTrue : kFalse, (mask & 2u) ? kTrue : kFalse, (mask & 4u) ? kTrue : kFalse, (mask & 8u) ? kTrue : kFalse);
+                        g.DrawArrays(kTriangles, 0, 3);
+                        ++extra;
+                    }
                 }
             }
             g.BindVertexArray(vao);
@@ -3065,6 +3290,11 @@ void main()
         if (presentVao && ensureClutProgram())
         {
             g.UseProgram(clutProgram);
+            // the sampler units its real draws use: left at 0, the integer and float samplers share a unit and ES rejects
+            // the draw (GL_INVALID_OPERATION, build 601's one GL error), so the pass was never built
+            g.Uniform1i(locClRtColor, 1);
+            g.Uniform1i(locClTables, 2);
+            g.Uniform1i(locClCoords, 3);
             g.BindFramebuffer(kFramebuffer, clutFbo);
             g.Viewport(0, 0, 256, 1);
             g.BindVertexArray(presentVao);
@@ -3393,6 +3623,12 @@ void main()
         attachDepth(rt, c.zbuf.zbp);
         rt.psm = c.frame.psm;
         ++rt.version;
+        if (opTrace)
+        {
+            char op[64];
+            std::snprintf(op, sizeof(op), " D%u<%s%x/%u", c.frame.fbp, s.prim.tme ? "t" : "-", c.tex0.tbp0, c.tex0.psm);
+            *opTrace += op;
+        }
         rt.lastDrawSeq = ++writeSeq;
         {
             // real extent of what was drawn (vertices clipped to the scissor), not the scissor itself
@@ -3942,13 +4178,17 @@ void main()
         if (now - stats.last < std::chrono::seconds(5))
             return;
         stats.last = now;
-        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
+        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu shuffleSelfCopies=%llu shuffleFetches=%llu fbChanges=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
                      (unsigned long long)stats.shuffles, (unsigned long long)stats.draws, (unsigned long long)stats.batches, (unsigned long long)stats.texDecodes,
                      (unsigned long long)stats.texHits, (unsigned long long)stats.skippedPsm, (unsigned long long)stats.skippedPrim,
                      (unsigned long long)stats.unsupportedBlend, textures.size(), (unsigned long long)stats.glDraws, (unsigned long long)stats.barriers,
-                     (unsigned long long)stats.selfCopies, (unsigned long long)(stats.uploadBytes >> 10), (unsigned long long)stats.orphans,
+                     (unsigned long long)stats.selfCopies, (unsigned long long)stats.shuffleSelfCopies, (unsigned long long)stats.shuffleFetches,
+                     (unsigned long long)(GSGL::DrawFramebufferChanges() - stats.fbChangesAtLast),
+                     (unsigned long long)(stats.uploadBytes >> 10), (unsigned long long)stats.orphans,
                      (unsigned long long)stats.clutReadbacks, (unsigned long long)stats.paletteUploads);
         stats.shuffles = stats.draws = stats.batches = stats.texDecodes = stats.texHits = stats.skippedPsm = stats.skippedPrim = stats.unsupportedBlend = 0;
+        stats.shuffleSelfCopies = stats.shuffleFetches = 0;
+        stats.fbChangesAtLast = GSGL::DrawFramebufferChanges();
         stats.glDraws = stats.barriers = stats.selfCopies = stats.uploadBytes = stats.orphans = stats.clutReadbacks = stats.paletteUploads = 0;
         GSGL::ReportStateCacheVerify();
     }
@@ -4193,6 +4433,39 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
     Impl::GpuSpan gpuSpan(d, Impl::GpuPresent);
     d.reportGlError("present");
     ++d.presentCount;
+    // PS2X_GS_FBTRACE=<present> (tests): the draw framebuffers one frame switches to, in order (render passes on a
+    // tile-based GPU), named by what they hold
+    static const int fbTraceAt = [] { const char *v = std::getenv("PS2X_GS_FBTRACE"); return v ? std::atoi(v) : -1; }();
+    static std::vector<uint32_t> fbTrace;
+    static std::string opTrace;
+    if (fbTraceAt >= 0 && d.presentCount == fbTraceAt)
+        GSGL::TraceFramebufferChanges(&fbTrace), d.opTrace = &opTrace;
+    else if (fbTraceAt >= 0 && d.presentCount == fbTraceAt + 1)
+    {
+        GSGL::TraceFramebufferChanges(nullptr);
+        d.opTrace = nullptr;
+        std::fprintf(stderr, "[gs-hw-optrace]%s\n", opTrace.c_str());
+        std::string line;
+        for (uint32_t fb : fbTrace)
+        {
+            char name[48];
+            std::snprintf(name, sizeof(name), " fb%u", fb);
+            for (const RenderTarget &t : d.targets)
+                if (t.fbo == fb)
+                    std::snprintf(name, sizeof(name), " t%u/%u%s", t.fbp, t.fbw, t.depth ? "z" : "");
+                else if (t.colorFbo == fb)
+                    std::snprintf(name, sizeof(name), " t%u/%uc", t.fbp, t.fbw);
+            for (const auto &c : d.selfCopies)
+                if (c.second.fbo == fb)
+                    std::snprintf(name, sizeof(name), " copy");
+            if (fb == d.clutFbo)
+                std::snprintf(name, sizeof(name), " clut");
+            if (fb == d.presentFbo)
+                std::snprintf(name, sizeof(name), " present");
+            line += name;
+        }
+        std::fprintf(stderr, "[gs-hw-fbtrace] %zu switches:%s\n", fbTrace.size(), line.c_str());
+    }
     // GOW_TEST_HITCH_MS=<ms> (tests): the GL thread stalls that long every 600 presents, to check how the game clock
     // rides out a hitch (gow-speed lines)
     static const int testHitchMs = [] { const char *v = std::getenv("GOW_TEST_HITCH_MS"); return v ? std::atoi(v) : 0; }();
