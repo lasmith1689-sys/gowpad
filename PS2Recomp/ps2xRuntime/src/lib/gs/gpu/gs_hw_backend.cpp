@@ -1064,9 +1064,23 @@ void main()
     // BufferSubData and drawn from its first vertex; the storage is only re-specified (orphaned) when it is full. A
     // BufferData per batch makes the driver allocate new storage for every batch (Mesa: new buffer storage each time,
     // ~700 per frame), while a write to a range not written since the last orphan needs no synchronisation.
+    // GOW-Port: and when full it moves on to the next of a ring of buffers (each with its own VAO), reused once a fence
+    // says the GPU has finished with it, instead of re-specifying the storage: on iOS a BufferData that orphans a buffer
+    // the GPU still reads made the GL thread wait for the GPU (the 25-165 ms stalls inside vertex uploads of builds
+    // 601-621, about every other frame in the ship fights, CPU and GPU taking turns). Apple's advice for streamed
+    // vertices is this rotation. PS2X_GS_STREAM_RING=<n> buffers (default 4; 0 or 1: one buffer, orphaned).
     struct StreamBuffer
     {
-        GLsizeiptr size = 0, used = 0;
+        GLsizeiptr size = 0, used = 0; // the current buffer's storage and how much of it is written
+        struct Slot
+        {
+            GLuint vao = 0, vbo = 0;
+            GSGL::GLsync fence = nullptr; // after its last draw (set when the ring moves on from it)
+            GLsizeiptr size = 0;
+        };
+        std::vector<Slot> slots; // (empty: one buffer, orphaned when full)
+        size_t current = 0;
+        GLuint *vao = nullptr, *vbo = nullptr; // the members the draw code binds: the current slot's
     };
     StreamBuffer drawStream, shuffleStream;
     static constexpr GLsizeiptr kStreamBytes = GLsizeiptr(8) << 20;
@@ -1076,6 +1090,7 @@ void main()
     struct CpuTiming
     {
         uint64_t drawNanos = 0, streamNanos = 0, vertices = 0, draws = 0;
+        uint64_t streamWaitNanos = 0, streamMaxNanos = 0; // stream ring: fence waits; the slowest single upload
         uint64_t parts[4] = {}; // draw(): before the target bind, fixed state, texture setup, after the upload
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now(), mark{};
     } cpuTiming;
@@ -1151,8 +1166,9 @@ void main()
         const auto now = std::chrono::steady_clock::now();
         if (!timed || now - cpuTiming.last < std::chrono::seconds(5))
             return;
-        std::fprintf(stderr, "[gs-hw-cpu] draw_ms=%.1f stream_ms=%.1f vertices=%llu draw_calls=%llu pre_ms=%.1f state_ms=%.1f tex_ms=%.1f post_ms=%.1f tex_decodes=%llu tex_revalidated=%llu\n",
-                     cpuTiming.drawNanos * 1e-6, cpuTiming.streamNanos * 1e-6, (unsigned long long)cpuTiming.vertices,
+        std::fprintf(stderr, "[gs-hw-cpu] draw_ms=%.1f stream_ms=%.1f stream_wait_ms=%.1f stream_max_ms=%.1f vertices=%llu draw_calls=%llu pre_ms=%.1f state_ms=%.1f tex_ms=%.1f post_ms=%.1f tex_decodes=%llu tex_revalidated=%llu\n",
+                     cpuTiming.drawNanos * 1e-6, cpuTiming.streamNanos * 1e-6, cpuTiming.streamWaitNanos * 1e-6,
+                     cpuTiming.streamMaxNanos * 1e-6, (unsigned long long)cpuTiming.vertices,
                      (unsigned long long)cpuTiming.draws, cpuTiming.parts[0] * 1e-6, cpuTiming.parts[1] * 1e-6,
                      cpuTiming.parts[2] * 1e-6, cpuTiming.parts[3] * 1e-6, (unsigned long long)decodes,
                      (unsigned long long)revalidated);
@@ -1168,12 +1184,52 @@ void main()
         {
             CpuTiming &t;
             std::chrono::steady_clock::time_point start;
-            ~StreamTimer() { t.streamNanos += nanosSince(start); }
+            ~StreamTimer()
+            {
+                const uint64_t spent = nanosSince(start);
+                t.streamNanos += spent;
+                t.streamMaxNanos = std::max(t.streamMaxNanos, spent);
+            }
         } streamTimer{cpuTiming, streamStart};
         const Api &g = gl();
         const GLsizeiptr step = static_cast<GLsizeiptr>(stride), length = static_cast<GLsizeiptr>(bytes);
         GLsizeiptr at = (sb.used + step - 1) / step * step;
-        if (at + length > sb.size)
+        if (at + length > sb.size && sb.slots.size() > 1u)
+        {
+            StreamBuffer::Slot &left = sb.slots[sb.current];
+            left.size = sb.size;
+            if (left.fence)
+                g.DeleteSync(left.fence);
+            left.fence = g.FenceSync(GSGL::kSyncGpuCommandsComplete, 0u);
+            sb.current = (sb.current + 1u) % sb.slots.size();
+            StreamBuffer::Slot &next = sb.slots[sb.current];
+            if (next.fence)
+            {
+                const auto waitStart = std::chrono::steady_clock::now();
+                for (int tries = 0; tries < 50; ++tries) // (100 ms each: 5 s at most)
+                {
+                    const GLenum status = g.ClientWaitSync(next.fence, GSGL::kSyncFlushCommandsBit, 100000000ull);
+                    if (status != 0x911Bu) // GL_TIMEOUT_EXPIRED
+                        break;
+                }
+                g.DeleteSync(next.fence);
+                next.fence = nullptr;
+                cpuTiming.streamWaitNanos += nanosSince(waitStart);
+            }
+            *sb.vao = next.vao;
+            *sb.vbo = next.vbo;
+            g.BindVertexArray(next.vao);
+            g.BindBuffer(kArrayBuffer, next.vbo);
+            sb.size = next.size;
+            at = 0;
+            if (length > sb.size)
+            {
+                sb.size = next.size = std::max<GLsizeiptr>(kStreamBytes, length);
+                g.BufferData(kArrayBuffer, sb.size, nullptr, kStreamDraw); // (first use, or a batch larger than it)
+                ++stats.orphans;
+            }
+        }
+        else if (at + length > sb.size)
         {
             sb.size = std::max<GLsizeiptr>(kStreamBytes, length);
             g.BufferData(kArrayBuffer, sb.size, nullptr, kStreamDraw);
@@ -1356,19 +1412,55 @@ void main()
             }
         }
 
+        const auto drawAttribs = [&g] {
+            const GLsizei stride = sizeof(HwVertex);
+            g.VertexAttribPointer(0, 2, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, x)));
+            g.VertexAttribPointer(1, 1, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, z)));
+            g.VertexAttribPointer(2, 4, kUnsignedByte, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, r)));
+            g.VertexAttribPointer(3, 3, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, s)));
+            g.VertexAttribPointer(4, 2, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, u)));
+            g.VertexAttribPointer(5, 4, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, cu0)));
+            for (GLuint i = 0; i < 6; ++i)
+                g.EnableVertexAttribArray(i);
+        };
+        const auto shuffleAttribs = [&g] {
+            g.VertexAttribPointer(0, 2, kFloat, kFalse, sizeof(ShuffleVertex), reinterpret_cast<const void *>(offsetof(ShuffleVertex, x)));
+            g.VertexAttribPointer(1, 2, kFloat, kFalse, sizeof(ShuffleVertex), reinterpret_cast<const void *>(offsetof(ShuffleVertex, ox)));
+            g.EnableVertexAttribArray(0);
+            g.EnableVertexAttribArray(1);
+        };
+        // the stream ring (see StreamBuffer): slot 0 is vao/vbo (shuffleVao/shuffleVbo), the others are made here
+        const size_t ringSlots = [] {
+            const char *v = std::getenv("PS2X_GS_STREAM_RING");
+            return v && *v ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : size_t(4);
+        }();
+        const auto makeRing = [&](StreamBuffer &sb, GLuint &vaoMember, GLuint &vboMember, const auto &attribs) {
+            sb.vao = &vaoMember;
+            sb.vbo = &vboMember;
+            sb.slots.clear();
+            sb.current = 0;
+            if (ringSlots < 2u || !g.FenceSync || !g.ClientWaitSync || !g.DeleteSync)
+                return;
+            sb.slots.push_back({vaoMember, vboMember, nullptr, 0});
+            for (size_t i = 1; i < ringSlots; ++i)
+            {
+                StreamBuffer::Slot slot;
+                g.GenVertexArrays(1, &slot.vao);
+                g.BindVertexArray(slot.vao);
+                g.GenBuffers(1, &slot.vbo);
+                g.BindBuffer(kArrayBuffer, slot.vbo);
+                attribs();
+                sb.slots.push_back(slot);
+            }
+            g.BindVertexArray(vaoMember);
+            g.BindBuffer(kArrayBuffer, vboMember);
+        };
         g.GenVertexArrays(1, &vao);
         g.BindVertexArray(vao);
         g.GenBuffers(1, &vbo);
         g.BindBuffer(kArrayBuffer, vbo);
-        const GLsizei stride = sizeof(HwVertex);
-        g.VertexAttribPointer(0, 2, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, x)));
-        g.VertexAttribPointer(1, 1, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, z)));
-        g.VertexAttribPointer(2, 4, kUnsignedByte, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, r)));
-        g.VertexAttribPointer(3, 3, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, s)));
-        g.VertexAttribPointer(4, 2, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, u)));
-        g.VertexAttribPointer(5, 4, kFloat, kFalse, stride, reinterpret_cast<const void *>(offsetof(HwVertex, cu0)));
-        for (GLuint i = 0; i < 6; ++i)
-            g.EnableVertexAttribArray(i);
+        drawAttribs();
+        makeRing(drawStream, vao, vbo, drawAttribs);
         buildTables();
         {
             const GLuint sv = compile(GSGL::kVertexShader, kShuffleVs), sfs = compile(GSGL::kFragmentShader, kShuffleFs);
@@ -1385,10 +1477,8 @@ void main()
                 g.BindVertexArray(shuffleVao);
                 g.GenBuffers(1, &shuffleVbo);
                 g.BindBuffer(kArrayBuffer, shuffleVbo);
-                g.VertexAttribPointer(0, 2, kFloat, kFalse, sizeof(ShuffleVertex), reinterpret_cast<const void *>(offsetof(ShuffleVertex, x)));
-                g.VertexAttribPointer(1, 2, kFloat, kFalse, sizeof(ShuffleVertex), reinterpret_cast<const void *>(offsetof(ShuffleVertex, ox)));
-                g.EnableVertexAttribArray(0);
-                g.EnableVertexAttribArray(1);
+                shuffleAttribs();
+                makeRing(shuffleStream, shuffleVao, shuffleVbo, shuffleAttribs);
                 g.BindVertexArray(vao);
                 g.BindBuffer(kArrayBuffer, vbo);
             }
@@ -3353,8 +3443,9 @@ void main()
             char detail[320];
             // the draw's phases (cpuMark: before the target bind, fixed state, texture setup, upload + draw calls)
             const auto ms = [&](int part) { return (cpuTiming.parts[part] - partsBefore[part]) * 1e-6; };
-            std::snprintf(detail, sizeof(detail), "draw %.0f ms, %zu verts [setup %.0f state %.0f tex %.0f calls %.0f]%s%s%s%s",
-                          spent * 1e-6, pending.size(), ms(0), ms(1), ms(2), ms(3),
+            const double upload = spent * 1e-6 - ms(0) - ms(1) - ms(2) - ms(3); // (stream_ms: vertex upload)
+            std::snprintf(detail, sizeof(detail), "draw %.0f ms, %zu verts [setup %.0f state %.0f tex %.0f upload %.0f calls %.0f]%s%s%s%s",
+                          spent * 1e-6, pending.size(), ms(0), ms(1), ms(2), upload, ms(3),
                           drawFirstProgram ? ", first use of a shader" : "", drawFirstPipeline ? ", new pipeline" : "",
                           decodes > decodesBefore ? ", texture decode" : "", stats.selfCopies > selfCopiesBefore ? ", target copy" : "");
             const auto tx = [&](int part) { return (texParts[part] - texBefore[part]) * 1e-6; };
@@ -3677,6 +3768,8 @@ void main()
         const std::vector<HwVertex> zero(3);
         g.BufferData(kArrayBuffer, static_cast<GLsizeiptr>(sizeof(HwVertex) * zero.size()), zero.data(), kStreamDraw);
         drawStream.size = drawStream.used = 0; // the next upload re-specifies the stream buffer
+        if (!drawStream.slots.empty())
+            drawStream.slots[drawStream.current].size = 0;
         g.Disable(kScissorTest);
         g.Disable(kDepthTest);
         g.Viewport(0, 0, kSize, kSize);
@@ -3738,6 +3831,8 @@ void main()
             const std::vector<ShuffleVertex> zeroShuffle(3);
             g.BufferData(kArrayBuffer, static_cast<GLsizeiptr>(sizeof(ShuffleVertex) * zeroShuffle.size()), zeroShuffle.data(), kStreamDraw);
             shuffleStream.size = shuffleStream.used = 0;
+            if (!shuffleStream.slots.empty())
+                shuffleStream.slots[shuffleStream.current].size = 0;
             for (const GLuint program : {shuffleProgram, shuffleFetchProgram})
             {
                 if (!program)
