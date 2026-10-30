@@ -132,6 +132,10 @@ fs::path ps2xIosPrepare()
 
     setenv("PS2X_GS_WORKER", "1", 0);
     setenv("GOW_GS_FINISH_ASINCRONO", "1", 0);
+    // GS GL-thread queue: 32 chunks of 64 KB (default 8). The ship fight sends ~150 chunks a frame, so 8 was a tenth of a
+    // frame and every GL hiccup stopped the GS stage (the readout's "wait", 19 % on build 581); on the PC with the GL
+    // thread slowed to the phone's busy share the frontend's queue wait fell from ~18 % to under 1 %
+    setenv("PS2X_GS_QUEUE_CHUNKS", "32", 0);
     setenv("GOW_AUDIO_DEVICE", "default", 0);
     setenv("GOW_HEARTBEAT", "5", 0); // EE progress in the log every 5 s (ps2_runtime.cpp)
     // performance counters in the log and on screen (ps2_perf.h, gs_host_present.cpp); 0x1837B8 = the game's frame flip

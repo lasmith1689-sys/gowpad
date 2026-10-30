@@ -1029,8 +1029,10 @@ void main()
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         ~TexSpan() { slot += nanosSince(start); }
     };
-    // texture names for the texture cache, made in batches (PS2X_GS_NAME_POOL=0: one glGenTextures per texture)
-    std::vector<GLuint> namePool;
+    // texture and framebuffer names, made in batches (PS2X_GS_NAME_POOL=0: one glGen* per object): a glGen* call on
+    // the GL thread waits for the share group, which the background shader compiler holds while it links (render
+    // targets, target copies and cached textures are made during play)
+    std::vector<GLuint> namePool, fboNamePool;
     GLuint newTextureName()
     {
         static const bool pooled = [] { const char *v = std::getenv("PS2X_GS_NAME_POOL"); return !(v && *v == '0'); }();
@@ -1047,6 +1049,24 @@ void main()
         }
         id = namePool.back();
         namePool.pop_back();
+        return id;
+    }
+    GLuint newFramebufferName()
+    {
+        static const bool pooled = [] { const char *v = std::getenv("PS2X_GS_NAME_POOL"); return !(v && *v == '0'); }();
+        GLuint id = 0;
+        if (!pooled)
+        {
+            gl().GenFramebuffers(1, &id);
+            return id;
+        }
+        if (fboNamePool.empty())
+        {
+            fboNamePool.resize(64);
+            gl().GenFramebuffers(static_cast<GLsizei>(fboNamePool.size()), fboNamePool.data());
+        }
+        id = fboNamePool.back();
+        fboNamePool.pop_back();
         return id;
     }
     uint64_t decodes = 0;
@@ -1408,16 +1428,27 @@ void main()
         t.pxH = 512u;
         t.glW = static_cast<uint32_t>(std::ceil(t.pxW * scale));
         t.glH = static_cast<uint32_t>(std::ceil(t.pxH * scale));
-        g.GenTextures(1, &t.color);
+        t.color = newTextureName();
         g.BindTexture(kTexture2D, t.color);
         g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), t.glW, t.glH, 0, kRgba, kUnsignedByte, nullptr);
         g.TexParameteri(kTexture2D, kTextureMinFilter, kLinear);
         g.TexParameteri(kTexture2D, kTextureMagFilter, kLinear);
-        g.GenFramebuffers(1, &t.fbo);
+        t.fbo = newFramebufferName();
         g.BindFramebuffer(kFramebuffer, t.fbo);
         g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, t.color, 0);
+        // the whole target, every channel (a clear follows the scissor and the colour mask; a partial one is a draw
+        // with a pipeline of its own on Apple's GL)
+        g.Disable(kScissorTest);
+        g.ColorMask(kTrue, kTrue, kTrue, kTrue);
         g.ClearColor(0.f, 0.f, 0.f, 0.f);
         g.Clear(kColorBufferBit);
+        // ES: the copy a draw or shuffle that samples its own target reads (selfCopy) is made with the target, not at
+        // the first such draw in the middle of play
+        if (g.es)
+        {
+            selfCopyFor(t);
+            g.BindFramebuffer(kFramebuffer, t.fbo);
+        }
         std::fprintf(stderr, "[gs-hw] render target fbp=%u fbw=%u -> %ux%u\n", fbp, t.fbw, t.glW, t.glH);
     }
 
@@ -1426,13 +1457,15 @@ void main()
         const Api &g = gl();
         if (!t.depth)
         {
-            g.GenTextures(1, &t.depth);
+            t.depth = newTextureName();
             g.BindTexture(kTexture2D, t.depth);
             g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kDepthComponent32F), t.glW, t.glH, 0, kDepthComponent, kFloat, nullptr);
             g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
             g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
             g.BindFramebuffer(kFramebuffer, t.fbo);
             g.FramebufferTexture2D(kFramebuffer, kDepthAttachment, kTexture2D, t.depth, 0);
+            g.Disable(kScissorTest);
+            g.DepthMask(kTrue);
             if (g.ClearDepth)
                 g.ClearDepth(0.0);
             else
@@ -1451,10 +1484,32 @@ void main()
         GLuint texture = 0, fbo = 0;
     };
     std::unordered_map<uint64_t, SelfCopy> selfCopies;
+    // the scratch copy for targets of t's size, made on first request (leaves the copy's framebuffer bound when it does)
+    const SelfCopy &selfCopyFor(const RenderTarget &t)
+    {
+        SelfCopy &copy = selfCopies[(static_cast<uint64_t>(t.glW) << 32) | t.glH];
+        if (!copy.texture)
+        {
+            const Api &g = gl();
+            copy.texture = newTextureName();
+            g.BindTexture(kTexture2D, copy.texture);
+            g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), t.glW, t.glH, 0, kRgba, kUnsignedByte, nullptr);
+            g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+            g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
+            copy.fbo = newFramebufferName();
+            g.BindFramebuffer(kFramebuffer, copy.fbo);
+            g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, copy.texture, 0);
+        }
+        return copy;
+    }
     // without framebuffer fetch: destination reads sample a fresh copy of the target instead of the target itself after a
     // texture barrier. Always on ES without fetch (no barrier there, e.g. the iOS simulator's software renderer); on
     // desktop GL with PS2X_GS_DEST_COPY=1 (testing). Set by ensure().
     bool destCopyMode = false;
+    // GOW-Port: PS2X_GS_PROFILE_FETCH=1 (desktop profiling only, the picture is not exact): destination reads without the
+    // barriers and the barrier-separated triangle runs, so the GL thread issues the draws the framebuffer-fetch path
+    // (iOS) issues and its queue timing can be studied on a PC
+    const bool profileFetch = [] { const char *v = std::getenv("PS2X_GS_PROFILE_FETCH"); return v && *v == '1'; }();
     // makes the next draw's destination reads see everything drawn so far (the colour mask is left all-on in copy mode)
     void refreshDest(RenderTarget &rt)
     {
@@ -1473,18 +1528,7 @@ void main()
     {
         constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9;
         const Api &g = gl();
-        SelfCopy &copy = selfCopies[(static_cast<uint64_t>(t.glW) << 32) | t.glH];
-        if (!copy.texture)
-        {
-            g.GenTextures(1, &copy.texture);
-            g.BindTexture(kTexture2D, copy.texture);
-            g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), t.glW, t.glH, 0, kRgba, kUnsignedByte, nullptr);
-            g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
-            g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
-            g.GenFramebuffers(1, &copy.fbo);
-            g.BindFramebuffer(kFramebuffer, copy.fbo);
-            g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, copy.texture, 0);
-        }
+        const SelfCopy &copy = selfCopyFor(t);
         if (scissor)
             g.Disable(kScissorTest);
         g.ColorMask(kTrue, kTrue, kTrue, kTrue);
@@ -3033,10 +3077,14 @@ void main()
         if (g.BlitFramebuffer)
         {
             constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9;
-            g.BindFramebuffer(kReadFramebuffer, fbo[0]);
-            g.BindFramebuffer(kDrawFramebuffer, fbo[1]);
-            g.BlitFramebuffer(0, 0, kSize, kSize, 0, 0, kSize, kSize, kColorBufferBit, kNearest);
-            ++extra;
+            // both ways: a target with depth into a colour-only copy (selfCopy) and the reverse
+            for (int from = 0; from < 2; ++from)
+            {
+                g.BindFramebuffer(kReadFramebuffer, fbo[from]);
+                g.BindFramebuffer(kDrawFramebuffer, fbo[1 - from]);
+                g.BlitFramebuffer(0, 0, kSize, kSize, 0, 0, kSize, kSize, kColorBufferBit, kNearest);
+                ++extra;
+            }
         }
         g.Finish(); // every pipeline built before the game draws
         std::fprintf(stderr, "[gs-hw] pre-warmed %d other passes (shuffle, CLUT, blit)\n", extra);
@@ -3523,7 +3571,7 @@ void main()
                 g.BindTexture(kTexture2D, destCopyMode ? selfCopy(rt, true) : rt.color);
                 u1i(locDest, 4);
                 g.ActiveTexture(kTexture0);
-                if (!destCopyMode)
+                if (!destCopyMode && !profileFetch)
                     g.TextureBarrier(), ++stats.barriers;
             }
         }
@@ -3694,7 +3742,7 @@ void main()
         // (coherent framebuffer fetch already orders overlapping triangles of one draw: no runs needed. Without it, the ES
         // path's shader blend also stands in for the dual-source blends, whose overlapping sprites must see each other:
         // runs for every shader blend there.)
-        if (softBlend && !zAliasWrite && ((s.colclamp & 1u) == 0u || dualInShader) && !g.fbFetch)
+        if (softBlend && !zAliasWrite && ((s.colclamp & 1u) == 0u || dualInShader) && !g.fbFetch && !profileFetch)
         {
             gpuTag(GpuBarrierRun);
             // wrapping blend (COLCLAMP=0, only the shadow-volume passes): the shader reads the destination, so a triangle
@@ -3764,7 +3812,7 @@ void main()
             else { g.DepthMask(kFalse); g.ColorMask(mr, mg, mb, kFalse); }
             // a shader that reads the destination must see the passing pass's writes (framebuffer fetch always does)
             const bool readsDest = softBlend || zAlias || (((c.test >> 14) & 1u) != 0u && c.frame.psm != GS_PSM_CT24);
-            if (readsDest && !g.fbFetch && afail != 2u)
+            if (readsDest && !g.fbFetch && !profileFetch && afail != 2u)
             {
                 refreshDest(rt);
                 if (afail == 1u) g.ColorMask(mr, mg, mb, ma);

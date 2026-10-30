@@ -323,6 +323,16 @@ void GSThreadedBackend::WorkerLoop()
 #endif
             const auto t1 = timed ? std::chrono::steady_clock::now() : t0;
             Execute(chunk, draw);
+            // GOW-Port: PS2X_GS_PROFILE_SLOW=<factor> (desktop profiling only): each chunk takes <factor> times as long,
+            // to study the queue against a slower GL driver (iOS) on a PC
+            static const double slowFactor = [] { const char *v = std::getenv("PS2X_GS_PROFILE_SLOW"); return v ? std::atof(v) : 1.0; }();
+            if (slowFactor > 1.0)
+            {
+                const auto spent = std::chrono::steady_clock::now() - t1;
+                const auto until = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(spent * (slowFactor - 1.0));
+                while (std::chrono::steady_clock::now() < until)
+                    std::this_thread::yield();
+            }
             if (timed)
             {
                 s_glTiming.lockWait += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
