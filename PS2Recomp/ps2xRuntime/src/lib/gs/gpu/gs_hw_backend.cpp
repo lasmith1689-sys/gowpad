@@ -423,6 +423,11 @@ void main()
     }
     else
         c = texelFetch(uSrc, p, 0);
+    if (uHd == 2) // the two halves exchanged (strip swap chains: see holdStripStep; TEXA passes them unchanged there)
+    {
+        oColor = vec4(c.ba, c.rg);
+        return;
+    }
     vec2 h = (uHs == 0) ? c.rg : c.ba;
     uint v = uint(h.x * 255.0 + 0.5) | (uint(h.y * 255.0 + 0.5) << 8);
     uint rgb = v & 0x7FFFu;
@@ -509,7 +514,8 @@ void main()
     struct RenderTarget
     {
         GLuint color = 0, depth = 0, fbo = 0;
-        GLuint colorFbo = 0; // the colour alone (shuffles on ES: see shuffleFramebuffer)
+        GLuint colorFbo = 0; // the colour alone (ES: see colourOnlyFramebuffer)
+        uint64_t depthDrawPresent = 0; // presentCount + 1 at its last draw that tested or wrote depth (0: none yet)
         uint32_t fbp = 0, fbw = 1; // PS2 page base and width in 64 px units
         uint8_t psm = 0;
         uint32_t zbp = ~0u;
@@ -721,6 +727,44 @@ void main()
     int shuffleWhy = 0; // debug: which tryShuffle check rejected the last sprite
     RenderTarget *shuffleDst = nullptr, *shuffleSrc = nullptr;
     bool shuffleSrcZ = false;
+    // GOW-Port: strip swap chains (the ship fights, ES: 16 switches a frame between the 1536x1536 main target and a 64 px
+    // scratch target). The game exchanges the two halves of the main target's pixels strip by strip through the scratch
+    // target: per strip X (scratch.b <- main.a), Y (main.a <- main.(1-a), in place), Z (main.(1-a) <- scratch.b), all with
+    // the same byte mask. Completed triples are held and drawn as one in-place exchange pass over the main target plus
+    // the scratch writes (from the exchanged pixels: the same bytes), so the main target's pass is left once, not per
+    // strip. Exact when TEXA passes the halfword unchanged and the strips do not overlap (checked; anything else draws the
+    // held batches as they came). Anything other than the next shuffle draws them first (flushShuffle).
+    // PS2X_GS_STRIP_FUSE=0 disables; PS2X_GS_STRIP_VERIFY=1 (desktop test) also draws every chain the original way from
+    // the same input and compares both targets pixel by pixel ([gs-hw-verify] strips ...).
+    struct HeldShuffle
+    {
+        GSDrawState state{};
+        RenderTarget *src = nullptr, *dst = nullptr;
+        bool srcZ = false, conflict = false;
+        std::vector<ShuffleVertex> quads[4];
+        uint32_t srcFbp = 0, srcFbw = 0, dstFbp = 0, dstFbw = 0; // (held writes: the targets are found again when drawn)
+    };
+    std::vector<HeldShuffle> stripHeld; // the chain's batches in order: stripFused complete triples, then 0-2 steps of the next
+    size_t stripFused = 0;
+    std::vector<uint32_t> stripBlockGen; // per 8x8 block of the main target: stripGen when an earlier strip of the chain used it
+    uint32_t stripGen = 1;
+    bool stripFuse = true, stripVerify = false;
+    bool shuffleSwapHalves = false; // the queued batch is a strip chain's exchange pass (one group, uHd 2)
+    // GOW-Port: held writes into a large target (the ship fights, ES: per strip the game draws into the 64 px scratch
+    // target, then shuffles it into the main target: 16 switches a frame). A complete shuffle batch from a small target S
+    // into a target T at least 4x its size is held, with S's colour copied to a stash texture (small) as the batch's
+    // source; draws into S that cannot read what the held batches write in T (texture and Z memory outside the rows of T
+    // they write) keep them held, as do TEXFLUSH, CLUT loads not read from a render target and the next such batch.
+    // Anything else draws them first, in order, in one pass of T. The batches are drawn as they came (the same quads and
+    // program, from what S held at the time), so the result is the same. PS2X_GS_HOLD_WRITES=0 disables.
+    std::vector<HeldShuffle> heldWrites;
+    std::vector<VerifyTarget> stashes; // heldWrites[i] reads stashes[i]
+    uint32_t stashW = 0, stashH = 0;
+    bool holdWrites = true;
+    GLuint shuffleSrcTexture = 0; // the queued batch reads this texture (a stash) instead of its source target
+    RenderTarget stashOwner; // (the source of a held batch whose target is gone: only its fbp is used)
+    uint32_t heldRowsEnd = 0; // T's memory written by the held batches ends at this block
+    uint64_t stripVerifyChains = 0, stripVerifyBad = 0, stripVerifyBadPixels = 0;
     std::array<std::vector<uint16_t>, 64> ownerInverse; // psm (6 bits) -> in-page word index -> y * 64 + x
     // GOW-Port: tryShuffle's 8x8 unit mapping is a pure function of the view/owner layouts and the sprite rectangle, and
     // the game draws the same shuffle sprites every frame: the result (owner quads, or the check that rejected the
@@ -820,6 +864,8 @@ void main()
         uint64_t glDraws = 0, barriers = 0, uploadBytes = 0, orphans = 0, clutReadbacks = 0, paletteUploads = 0; // GL calls the driver sees (GOW_GS_HW_STATS)
         uint64_t selfCopies = 0; // ES: render targets copied because a draw samples the target it draws into
         uint64_t shuffleSelfCopies = 0, shuffleFetches = 0; // ES: self-sourced shuffle batches through a copy / through fetch
+        uint64_t stripsFused = 0; // strip swap triples drawn as part of an exchange pass (holdStripStep)
+        uint64_t writesHeld = 0; // shuffle batches drawn later from a stash (holdWrite)
         uint64_t fbChangesAtLast = 0;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     } stats;
@@ -1346,6 +1392,11 @@ void main()
                 g.BindVertexArray(vao);
                 g.BindBuffer(kArrayBuffer, vbo);
             }
+            const char *fuseEnv = std::getenv("PS2X_GS_STRIP_FUSE"), *stripVerifyEnv = std::getenv("PS2X_GS_STRIP_VERIFY");
+            stripFuse = !(fuseEnv && *fuseEnv == '0');
+            const char *holdEnv = std::getenv("PS2X_GS_HOLD_WRITES");
+            holdWrites = !(holdEnv && *holdEnv == '0');
+            stripVerify = stripFuse && stripVerifyEnv && *stripVerifyEnv == '1';
             const char *fetchEnv = std::getenv("PS2X_GS_SHUFFLE_FETCH");
             const char *verifyEnv = std::getenv("PS2X_GS_SHUFFLE_VERIFY");
             shuffleVerify = verifyEnv && *verifyEnv == '1' && !g.fbFetch;
@@ -1588,6 +1639,9 @@ void main()
     {
         constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9;
         const Api &g = gl();
+        GLuint previous = 0; // (the draw's framebuffer: the target's own or its colour-only one)
+        if (!GSGL::CurrentDrawFramebuffer(previous) || (previous != t.fbo && previous != t.colorFbo))
+            previous = t.fbo;
         const SelfCopy &copy = selfCopyFor(t);
         if (scissor)
             g.Disable(kScissorTest);
@@ -1596,7 +1650,7 @@ void main()
         g.BindFramebuffer(kDrawFramebuffer, copy.fbo);
         g.BlitFramebuffer(0, 0, static_cast<GLint>(t.glW), static_cast<GLint>(t.glH), 0, 0, static_cast<GLint>(t.glW),
                           static_cast<GLint>(t.glH), kColorBufferBit, kNearest);
-        g.BindFramebuffer(kFramebuffer, t.fbo);
+        g.BindFramebuffer(kFramebuffer, previous);
         if (scissor)
             g.Enable(kScissorTest);
         ++stats.selfCopies;
@@ -2381,9 +2435,12 @@ void main()
         const uint32_t maxX = map.maxX, maxY = map.maxY;
         // queue: one GL pass per state run
         if (havePending)
-            flushPending();
+            flushPending(true); // (a held chain or held writes stay: the pending draws do not read them)
         if (haveShuffle && (!sameState(shuffleState, s) || shuffleDst != dst || shuffleSrc != src || shuffleSrcZ != srcDepth))
-            flushShuffle();
+        {
+            if (!holdStripStep() && !holdWrite())
+                flushShuffle();
+        }
         if (!haveShuffle)
         {
             haveShuffle = true;
@@ -2433,21 +2490,403 @@ void main()
     }
 
     // GOW-Port: ES (Apple's tile-based GPUs): every switch between framebuffers stores the attachments of the one left
-    // and reloads those of the next, and a shuffle uses no depth. When a shuffle needs a switch anyway it goes to the
-    // target's colour-only framebuffer, so the game's strip-by-strip shuffle chains (the ship fights: the 1536x1536 main
-    // target <-> a 64 px scratch target 16 times a frame) move the colour alone, not the depth buffer as well. In the
-    // target's pass already (either framebuffer), it stays there. PS2X_GS_COLOR_FBO=0 disables.
-    GLuint shuffleFramebuffer(const RenderTarget &t)
+    // and reloads those of the next. Work that uses no depth (shuffles; draws that neither test nor write it) goes to
+    // the target's colour-only framebuffer when it switches framebuffer anyway, so the game's strip-by-strip effect chains
+    // (the ship fights: the 1536x1536 main target <-> a 64 px scratch target 16 times a frame) and its 2D passes into
+    // other targets move the colour alone, not the depth buffer as well. In the target's pass already (either
+    // framebuffer), it stays there; a draw goes to the depth framebuffer of a target that drew with depth in the last
+    // two frames (it would likely switch back for the next depth draw). PS2X_GS_COLOR_FBO=0 disables.
+    GLuint colourOnlyFramebuffer(RenderTarget &t, bool draw)
     {
         static const bool on = [] { const char *v = std::getenv("PS2X_GS_COLOR_FBO"); return !(v && *v == '0'); }();
         GLuint current = 0;
-        if (!on || !t.colorFbo || !GSGL::CurrentDrawFramebuffer(current) || current == t.fbo)
+        if (!on || !t.colorFbo || !t.depth || !GSGL::CurrentDrawFramebuffer(current) || current == t.fbo)
             return t.fbo;
-        return t.colorFbo;
+        if (current == t.colorFbo || !draw)
+            return t.colorFbo;
+        return (t.depthDrawPresent != 0u && presentCount + 1u - t.depthDrawPresent <= 2u) ? t.fbo : t.colorFbo;
+    }
+
+    void swapQueued(HeldShuffle &h)
+    {
+        std::swap(shuffleState, h.state);
+        std::swap(shuffleSrc, h.src);
+        std::swap(shuffleDst, h.dst);
+        std::swap(shuffleSrcZ, h.srcZ);
+        std::swap(shuffleConflict, h.conflict);
+        for (int i = 0; i < 4; ++i)
+            std::swap(shuffleQuads[i], h.quads[i]);
+    }
+
+    static int singleGroup(const std::vector<ShuffleVertex> (&q)[4])
+    {
+        int g = -1;
+        for (int i = 0; i < 4; ++i)
+            if (!q[i].empty())
+            {
+                if (g >= 0)
+                    return -1;
+                g = i;
+            }
+        return g;
+    }
+
+    // a batch's quads as (main target block, scratch block) pairs, sorted: per quad its position plus (mainAt: 0 the
+    // position is in the main target, the source offset leads to the scratch target; 1 the reverse)
+    static std::vector<std::array<int, 4>> stripPairs(const std::vector<ShuffleVertex> &q, int mainAt)
+    {
+        std::vector<std::array<int, 4>> out;
+        out.reserve(q.size() / 6u);
+        for (size_t v = 0; v < q.size(); v += 6)
+        {
+            const int x = static_cast<int>(q[v].x), y = static_cast<int>(q[v].y);
+            const int ox = static_cast<int>(q[v].ox), oy = static_cast<int>(q[v].oy);
+            out.push_back(mainAt == 0 ? std::array<int, 4>{x, y, x + ox, y + oy} : std::array<int, 4>{x + ox, y + oy, x, y});
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    // the queued batch is complete (the next sprite has another state): holds it when it is the next step of a strip
+    // swap chain (see stripHeld); false = not that, the caller draws it (and the chain)
+    bool stripReject(int why)
+    {
+        if (opTrace)
+            *opTrace += " !h" + std::to_string(why);
+        return false;
+    }
+
+    bool holdStripStep()
+    {
+        if (!stripFuse || !haveShuffle || shuffleSrcZ || !heldWrites.empty())
+            return stripReject(1);
+        const int g = singleGroup(shuffleQuads);
+        const GSTexaReg &t = shuffleState.texa;
+        if (g < 0 || (t.ta0 >> 7) != 0u || (t.ta1 >> 7) != 1u || t.aem)
+            return stripReject(2);
+        const size_t stage = stripHeld.size() - stripFused * 3u;
+        const HeldShuffle *x = stage == 0u ? (stripFused ? &stripHeld[0] : nullptr) : &stripHeld[stripFused * 3u];
+        const int a = x ? singleGroup(x->quads) >> 1 : g >> 1, b = x ? singleGroup(x->quads) & 1 : g & 1;
+        if (x && shuffleState.context.frame.fbmsk != x->state.context.frame.fbmsk)
+            return stripReject(3);
+        if (stage == 0u)
+        {
+            if (shuffleSrc == shuffleDst || (x && (x->src != shuffleSrc || x->dst != shuffleDst || singleGroup(x->quads) != g)))
+                return stripReject(4);
+        }
+        else
+        {
+            const int want = stage == 1u ? ((1 - a) << 1) | a : (b << 1) | (1 - a);
+            if (g != want || shuffleQuads[g].size() != x->quads[singleGroup(x->quads)].size())
+                return stripReject(5);
+            if (stage == 1u ? (shuffleSrc != x->src || shuffleDst != x->src || shuffleConflict) : (shuffleSrc != x->dst || shuffleDst != x->src))
+                return stripReject(6);
+            const auto xs = stripPairs(x->quads[singleGroup(x->quads)], 1);
+            const auto here = stripPairs(shuffleQuads[g], 0);
+            for (size_t i = 0; i < xs.size(); ++i)
+                if (here[i][0] != xs[i][0] || here[i][1] != xs[i][1] ||
+                    (stage == 1u ? (here[i][2] != here[i][0] || here[i][3] != here[i][1]) : (here[i][2] != xs[i][2] || here[i][3] != xs[i][3])))
+                    return stripReject(7);
+            if (stage == 2u)
+            {
+                // the strip must not touch a main target block an earlier strip of the chain exchanged
+                const RenderTarget &main = *x->src;
+                const uint32_t bw = (main.pxW + 7u) / 8u, blocks = bw * ((main.pxH + 7u) / 8u);
+                if (stripBlockGen.size() < blocks)
+                    stripBlockGen.resize(blocks, 0u);
+                for (const auto &q : here)
+                    if (stripBlockGen[static_cast<uint32_t>(q[1]) / 8u * bw + static_cast<uint32_t>(q[0]) / 8u] == stripGen)
+                        return stripReject(8);
+                for (const auto &q : here)
+                    stripBlockGen[static_cast<uint32_t>(q[1]) / 8u * bw + static_cast<uint32_t>(q[0]) / 8u] = stripGen;
+            }
+        }
+        stripHeld.emplace_back();
+        swapQueued(stripHeld.back());
+        haveShuffle = false;
+        if (stage == 2u)
+            ++stripFused;
+        return true;
+    }
+
+    // draws the held chain: the complete triples as one exchange pass on the main target and one batch of scratch writes,
+    // then the steps of an incomplete one as they came; the queued batch (if any) stays queued
+    void drawStrips()
+    {
+        if (stripHeld.empty())
+            return;
+        std::vector<HeldShuffle> held;
+        held.swap(stripHeld);
+        const size_t fused = stripFused;
+        stripFused = 0;
+        ++stripGen;
+        HeldShuffle queued;
+        const bool hadQueued = haveShuffle;
+        if (hadQueued)
+            swapQueued(queued);
+        haveShuffle = false;
+        const auto drawHeld = [this](HeldShuffle &h) {
+            swapQueued(h);
+            haveShuffle = true;
+            flushShuffle();
+        };
+        if (fused)
+        {
+            RenderTarget &main = *held[0].src, &scratch = *held[0].dst;
+            const int gx = singleGroup(held[0].quads), a = gx >> 1, b = gx & 1;
+            if (stripVerify)
+                stripSnapshot(main, scratch, 0);
+            HeldShuffle swap, writes;
+            swap.state = held[1].state;
+            swap.src = swap.dst = &main;
+            writes.state = held[0].state;
+            writes.src = &main;
+            writes.dst = &scratch;
+            std::vector<ShuffleVertex> &wq = writes.quads[((1 - a) << 1) | b];
+            for (size_t k = 0; k < fused; ++k)
+            {
+                const std::vector<ShuffleVertex> &xq = held[k * 3u].quads[gx], &yq = held[k * 3u + 1u].quads[((1 - a) << 1) | a];
+                swap.quads[0].insert(swap.quads[0].end(), yq.begin(), yq.end());
+                wq.insert(wq.end(), xq.begin(), xq.end()); // (the main target's half 1-a now holds the bytes half a held)
+            }
+            stats.stripsFused += fused;
+            shuffleSwapHalves = true;
+            drawHeld(swap);
+            shuffleSwapHalves = false;
+            drawHeld(writes);
+            if (stripVerify)
+            {
+                stripSnapshot(main, scratch, 1); // the fused result, then the input back
+                for (size_t i = 0; i < fused * 3u; ++i)
+                {
+                    HeldShuffle copy = held[i];
+                    drawHeld(copy);
+                }
+                stripCompare(main, scratch);
+            }
+        }
+        for (size_t i = fused * 3u; i < held.size(); ++i)
+            drawHeld(held[i]);
+        if (hadQueued)
+        {
+            swapQueued(queued);
+            haveShuffle = true;
+        }
+    }
+
+    // strip verify: phase 0 saves both targets (the chain's input); phase 1 saves the fused result and puts the input back
+    std::vector<uint8_t> stripResult[2];
+    VerifyTarget stripInput[2];
+    void stripSnapshot(RenderTarget &main, RenderTarget &scratch, int phase)
+    {
+        constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9;
+        const Api &g = gl();
+        GLuint previous = 0;
+        GSGL::CurrentDrawFramebuffer(previous);
+        RenderTarget *both[2] = {&main, &scratch};
+        for (int i = 0; i < 2; ++i)
+        {
+            RenderTarget &t = *both[i];
+            const GLint w = static_cast<GLint>(t.glW), h = static_cast<GLint>(t.glH);
+            VerifyTarget &in = stripInput[i];
+            g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+            if (phase == 0)
+            {
+                if (in.texture)
+                    g.DeleteTextures(1, &in.texture), g.DeleteFramebuffers(1, &in.fbo);
+                g.GenTextures(1, &in.texture);
+                g.BindTexture(kTexture2D, in.texture);
+                g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), w, h, 0, kRgba, kUnsignedByte, nullptr);
+                g.GenFramebuffers(1, &in.fbo);
+                g.BindFramebuffer(kFramebuffer, in.fbo);
+                g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, in.texture, 0);
+                g.BindFramebuffer(kReadFramebuffer, t.fbo);
+                g.BindFramebuffer(kDrawFramebuffer, in.fbo);
+                g.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, kColorBufferBit, kNearest);
+            }
+            else
+            {
+                stripResult[i].assign(static_cast<size_t>(w) * h * 4u, 0);
+                g.BindFramebuffer(kFramebuffer, t.fbo);
+                g.PixelStorei(kPackAlignment, 1);
+                g.ReadPixels(0, 0, w, h, kRgba, kUnsignedByte, stripResult[i].data());
+                g.BindFramebuffer(kReadFramebuffer, in.fbo);
+                g.BindFramebuffer(kDrawFramebuffer, t.fbo);
+                g.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, kColorBufferBit, kNearest);
+            }
+        }
+        g.BindFramebuffer(kFramebuffer, previous);
+    }
+
+    void stripCompare(RenderTarget &main, RenderTarget &scratch)
+    {
+        const Api &g = gl();
+        GLuint previous = 0;
+        GSGL::CurrentDrawFramebuffer(previous);
+        RenderTarget *both[2] = {&main, &scratch};
+        uint64_t bad = 0;
+        for (int i = 0; i < 2; ++i)
+        {
+            RenderTarget &t = *both[i];
+            std::vector<uint8_t> ref(stripResult[i].size());
+            g.BindFramebuffer(kFramebuffer, t.fbo);
+            g.PixelStorei(kPackAlignment, 1);
+            g.ReadPixels(0, 0, static_cast<GLint>(t.glW), static_cast<GLint>(t.glH), kRgba, kUnsignedByte, ref.data());
+            for (size_t p = 0; p < ref.size(); p += 4)
+                bad += std::memcmp(&ref[p], &stripResult[i][p], 4) != 0 ? 1u : 0u;
+        }
+        g.BindFramebuffer(kFramebuffer, previous);
+        ++stripVerifyChains;
+        if (bad)
+            ++stripVerifyBad, stripVerifyBadPixels += bad;
+        static auto last = std::chrono::steady_clock::now();
+        if (bad || std::chrono::steady_clock::now() - last >= std::chrono::seconds(5))
+        {
+            last = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[gs-hw-verify] strips chains=%llu differing=%llu differing_px=%llu\n",
+                         (unsigned long long)stripVerifyChains, (unsigned long long)stripVerifyBad, (unsigned long long)stripVerifyBadPixels);
+        }
+    }
+
+    // block range [first, end) of a target's memory down to row rows (PS2 px, 32 bit: 64x32 px pages of 32 blocks)
+    static void targetBlocks(const RenderTarget &t, uint32_t rows, uint32_t &first, uint32_t &end)
+    {
+        first = t.fbp * 32u;
+        end = (t.fbp + t.fbw * ((rows + 31u) / 32u)) * 32u;
+    }
+
+    // the queued batch is complete: held (see heldWrites) when it writes a large target from a small one; false = not
+    bool holdWrite()
+    {
+        if (!holdWrites || !haveShuffle || shuffleSrcZ || shuffleSrc == shuffleDst || !stripHeld.empty() || heldWrites.size() >= 16u)
+            return false;
+        const RenderTarget &src = *shuffleSrc, &dst = *shuffleDst;
+        if (static_cast<uint64_t>(src.pxW) * src.pxH * 4u > static_cast<uint64_t>(dst.pxW) * dst.pxH)
+            return false;
+        if (!heldWrites.empty())
+        {
+            const HeldShuffle &h = heldWrites.front();
+            if (h.srcFbp != src.fbp || h.srcFbw != src.fbw || h.dstFbp != dst.fbp || h.dstFbw != dst.fbw || src.glW != stashW || src.glH != stashH)
+                return false;
+        }
+        uint32_t maxY = 0;
+        for (const auto &q : shuffleQuads)
+            for (size_t v = 0; v < q.size(); ++v)
+                maxY = std::max(maxY, static_cast<uint32_t>(std::max(q[v].y, 0.0f)));
+        // the source as it is now
+        constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9;
+        const Api &g = gl();
+        if (stashW != src.glW || stashH != src.glH)
+        {
+            for (VerifyTarget &t : stashes)
+                if (t.texture)
+                    g.DeleteTextures(1, &t.texture), g.DeleteFramebuffers(1, &t.fbo);
+            stashes.clear();
+            stashW = src.glW;
+            stashH = src.glH;
+        }
+        if (stashes.size() <= heldWrites.size())
+        {
+            VerifyTarget t;
+            g.GenTextures(1, &t.texture);
+            g.BindTexture(kTexture2D, t.texture);
+            g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), static_cast<GLsizei>(stashW), static_cast<GLsizei>(stashH), 0, kRgba, kUnsignedByte, nullptr);
+            g.GenFramebuffers(1, &t.fbo);
+            g.BindFramebuffer(kFramebuffer, t.fbo);
+            g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, t.texture, 0);
+            stashes.push_back(t);
+        }
+        const VerifyTarget &stash = stashes[heldWrites.size()];
+        const GLint w = static_cast<GLint>(stashW), h = static_cast<GLint>(stashH);
+        GLuint previous = 0;
+        if (!GSGL::CurrentDrawFramebuffer(previous))
+            previous = src.colorFbo ? src.colorFbo : src.fbo;
+        g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+        g.Disable(kScissorTest);
+        g.BindFramebuffer(kReadFramebuffer, src.colorFbo ? src.colorFbo : src.fbo);
+        g.BindFramebuffer(kDrawFramebuffer, stash.fbo);
+        g.BlitFramebuffer(0, 0, w, h, 0, 0, w, h, kColorBufferBit, kNearest);
+        g.BindFramebuffer(kFramebuffer, previous);
+        heldWrites.emplace_back();
+        HeldShuffle &held = heldWrites.back();
+        held.srcFbp = src.fbp;
+        held.srcFbw = src.fbw;
+        held.dstFbp = dst.fbp;
+        held.dstFbw = dst.fbw;
+        uint32_t first = 0, end = 0;
+        targetBlocks(dst, maxY, first, end); // (maxY: the quads' far edge)
+        heldRowsEnd = std::max(heldRowsEnd, end);
+        swapQueued(held);
+        haveShuffle = false;
+        ++stats.writesHeld;
+        return true;
+    }
+
+    // a draw that leaves the held writes held: into their source target, reading no memory they write
+    bool drawKeepsWrites(const GSDrawState &s)
+    {
+        const HeldShuffle &h = heldWrites.front();
+        const GSContext &c = s.context;
+        if (c.frame.fbp != h.srcFbp || c.frame.fbw != h.srcFbw || family16(c.frame.psm))
+            return false;
+        const RenderTarget *t = findTarget(h.dstFbp);
+        if (!t)
+            return false;
+        const uint32_t first = t->fbp * 32u, end = heldRowsEnd;
+        const auto outside = [&](uint32_t b0, uint32_t b1) { return b1 <= first || b0 >= end; };
+        if (s.prim.tme && !outside(c.tex0.tbp0, c.tex0.tbp0 + std::max<uint32_t>(c.tex0.tbw, 1u) * (1u << std::min<uint32_t>(c.tex0.th, 11u))))
+            return false; // (bound: 4 bytes a texel, the buffer width times the height)
+        const bool zte = ((c.test >> 16) & 1u) != 0u;
+        const bool depthUsed = (zte && ((c.test >> 17) & 3u) != 1u) || !c.zbuf.zmask;
+        if (depthUsed && !outside(c.zbuf.zbp * 32u, c.zbuf.zbp * 32u + std::max<uint32_t>(c.frame.fbw, 1u) * 512u))
+            return false; // (bound: 512 rows of the frame's width, 32 bit)
+        return true;
+    }
+
+    void drawWrites()
+    {
+        if (heldWrites.empty())
+            return;
+        std::vector<HeldShuffle> held;
+        held.swap(heldWrites);
+        heldRowsEnd = 0;
+        HeldShuffle queued;
+        const bool hadQueued = haveShuffle;
+        if (hadQueued)
+            swapQueued(queued);
+        for (size_t i = 0; i < held.size(); ++i)
+        {
+            HeldShuffle &h = held[i];
+            RenderTarget *dst = findTarget(h.dstFbp);
+            if (!dst || dst->fbw != h.dstFbw)
+                continue; // (the target is gone: so is what the batch wrote)
+            RenderTarget *src = findTarget(h.srcFbp);
+            if (!src || src == dst)
+            {
+                stashOwner.fbp = h.srcFbp;
+                src = &stashOwner;
+            }
+            h.dst = dst;
+            h.src = src;
+            swapQueued(h);
+            haveShuffle = true;
+            shuffleSrcTexture = stashes[i].texture;
+            flushShuffle();
+            shuffleSrcTexture = 0;
+        }
+        if (hadQueued)
+        {
+            swapQueued(queued);
+            haveShuffle = true;
+        }
     }
 
     void flushShuffle()
     {
+        if (haveShuffle && !stripHeld.empty())
+            holdStripStep(); // (the queued batch may complete the chain's last triple)
+        drawStrips();
+        drawWrites();
         if (!haveShuffle)
             return;
         haveShuffle = false;
@@ -2466,7 +2905,17 @@ void main()
             for (const auto &q : shuffleQuads)
                 quads += q.size() / 6u;
             char op[64];
-            std::snprintf(op, sizeof(op), " S%u%s>%u:%zu", src.fbp, shuffleSrcZ ? "z" : "", dst.fbp, quads);
+            std::snprintf(op, sizeof(op), " S%s%u%s>%u:%zu[", shuffleSwapHalves ? "x" : "", src.fbp, shuffleSrcZ ? "z" : "", dst.fbp, quads);
+            *opTrace += op;
+            for (int i = 0; i < 4; ++i)
+                if (!shuffleQuads[i].empty())
+                {
+                    const ShuffleVertex &q0 = shuffleQuads[i].front(), &q1 = shuffleQuads[i][shuffleQuads[i].size() - 6];
+                    std::snprintf(op, sizeof(op), "h%d>%d:%zu (%.0f,%.0f)off(%.0f,%.0f)..(%.0f,%.0f) ", i >> 1, i & 1, shuffleQuads[i].size() / 6u,
+                                  q0.x, q0.y, q0.ox, q0.oy, q1.x, q1.y);
+                    *opTrace += op;
+                }
+            std::snprintf(op, sizeof(op), "m%x]", c.frame.fbmsk);
             *opTrace += op;
         }
         const Api &g = gl();
@@ -2474,13 +2923,13 @@ void main()
         dst.lastDrawSeq = ++writeSeq;
         const uint32_t m16 = fbmsk16(c.frame.fbmsk);
         const GLboolean lo = (m16 & 0xFFu) == 0u ? kTrue : kFalse, hi = (m16 & 0xFF00u) == 0u ? kTrue : kFalse;
-        g.BindFramebuffer(kFramebuffer, shuffleFramebuffer(dst));
+        g.BindFramebuffer(kFramebuffer, colourOnlyFramebuffer(dst, false));
         g.Viewport(0, 0, dst.glW, dst.glH);
         g.Disable(kScissorTest);
         g.Disable(kBlend);
         g.Disable(kDepthTest);
         g.DepthMask(kFalse);
-        const bool fetch = shuffleFetchProgram && &src == &dst && !shuffleSrcZ && !shuffleConflict;
+        const bool fetch = shuffleFetchProgram && &src == &dst && !shuffleSrcZ && !shuffleConflict && !shuffleSrcTexture;
         if (fetch)
         {
             ++stats.shuffleFetches;
@@ -2502,7 +2951,7 @@ void main()
         {
             g.UseProgram(shuffleProgram);
             const bool copied = g.es && &src == &dst && !shuffleSrcZ;
-            const GLuint srcColor = copied ? selfCopy(dst, false) : src.color;
+            const GLuint srcColor = shuffleSrcTexture ? shuffleSrcTexture : copied ? selfCopy(dst, false) : src.color;
             stats.shuffleSelfCopies += (&src == &dst && !shuffleSrcZ) ? 1u : 0u; // (forced desktop test: the batches fetch would not take)
             g.ActiveTexture(kTexture0);
             g.BindTexture(kTexture2D, shuffleSrcZ ? src.depth : srcColor);
@@ -2517,7 +2966,7 @@ void main()
         }
         const GLint locHs = fetch ? locShfHs : locShHs, locHd = fetch ? locShfHd : locShHd;
         std::vector<ShuffleVertex> verifyQuads[4];
-        if (fetch && shuffleVerify)
+        if (fetch && shuffleVerify && !shuffleSwapHalves)
         {
             for (int i = 0; i < 4; ++i)
                 verifyQuads[i] = shuffleQuads[i];
@@ -2533,16 +2982,19 @@ void main()
                 continue;
             const uint32_t hs = i >> 1, hd = i & 1u;
             g.Uniform1i(locHs, static_cast<GLint>(hs));
-            g.Uniform1i(locHd, static_cast<GLint>(hd));
+            g.Uniform1i(locHd, shuffleSwapHalves ? 2 : static_cast<GLint>(hd));
             if (fetch && shuffleFetchForced && g.TextureBarrier)
                 g.TextureBarrier(), ++stats.barriers; // (desktop test: each pass sees the previous one's writes, as fetch does)
-            g.ColorMask(hd == 0u ? lo : kFalse, hd == 0u ? hi : kFalse, hd == 1u ? lo : kFalse, hd == 1u ? hi : kFalse);
+            if (shuffleSwapHalves)
+                g.ColorMask(lo, hi, lo, hi);
+            else
+                g.ColorMask(hd == 0u ? lo : kFalse, hd == 0u ? hi : kFalse, hd == 1u ? lo : kFalse, hd == 1u ? hi : kFalse);
             const GLint first = streamVertices(shuffleStream, q.data(), q.size() * sizeof(ShuffleVertex), sizeof(ShuffleVertex));
             g.DrawArrays(kTriangles, first, static_cast<GLsizei>(q.size()));
             ++stats.glDraws;
             q.clear();
         }
-        if (fetch && shuffleVerify)
+        if (fetch && shuffleVerify && !shuffleSwapHalves)
             verifyShuffle(verifyQuads, dst, lo, hi);
         g.ColorMask(kTrue, kTrue, kTrue, kTrue);
         g.BindVertexArray(vao);
@@ -2654,7 +3106,8 @@ void main()
         const uint8_t fpsm = s.context.frame.psm;
         if (family16(fpsm) && tryShuffle(s, b))
             return;
-        flushShuffle();
+        if (heldWrites.empty() || !drawKeepsWrites(s) || (haveShuffle && !holdWrite()))
+            flushShuffle();
         if (fpsm != GS_PSM_CT32 && fpsm != GS_PSM_CT24 && fpsm != GS_PSM_CT16 && fpsm != GS_PSM_CT16S)
         {
             ++stats.skippedPsm;
@@ -2671,7 +3124,7 @@ void main()
             }
         const bool sameSerial = b.stateSerial != 0u && b.stateSerial == pendingSerial;
         if (havePending && !sameSerial && !sameState(pendingState, s))
-            flushPending();
+            flushPending(true);
         if (!havePending)
         {
             pendingState = s;
@@ -2837,7 +3290,18 @@ void main()
         }
     }
 
-    void flushPending()
+    // TEXFLUSH and TEX0 writes (CLUT loads): the game's strip effects put both between every two steps. The queued batch
+    // is complete: held when it continues a strip chain or is a held write, else drawn (after what is held); what is held
+    // stays held (pending draws do not read it; other draws and everything else draw it first, a CLUT read from a render
+    // target too)
+    void flushKeepingStrips()
+    {
+        if (haveShuffle && !holdStripStep() && !holdWrite())
+            flushShuffle();
+        flushPending(true); // (pending draws never read held work: see drawKeepsWrites)
+    }
+
+    void flushPending(bool keepStrips = false)
     {
         // GL state cache (gs_gl_cache.cpp): PS2X_GS_STATE_CACHE=1, or GOW_GL_AB's setting 1 while that test runs
         {
@@ -2846,7 +3310,7 @@ void main()
             GSGL::SetStateCacheEnabled(ab >= 0 ? ab == 1 : cacheSetting);
         }
         ++batchSerial; // the next sprite starts a new batch: no seam with the previous one
-        if (haveShuffle) // (timed only when a shuffle is queued: most batches have none)
+        if (haveShuffle || (!keepStrips && (!stripHeld.empty() || !heldWrites.empty()))) // (timed only when a shuffle is queued: most batches have none)
         {
             const auto shuffleStart = std::chrono::steady_clock::now();
             flushShuffle();
@@ -3247,6 +3711,13 @@ void main()
             g.ColorMask((mask & 1u) ? kTrue : kFalse, (mask & 2u) ? kTrue : kFalse, (mask & 4u) ? kTrue : kFalse, (mask & 8u) ? kTrue : kFalse);
             g.UseProgram(prog);
             g.DrawArrays(kTriangles, 0, 3);
+            // and into a colour-only framebuffer (a draw without depth use into a target that has depth: see
+            // colourOnlyFramebuffer), another pipeline on Apple's GL
+            if (withDepth && fbo[0])
+            {
+                g.BindFramebuffer(kFramebuffer, fbo[0]);
+                g.DrawArrays(kTriangles, 0, 3);
+            }
             seenPipelines.insert(line);
             // progress on the start-up log overlay (the first launch builds every pipeline: seconds on a phone)
             if (++warmed % 25 == 0)
@@ -3644,8 +4115,19 @@ void main()
             rt.usedH = std::max<uint32_t>(rt.usedH, std::min<uint32_t>(by, rt.pxH));
         }
         cpuMark(0);
-        g.BindFramebuffer(kFramebuffer, rt.fbo);
-        drawTargetDepth = rt.depth != 0u; // (pipeline records: the attachment formats)
+        // no depth test (ZTE off or ZTST ALWAYS) and no depth write (ZMSK), or Z in the target's own colour (zAlias below):
+        // the depth attachment is not used
+        {
+            const bool zte = ((c.test >> 16) & 1u) != 0u;
+            const bool alwaysPass = !zte || ((c.test >> 17) & 3u) == 1u;
+            const bool aliased = c.zbuf.zbp == c.frame.fbp && zte && (c.frame.psm == GS_PSM_CT32 || c.frame.psm == GS_PSM_CT24);
+            const bool depthFree = aliased || (alwaysPass && c.zbuf.zmask);
+            if (!depthFree)
+                rt.depthDrawPresent = static_cast<uint64_t>(presentCount) + 1u;
+            const GLuint drawFb = depthFree ? colourOnlyFramebuffer(rt, true) : rt.fbo;
+            g.BindFramebuffer(kFramebuffer, drawFb);
+            drawTargetDepth = rt.depth != 0u && drawFb == rt.fbo; // (pipeline records: the attachment formats)
+        }
         g.Viewport(0, 0, rt.glW, rt.glH);
         g.Enable(kScissorTest);
         const int sx0 = c.scissor.x0, sy0 = c.scissor.y0;
@@ -3840,6 +4322,15 @@ void main()
                 }
                 else
                     g.TextureBarrier(), ++stats.barriers;
+                if (opTrace)
+                {
+                    char op[256];
+                    const HwVertex &a = verts.front(), &b = verts.back();
+                    std::snprintf(op, sizeof(op), " COPY<prim%u n%zu lin%d fst%d abe%d alpha%llx %.2f,%.2f uv%.3f,%.3f stq%.3f,%.3f,%.3f / %.2f,%.2f uv%.3f,%.3f>",
+                                  (unsigned)s.prim.type, verts.size(), s.linearFilter ? 1 : 0, s.prim.fst ? 1 : 0, s.prim.abe ? 1 : 0,
+                                  (unsigned long long)c.alpha, a.x, a.y, a.u, a.v, a.s, a.t, a.q, b.x, b.y, b.u, b.v);
+                    *opTrace += op;
+                }
             }
             Texture dummy;
             RenderTarget *zsrc = nullptr;
@@ -3864,6 +4355,13 @@ void main()
                     g.TextureBarrier(), ++stats.barriers;
             }
             findSpan.reset();
+            if (!heldWrites.empty() && ((src && src->fbp == heldWrites.front().dstFbp) || (rsrc && rsrc->fbp == heldWrites.front().dstFbp)))
+            {
+                // (drawKeepsWrites let through a draw that samples the target the held writes go to: they would be missed)
+                static uint64_t hazards = 0;
+                if ((++hazards & (hazards - 1u)) == 0u)
+                    std::fprintf(stderr, "[gs-hw] held writes: draw sampling their target (%llu)\n", (unsigned long long)hazards);
+            }
             const bool indexed = !(src || rsrc || zsrc) && isIndexed(c.tex0.psm) && vram != nullptr;
             Texture &tex = (src || rsrc || zsrc) ? dummy : indexed ? indexTextureFor(s) : textureFor(s);
             u1i(locIndexed, indexed ? 1 : 0);
@@ -4178,16 +4676,16 @@ void main()
         if (now - stats.last < std::chrono::seconds(5))
             return;
         stats.last = now;
-        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu shuffleSelfCopies=%llu shuffleFetches=%llu fbChanges=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
+        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu shuffleSelfCopies=%llu shuffleFetches=%llu stripsFused=%llu writesHeld=%llu fbChanges=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
                      (unsigned long long)stats.shuffles, (unsigned long long)stats.draws, (unsigned long long)stats.batches, (unsigned long long)stats.texDecodes,
                      (unsigned long long)stats.texHits, (unsigned long long)stats.skippedPsm, (unsigned long long)stats.skippedPrim,
                      (unsigned long long)stats.unsupportedBlend, textures.size(), (unsigned long long)stats.glDraws, (unsigned long long)stats.barriers,
                      (unsigned long long)stats.selfCopies, (unsigned long long)stats.shuffleSelfCopies, (unsigned long long)stats.shuffleFetches,
-                     (unsigned long long)(GSGL::DrawFramebufferChanges() - stats.fbChangesAtLast),
+                     (unsigned long long)stats.stripsFused, (unsigned long long)stats.writesHeld, (unsigned long long)(GSGL::DrawFramebufferChanges() - stats.fbChangesAtLast),
                      (unsigned long long)(stats.uploadBytes >> 10), (unsigned long long)stats.orphans,
                      (unsigned long long)stats.clutReadbacks, (unsigned long long)stats.paletteUploads);
         stats.shuffles = stats.draws = stats.batches = stats.texDecodes = stats.texHits = stats.skippedPsm = stats.skippedPrim = stats.unsupportedBlend = 0;
-        stats.shuffleSelfCopies = stats.shuffleFetches = 0;
+        stats.shuffleSelfCopies = stats.shuffleFetches = stats.stripsFused = stats.writesHeld = 0;
         stats.fbChangesAtLast = GSGL::DrawFramebufferChanges();
         stats.glDraws = stats.barriers = stats.selfCopies = stats.uploadBytes = stats.orphans = stats.clutReadbacks = stats.paletteUploads = 0;
         GSGL::ReportStateCacheVerify();
@@ -4251,13 +4749,16 @@ void GSHwBackend::SubmitRun(const GSDrawState &state, const GSPrimitiveVerts *pr
 void GSHwBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
     Impl &d = *m_impl;
-    d.flushPending();
+    d.flushKeepingStrips();
     const auto start = std::chrono::steady_clock::now();
     const uint64_t readbacksBefore = d.stats.clutReadbacks;
     const bool hadClutProgram = d.clutProgram != 0u;
     if (d.initialized)
         d.store.LoadClut(tex0, texclut, [&d](const GSTex0Reg &t, uint32_t width, const uint16_t *xy, uint32_t count, uint32_t *words)
-                         { return d.clutFromTarget(t, width, xy, count, words); });
+                         {
+                             d.flushShuffle(); // (a held strip chain: see flushKeepingStrips)
+                             return d.clutFromTarget(t, width, xy, count, words);
+                         });
     else
         d.store.LoadClut(tex0, texclut);
     d.clutHash = d.store.ClutHash();
@@ -4334,7 +4835,7 @@ void GSHwBackend::Flush()
 
 void GSHwBackend::TextureFlush()
 {
-    m_impl->flushPending(); // textures are re-read from the store when an upload overlaps them, not on TEXFLUSH
+    m_impl->flushKeepingStrips(); // textures are re-read from the store when an upload overlaps them, not on TEXFLUSH
 }
 
 void GSHwBackend::Sync(GSSyncReason)
