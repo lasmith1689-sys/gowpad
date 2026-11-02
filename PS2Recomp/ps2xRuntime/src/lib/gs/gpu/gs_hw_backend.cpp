@@ -501,12 +501,21 @@ void main()
         bool valid = false;
         uint64_t lastUse = 0;
         uint64_t contentHash = 0; // GS memory [blockLo, blockHi) when last decoded (0: none)
+        // what the decoded texels hold, for the alpha test (alphaTestBound): RGBA textures their alpha range, index
+        // textures the palette entries they use
+        struct Content
+        {
+            uint8_t alphaLo = 0, alphaHi = 255;
+            uint64_t indices[4] = {~0ull, ~0ull, ~0ull, ~0ull};
+        };
+        Content content;
         // earlier decodes of this texture with other contents (animated textures upload a few frames in turn to the same
         // place), newest first; same size and range as the texture
         struct Earlier
         {
             uint64_t contentHash = 0;
             GLuint id = 0;
+            Content content;
         };
         Earlier earlier[3];
     };
@@ -866,6 +875,7 @@ void main()
         uint64_t shuffleSelfCopies = 0, shuffleFetches = 0; // ES: self-sourced shuffle batches through a copy / through fetch
         uint64_t stripsFused = 0; // strip swap triples drawn as part of an exchange pass (holdStripStep)
         uint64_t writesHeld = 0; // shuffle batches drawn later from a stash (holdWrite)
+        uint64_t failPasses = 0, failMerged = 0, alphaProved = 0; // alpha-tested batches drawn twice (fail pass) / once (see the draw path)
         uint64_t fbChangesAtLast = 0;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     } stats;
@@ -887,7 +897,11 @@ void main()
     };
     struct GpuTimer
     {
-        bool enabled = [] { const char *v = std::getenv("GOW_GS_GPU_TIME"); return v && *v == '1'; }();
+        bool enabled = [] { const char *v = std::getenv("GOW_GS_GPU_TIME"); return v && (*v == '1' || *v == '2'); }();
+        // GOW_GS_GPU_TIME=2 (desktop): fragment shader invocations instead of time (ARB_pipeline_statistics_query),
+        // printed in the same place (the "ms" are millions of invocations): the shading work per kind, independent of
+        // the GPU's clocks and queueing
+        GLenum target = [] { const char *v = std::getenv("GOW_GS_GPU_TIME"); return v && *v == '2' ? 0x82F4u : kTimeElapsed; }();
         bool open = false;
         GLuint query = 0u;
         uint32_t kind = 0u;
@@ -917,7 +931,7 @@ void main()
         t.kind = kind;
         t.area = 0u;
         t.open = true;
-        g.BeginQuery(kTimeElapsed, t.query);
+        g.BeginQuery(t.target, t.query);
     }
     void gpuTag(uint32_t bits) { gpuTimer.kind |= bits; }
 
@@ -970,7 +984,7 @@ void main()
         GpuTimer &t = gpuTimer;
         if (!t.open)
             return;
-        gl().EndQuery(kTimeElapsed);
+        gl().EndQuery(gpuTimer.target);
         t.open = false;
         if (t.pending.size() - t.head >= 16384u) // results stopped arriving: stop growing
         {
@@ -1753,7 +1767,7 @@ void main()
         return psm == GS_PSM_T8 || psm == GS_PSM_T8H || psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
     }
 
-    Texture &textureFor(const GSDrawState &s)
+    uint64_t textureKey(const GSDrawState &s) const
     {
         const GSTex0Reg &t = s.context.tex0;
         uint64_t key = t.tbp0 | (static_cast<uint64_t>(t.tbw) << 14) | (static_cast<uint64_t>(t.psm & 63) << 20) |
@@ -1764,6 +1778,41 @@ void main()
             key = key * 1099511628211ull ^ clutHash;
             key = key * 1099511628211ull ^ (t.cpsm | (t.csm << 8) | (t.csa << 16));
         }
+        return key;
+    }
+
+    // GOW-Port: a filtered paletted texture costs the shader 2x2 index reads and four dependent palette reads per pixel
+    // (four plain reads on ES, which has no textureGather), the ship fights' main GPU cost. Once the same image with the
+    // same palette is drawn in a few frames, it is decoded to RGBA (index run + palette, the colours the shader would
+    // look up) and filtered by the texture unit: one read. A palette that changes every frame (colour cycling) never
+    // gets there and stays on the index path, so it costs no decode per frame. PS2X_GS_INDEXED: 1 = always the index
+    // path, 2 = always RGBA when filtered, 3 (default) = RGBA once stable.
+    struct RgbaDemand
+    {
+        int lastPresent = -1;
+        uint32_t frames = 0;
+    };
+    std::unordered_map<uint64_t, RgbaDemand> rgbaDemand;
+    bool rgbaStable(const GSDrawState &s)
+    {
+        const uint64_t key = textureKey(s);
+        if (const auto it = textures.find(key); it != textures.end() && it->second.id)
+            return true;
+        if (rgbaDemand.size() > 16384u)
+            rgbaDemand.clear();
+        RgbaDemand &d = rgbaDemand[key];
+        if (d.lastPresent != presentCount)
+        {
+            d.lastPresent = presentCount;
+            ++d.frames;
+        }
+        return d.frames >= 3u;
+    }
+
+    Texture &textureFor(const GSDrawState &s)
+    {
+        const GSTex0Reg &t = s.context.tex0;
+        const uint64_t key = textureKey(s);
         Texture &tex = textures[key];
         tex.lastUse = ++useCounter;
         if (tex.valid)
@@ -1822,6 +1871,15 @@ void main()
             TexSpan span{texParts[TexUpload]};
             g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), tex.width, tex.height, 0, kRgba, kUnsignedByte, pixels.data());
         }
+        tex.content = {};
+        if (!pixels.empty())
+        {
+            uint32_t lo = 255u, hi = 0u;
+            for (uint32_t px : pixels)
+                lo = std::min(lo, px >> 24), hi = std::max(hi, px >> 24);
+            tex.content.alphaLo = static_cast<uint8_t>(lo);
+            tex.content.alphaHi = static_cast<uint8_t>(hi);
+        }
         tex.valid = true;
         {
             TexSpan span{texParts[TexHash]};
@@ -1843,6 +1901,37 @@ void main()
         const GSSwizzle::Format &f = GSSwizzle::GetFormat(t.psm);
         const uint32_t w = std::max<uint32_t>(1u, s.textureWidth), h = std::max<uint32_t>(1u, s.textureHeight);
         const bool sixteen = f.kind == GSSwizzle::Kind::Bits16;
+        static const bool slowIndexed = std::getenv("PS2X_GS_SLOW_INDEXED") != nullptr; // (the reference decode, to compare)
+        if (vram && isIndexed(t.psm) && !slowIndexed)
+        {
+            // paletted: the index runs the index path reads, through the palette the shader would look them up in
+            uint32_t colors[256];
+            store.BuildPalette(s, colors);
+            std::vector<uint8_t> indices(w);
+            out.resize(static_cast<size_t>(w) * h);
+            for (uint32_t y = 0; y < h; ++y)
+            {
+                GSMem::ReadIndexRun(vram, t.psm, t.tbp0, t.tbw, 0u, y, w, indices.data());
+                uint32_t *line = out.data() + static_cast<size_t>(y) * w;
+                for (uint32_t x = 0; x < w; ++x)
+                    line[x] = colors[indices[x]];
+            }
+            static const bool check = std::getenv("GOW_GS_TEXCHECK") != nullptr;
+            if (check)
+            {
+                std::vector<uint32_t> ref;
+                store.DecodeTextureRgba(s, ref);
+                static int mismatches = 0, checked = 0;
+                for (size_t i = 0; i < ref.size() && i < out.size(); ++i)
+                    if (ref[i] != out[i] && mismatches++ < 20)
+                        std::fprintf(stderr, "[gs-texcheck] indexed psm=%u tbp=%x %ux%u texel %zu ref=%08x run=%08x\n", t.psm, t.tbp0, w, h, i, ref[i], out[i]);
+                if (ref.size() != out.size() && mismatches++ < 20)
+                    std::fprintf(stderr, "[gs-texcheck] indexed size %zu vs %zu\n", ref.size(), out.size());
+                if (++checked % 50 == 0)
+                    std::fprintf(stderr, "[gs-texcheck] %d indexed textures checked, %d mismatching texels\n", checked, mismatches);
+            }
+            return;
+        }
         if (!vram || !f.table || !(sixteen || f.kind == GSSwizzle::Kind::Bits32 || f.kind == GSSwizzle::Kind::Bits24))
         {
             store.DecodeTextureRgba(s, out); // formats without a direct layout (none seen in this game)
@@ -1978,6 +2067,10 @@ void main()
             TexSpan span{texParts[TexUpload]};
             g.TexImage2D(kTexture2D, 0, 0x8229 /*R8*/, tex.width, tex.height, 0, 0x1903 /*RED*/, kUnsignedByte, indices.data());
         }
+        tex.content = {};
+        std::fill(std::begin(tex.content.indices), std::end(tex.content.indices), 0ull);
+        for (uint8_t i : indices)
+            tex.content.indices[i >> 6] |= 1ull << (i & 63u);
         g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
         g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
         tex.valid = true;
@@ -1994,7 +2087,13 @@ void main()
     }
 
     // 256x1 RGBA palette of the current CLUT as the draw reads it (format, offset, TEXA alpha)
-    std::unordered_map<uint64_t, GLuint> palettes;
+    struct Palette
+    {
+        GLuint id = 0;
+        uint8_t alpha[256]; // each entry's alpha (alphaTestBound)
+    };
+    std::unordered_map<uint64_t, Palette> palettes;
+    const uint8_t *paletteAlpha = nullptr; // the last paletteFor's
     GLuint paletteFor(const GSDrawState &s)
     {
         const GSTex0Reg &t = s.context.tex0;
@@ -2017,25 +2116,30 @@ void main()
         }
         const auto it = palettes.find(key);
         if (it != palettes.end())
-            return it->second;
+        {
+            paletteAlpha = it->second.alpha;
+            return it->second.id;
+        }
         const Api &g = gl();
         if (palettes.size() > 4096u)
         {
             for (auto &kv : palettes)
-                g.DeleteTextures(1, &kv.second);
+                g.DeleteTextures(1, &kv.second.id);
             palettes.clear();
         }
         uint32_t colors[256];
         store.BuildPalette(s, colors);
-        GLuint id = 0;
-        id = newTextureName();
-        g.BindTexture(kTexture2D, id);
+        Palette &p = palettes[key];
+        p.id = newTextureName();
+        for (int i = 0; i < 256; ++i)
+            p.alpha[i] = static_cast<uint8_t>(colors[i] >> 24);
+        g.BindTexture(kTexture2D, p.id);
         g.PixelStorei(kUnpackAlignment, 4);
         g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), 256, 1, 0, kRgba, kUnsignedByte, colors);
         g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
         g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
-        palettes[key] = id;
-        return id;
+        paletteAlpha = p.alpha;
+        return p.id;
     }
 
     void evictOld()
@@ -2090,11 +2194,12 @@ void main()
             for (Texture::Earlier &e : tex.earlier)
                 if (e.id && e.contentHash == hash)
                     match = &e;
-            Texture::Earlier current{tex.contentHash, tex.id};
+            Texture::Earlier current{tex.contentHash, tex.id, tex.content};
             if (match)
             {
                 tex.id = match->id;
                 tex.contentHash = hash;
+                tex.content = match->content;
                 *match = current;
                 tex.valid = true;
                 ++revalidated;
@@ -4396,6 +4501,7 @@ void main()
         u1i(locTcc, c.tex0.tcc);
         u1f(locBlendScale, 1.0f / 128.0f);
         cpuMark(1);
+        int texAlphaLo = 0, texAlphaHi = 255; // the texels' alpha range, when known (alphaTestBound)
         if (s.prim.tme)
         {
             // a texture that lives in a render target of the same format is sampled straight from it
@@ -4457,7 +4563,9 @@ void main()
                 if ((++hazards & (hazards - 1u)) == 0u)
                     std::fprintf(stderr, "[gs-hw] held writes: draw sampling their target (%llu)\n", (unsigned long long)hazards);
             }
-            const bool indexed = !(src || rsrc || zsrc) && isIndexed(c.tex0.psm) && vram != nullptr;
+            static const int indexedMode = [] { const char *v = std::getenv("PS2X_GS_INDEXED"); return v && *v ? std::atoi(v) : 3; }();
+            const bool paletted = !(src || rsrc || zsrc) && isIndexed(c.tex0.psm) && vram != nullptr && indexedMode != 0;
+            const bool indexed = paletted && !(s.linearFilter && (indexedMode == 2 || (indexedMode == 3 && rgbaStable(s))));
             Texture &tex = (src || rsrc || zsrc) ? dummy : indexed ? indexTextureFor(s) : textureFor(s);
             u1i(locIndexed, indexed ? 1 : 0);
             const bool linearFilter = s.linearFilter && bisect.mode != BisectPoint;
@@ -4468,9 +4576,21 @@ void main()
             {
                 g.ActiveTexture(kTexture0 + 5);
                 TexSpan span{texParts[TexPalette]};
+                paletteAlpha = nullptr;
                 g.BindTexture(kTexture2D, paletteFor(s));
                 u1i(locIdxPalette, 5);
+                if (paletteAlpha)
+                {
+                    int lo = 255, hi = -1;
+                    for (int i = 0; i < 256; ++i)
+                        if ((tex.content.indices[i >> 6] >> (i & 63)) & 1u)
+                            lo = std::min<int>(lo, paletteAlpha[i]), hi = std::max<int>(hi, paletteAlpha[i]);
+                    if (hi >= lo)
+                        texAlphaLo = lo, texAlphaHi = hi;
+                }
             }
+            else if (!(src || rsrc || zsrc))
+                texAlphaLo = tex.content.alphaLo, texAlphaHi = tex.content.alphaHi;
             g.ActiveTexture(kTexture0);
             g.BindTexture(kTexture2D, zsrc ? zsrc->depth : selfTex ? selfTex : src ? src->color : rsrc ? rsrc->color : tex.id);
             u1i(locZTex, !zsrc ? 0 : c.tex0.psm == 0x32 || c.tex0.psm == 0x3A ? 16 : c.tex0.psm == 0x31 ? 24 : 32);
@@ -4519,7 +4639,56 @@ void main()
         u1i(locAtst, static_cast<GLint>(atst));
         u1i(locAref, static_cast<GLint>(aref));
         static const bool forceNoTest = std::getenv("GOW_GS_HW_NOATEST") != nullptr;
-        u1i(locPass, (ate && !forceNoTest) ? 1 : 0);
+        // GOW-Port: without a Z write (ZMSK, Z not in the colour) the alpha test only decides which fragments write
+        // colour: FB_ONLY (and RGB_ONLY with alpha masked) writes failing fragments exactly like passing ones, so there is
+        // no test at all; ZB_ONLY writes nothing for them, a plain discard. One pass instead of two (the fail pass ran the
+        // whole shader again, palette fetches included; the ship fights' blended effects are mostly this).
+        // PS2X_GS_FAIL_MERGE=0: always the two passes.
+        static const bool failMerge = [] { const char *v = std::getenv("PS2X_GS_FAIL_MERGE"); return !(v && *v == '0'); }();
+        const bool noZWrite = c.zbuf.zmask && !zAlias;
+        const bool failLikePass = failMerge && ate && noZWrite && (afail == 1u || (afail == 3u && !ma));
+        const bool failWritesNothing = failMerge && ate && noZWrite && afail == 2u;
+        if (failLikePass || failWritesNothing)
+            ++stats.failMerged;
+        // GOW-Port: alphaTestBound: the alpha the test sees lies between bounds known on the CPU: the texels' (RGBA
+        // textures: their alpha range at decode; paletted: the alphas of the palette entries the index texture uses;
+        // filtering mixes those) and the vertices' (interpolation stays between them), combined by TFX/TCC like the
+        // shader (each formula grows with both). When every value in that range passes, no fragment fails: the shader
+        // needs no test and the fail pass would draw nothing. Most of the ship fights' two-pass draws (FB_ONLY with a Z
+        // write, a second full shader run each) are textures whose alphas all pass. PS2X_GS_ALPHA_BOUND=0: off.
+        static const bool alphaBound = [] { const char *v = std::getenv("PS2X_GS_ALPHA_BOUND"); return !(v && *v == '0'); }();
+        bool allPass = false;
+        if (alphaBound && ate && !failLikePass)
+        {
+            int vLo = 255, vHi = 0;
+            for (const HwVertex &v : verts)
+                vLo = std::min<int>(vLo, v.a), vHi = std::max<int>(vHi, v.a);
+            int aLo = vLo, aHi = vHi;
+            if (s.prim.tme && c.tex0.tcc)
+            {
+                if (c.tex0.tfx == 0)
+                    aLo = std::min(255, texAlphaLo * vLo / 128), aHi = std::min(255, texAlphaHi * vHi / 128);
+                else if (c.tex0.tfx == 2)
+                    aLo = std::min(255, texAlphaLo + vLo), aHi = std::min(255, texAlphaHi + vHi);
+                else
+                    aLo = texAlphaLo, aHi = texAlphaHi;
+            }
+            const int ref = static_cast<int>(aref);
+            switch (atst)
+            {
+            case 0: allPass = false; break;
+            case 1: allPass = true; break;
+            case 2: allPass = aHi < ref; break;
+            case 3: allPass = aHi <= ref; break;
+            case 4: allPass = aLo == ref && aHi == ref; break;
+            case 5: allPass = aLo >= ref; break;
+            case 6: allPass = aLo > ref; break;
+            default: allPass = ref < aLo || ref > aHi; break;
+            }
+            if (allPass)
+                ++stats.alphaProved;
+        }
+        u1i(locPass, (ate && !forceNoTest && !failLikePass && !allPass) ? 1 : 0);
         u1i(locFailTint, 0);
         static const int traceAt = std::getenv("GOW_GS_HW_DEPTHTRACE") ? std::atoi(std::getenv("GOW_GS_HW_DEPTHTRACE")) : -1;
         const bool tracing = traceAt >= 0 && presentCount >= traceAt && presentCount < traceAt + 1 && rt.depth && rt.fbp == 0;
@@ -4628,9 +4797,49 @@ void main()
                 (px[i] < 127 ? below : px[i] > 127 ? above : equal) += 1;
             std::fprintf(stderr, "[gs-hw-vol]   after: G<127 %zu, G>127 %zu, G=127 %zu\n", below, above, equal);
         }
-        static const bool noFailPass = std::getenv("GOW_GS_HW_NOFAIL") != nullptr;
-        if (ate && afail != 0u && !noFailPass && bisect.mode != BisectNoFail)
+        // PS2X_GS_ALPHA_VERIFY=1 (desktop, testing alphaTestBound): each batch proven to pass is drawn once more keeping
+        // only failing fragments, writing nothing, without the depth test, counted by a samples query: any count means the
+        // bound was wrong (printed as [gs-hw] alpha bound)
+        static const bool alphaVerify = [] { const char *v = std::getenv("PS2X_GS_ALPHA_VERIFY"); return v && *v == '1'; }();
+        if (alphaVerify && allPass)
         {
+            static GLuint query = 0;
+            static uint64_t checked = 0, wrong = 0, wrongSamples = 0;
+            if (!query)
+                g.GenQueries(1, &query);
+            u1i(locPass, 2);
+            g.ColorMask(kFalse, kFalse, kFalse, kFalse);
+            g.DepthMask(kFalse);
+            g.Disable(kDepthTest);
+            g.BeginQuery(0x8914 /*SAMPLES_PASSED*/, query);
+            useDrawProgram(dualSource);
+            g.DrawArrays(kTriangles, first, static_cast<GLsizei>(verts.size()));
+            g.EndQuery(0x8914);
+            GLuint64 samples = 0;
+            g.GetQueryObjectui64v(query, kQueryResult, &samples);
+            ++checked;
+            if (samples)
+            {
+                ++wrong;
+                wrongSamples += samples;
+                if (wrong <= 20u)
+                    std::fprintf(stderr, "[gs-hw] alpha bound wrong: %llu samples, atst=%u aref=%u afail=%u tfx=%u tcc=%u tme=%d psm=%x tex alpha %d-%d\n",
+                                 (unsigned long long)samples, atst, aref, afail, (unsigned)c.tex0.tfx, (unsigned)c.tex0.tcc, s.prim.tme ? 1 : 0,
+                                 (unsigned)c.tex0.psm, texAlphaLo, texAlphaHi);
+            }
+            if ((checked & 4095u) == 0u)
+                std::fprintf(stderr, "[gs-hw] alpha bound: %llu batches checked, %llu with failing fragments (%llu samples)\n",
+                             (unsigned long long)checked, (unsigned long long)wrong, (unsigned long long)wrongSamples);
+            if (!(noDepth || zAlias))
+                g.Enable(kDepthTest);
+            g.ColorMask(mr, mg, mb, ma);
+            g.DepthMask(zwrite ? kTrue : kFalse);
+            u1i(locPass, 0);
+        }
+        static const bool noFailPass = std::getenv("GOW_GS_HW_NOFAIL") != nullptr;
+        if (ate && afail != 0u && !noFailPass && !failLikePass && !failWritesNothing && !allPass && bisect.mode != BisectNoFail)
+        {
+            ++stats.failPasses;
             // failing fragments: 1 FB_ONLY (colour+alpha, no Z), 2 ZB_ONLY (Z only), 3 RGB_ONLY (colour, no alpha, no Z)
             u1i(locPass, 2);
             gpuTag(GpuFailPass);
@@ -4771,16 +4980,18 @@ void main()
         if (now - stats.last < std::chrono::seconds(5))
             return;
         stats.last = now;
-        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu shuffleSelfCopies=%llu shuffleFetches=%llu stripsFused=%llu writesHeld=%llu fbChanges=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
+        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu shuffleSelfCopies=%llu shuffleFetches=%llu stripsFused=%llu writesHeld=%llu failPasses=%llu failMerged=%llu alphaProved=%llu fbChanges=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
                      (unsigned long long)stats.shuffles, (unsigned long long)stats.draws, (unsigned long long)stats.batches, (unsigned long long)stats.texDecodes,
                      (unsigned long long)stats.texHits, (unsigned long long)stats.skippedPsm, (unsigned long long)stats.skippedPrim,
                      (unsigned long long)stats.unsupportedBlend, textures.size(), (unsigned long long)stats.glDraws, (unsigned long long)stats.barriers,
                      (unsigned long long)stats.selfCopies, (unsigned long long)stats.shuffleSelfCopies, (unsigned long long)stats.shuffleFetches,
-                     (unsigned long long)stats.stripsFused, (unsigned long long)stats.writesHeld, (unsigned long long)(GSGL::DrawFramebufferChanges() - stats.fbChangesAtLast),
+                     (unsigned long long)stats.stripsFused, (unsigned long long)stats.writesHeld, (unsigned long long)stats.failPasses,
+                     (unsigned long long)stats.failMerged, (unsigned long long)stats.alphaProved,
+                     (unsigned long long)(GSGL::DrawFramebufferChanges() - stats.fbChangesAtLast),
                      (unsigned long long)(stats.uploadBytes >> 10), (unsigned long long)stats.orphans,
                      (unsigned long long)stats.clutReadbacks, (unsigned long long)stats.paletteUploads);
         stats.shuffles = stats.draws = stats.batches = stats.texDecodes = stats.texHits = stats.skippedPsm = stats.skippedPrim = stats.unsupportedBlend = 0;
-        stats.shuffleSelfCopies = stats.shuffleFetches = stats.stripsFused = stats.writesHeld = 0;
+        stats.shuffleSelfCopies = stats.shuffleFetches = stats.stripsFused = stats.writesHeld = stats.failPasses = stats.failMerged = stats.alphaProved = 0;
         stats.fbChangesAtLast = GSGL::DrawFramebufferChanges();
         stats.glDraws = stats.barriers = stats.selfCopies = stats.uploadBytes = stats.orphans = stats.clutReadbacks = stats.paletteUploads = 0;
         GSGL::ReportStateCacheVerify();
