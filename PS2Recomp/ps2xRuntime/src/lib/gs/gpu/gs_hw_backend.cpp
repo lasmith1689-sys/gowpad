@@ -534,6 +534,10 @@ void main()
         uint64_t version = 1, lastDrawSeq = 0;
         uint64_t lastDepthSeq = 0; // writeSeq of the last draw that wrote this target's depth (memory at zbp)
         uint32_t usedW = 0, usedH = 0; // PS2 pixels touched by draws (scissor extents)
+        // GOW-Port: the current pass's signature (the draw that started it) and, per signature, whether the last pass it
+        // started tested or wrote depth (enterPass / colourOnlyFramebuffer)
+        uint64_t passSig = 0;
+        std::unordered_map<uint64_t, bool> passDepthBySig;
     };
 
     uint32_t pageRowsFor(uint32_t psm)
@@ -875,6 +879,7 @@ void main()
         uint64_t shuffleSelfCopies = 0, shuffleFetches = 0; // ES: self-sourced shuffle batches through a copy / through fetch
         uint64_t stripsFused = 0; // strip swap triples drawn as part of an exchange pass (holdStripStep)
         uint64_t writesHeld = 0; // shuffle batches drawn later from a stash (holdWrite)
+        uint64_t deferred = 0; // Z-inversion draws deferred (deferZInversion)
         uint64_t failPasses = 0, failMerged = 0, alphaProved = 0; // alpha-tested batches drawn twice (fail pass) / once (see the draw path)
         uint64_t fbChangesAtLast = 0;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
@@ -1292,7 +1297,15 @@ void main()
     {
         const bool fragment = type == GSGL::kFragmentShader;
         std::string head = "#version 300 es\n";
-        const bool fetch = fragment && fbFetch && text.find("texelFetch(uDest, ivec2(gl_FragCoord.xy), 0)") != std::string::npos;
+        // GOW-Port: a specialised draw variant whose destination reads are all compiled out (no shader blend, no
+        // destination alpha test, no Z in the colour) gets a plain output, not the framebuffer-fetch input: a fragment
+        // shader that declares that input reads the tile (Apple's GPUs then keep its fragments in order per pixel and
+        // cannot drop hidden ones before shading), even when nothing reads it
+        const bool readsNoDest = text.find("#define uSwBlend 0\n") != std::string::npos && text.find("#define uDate 0\n") != std::string::npos &&
+                                 text.find("#define uZAlias 0\n") != std::string::npos;
+        static const bool fetchAll = [] { const char *v = std::getenv("PS2X_GS_FETCH_ALL"); return v && *v == '1'; }();
+        const bool fetch = fragment && fbFetch && text.find("texelFetch(uDest, ivec2(gl_FragCoord.xy), 0)") != std::string::npos &&
+                           (fetchAll || !readsNoDest);
         if (fetch)
             head += "#extension GL_EXT_shader_framebuffer_fetch : require\n";
         head += "precision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp usampler2D;\n"
@@ -1611,6 +1624,8 @@ void main()
         for (RenderTarget &t : targets) // grow an existing one
             if (t.fbp == fbp)
             {
+                if (deferredFbp(fbp) && !replaying)
+                    flushDeferred(); // (its deferred draws land before the old picture is dropped, as they would have)
                 destroy(t);
                 createTarget(t, fbp, fbw);
                 return t;
@@ -1735,12 +1750,14 @@ void main()
             return;
         }
         g.ActiveTexture(kTexture0 + 4);
-        const GLuint copy = selfCopy(rt, true);
+        const GLuint copy = selfCopy(rt, true, "dest");
         g.BindTexture(kTexture2D, copy);
         g.ActiveTexture(kTexture0);
     }
-    GLuint selfCopy(RenderTarget &t, bool scissor)
+    GLuint selfCopy(RenderTarget &t, bool scissor, const char *why = "?")
     {
+        if (opTrace)
+            *opTrace += std::string(" #copy:") + why;
         constexpr GLenum kReadFramebuffer = 0x8CA8, kDrawFramebuffer = 0x8CA9;
         const Api &g = gl();
         GLuint previous = 0; // (the draw's framebuffer: the target's own or its colour-only one)
@@ -2361,6 +2378,10 @@ void main()
         RenderTarget *rt = findReinterpretSource(tex0.cbp, tex0.cpsm);
         if (!rt || count == 0u || count > 256u || !ensureClutProgram())
             return false;
+        if (passModel.on)
+            ++passModel.reads["clut<t" + std::to_string(rt->fbp)];
+        if (deferredTarget(rt))
+            flushDeferred();
         uint64_t key = 1469598103934665603ull;
         const auto mix = [&key](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
         mix(rt->fbp); mix(rt->version); mix(tex0.cbp); mix(tex0.cpsm); mix(width); mix(count);
@@ -2643,6 +2664,8 @@ void main()
             shuffleDst = dst;
             shuffleSrc = src;
             shuffleSrcZ = srcDepth;
+            if (passModel.on)
+                ++passModel.reads["shuffle<t" + std::to_string(src->fbp) + (srcDepth ? "z" : "")];
             ++shuffleGen;
             shuffleConflict = false;
         }
@@ -2691,14 +2714,62 @@ void main()
     // other targets move the colour alone, not the depth buffer as well. In the target's pass already (either
     // framebuffer), it stays there; a draw goes to the depth framebuffer of a target that drew with depth in the last
     // two frames (it would likely switch back for the next depth draw). PS2X_GS_COLOR_FBO=0 disables.
-    GLuint colourOnlyFramebuffer(RenderTarget &t, bool draw)
+    // GOW-Port: that last guess per pass instead: a depth-free draw entering the target starts a colour-only pass when the
+    // last pass the same kind of draw started (same state signature, passSignature) used no depth. The ship fights enter
+    // the main target twice a frame with draws that never touch depth (a 1-draw pass between two 64 px scratch passes,
+    // the screen-filter sprite after its self copy), and each of those moved the 9 MB depth buffer in and out. A wrong
+    // guess costs one framebuffer switch (the depth draw moves to the depth framebuffer, as before); the frames repeat,
+    // so it is right from the second frame on. PS2X_GS_PASS_PREDICT=0: the two-frame rule above.
+    const bool passPredict = [] { const char *v = std::getenv("PS2X_GS_PASS_PREDICT"); return !(v && *v == '0'); }();
+    static uint64_t passSignature(const GSDrawState &s, bool afterCopy)
+    {
+        const GSContext &c = s.context;
+        uint64_t h = 1469598103934665603ull;
+        const auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+        mix(c.tex0.tbp0 | (uint64_t(s.prim.tme ? 1 : 0) << 14) | (uint64_t(c.tex0.psm & 63u) << 15) | (uint64_t(s.prim.type & 7u) << 21) |
+            (uint64_t(c.frame.psm & 63u) << 24) | (uint64_t(afterCopy ? 1 : 0) << 30) | (uint64_t(c.frame.fbp) << 32));
+        mix(c.frame.fbmsk);
+        mix(c.test);
+        mix(c.alpha);
+        return h | 1u; // (0 = no signature)
+    }
+    // a pass on t starts with work of signature sig (0: none, e.g. a shuffle): returns the depth use the last pass it
+    // started had (-1 unknown), and records this one as using none so far
+    int enterPass(RenderTarget &t, uint64_t sig)
+    {
+        t.passSig = sig;
+        if (!sig)
+            return -1;
+        if (t.passDepthBySig.size() > 4096u)
+            t.passDepthBySig.clear();
+        auto [it, added] = t.passDepthBySig.try_emplace(sig, false);
+        const int last = added ? -1 : (it->second ? 1 : 0);
+        it->second = false;
+        return last;
+    }
+    void notePassDepth(RenderTarget &t)
+    {
+        if (t.passSig)
+            t.passDepthBySig[t.passSig] = true;
+    }
+    // a pass on t follows (work goes to one of its framebuffers): true when coming from another framebuffer
+    bool entering(const RenderTarget &t) const
+    {
+        GLuint current = 0;
+        return !GSGL::CurrentDrawFramebuffer(current) || (current != t.fbo && current != t.colorFbo);
+    }
+    GLuint colourOnlyFramebuffer(RenderTarget &t, bool draw, uint64_t sig = 0)
     {
         static const bool on = [] { const char *v = std::getenv("PS2X_GS_COLOR_FBO"); return !(v && *v == '0'); }();
         GLuint current = 0;
-        if (!on || !t.colorFbo || !t.depth || !GSGL::CurrentDrawFramebuffer(current) || current == t.fbo)
+        const bool known = GSGL::CurrentDrawFramebuffer(current);
+        const int last = (!known || (current != t.fbo && current != t.colorFbo)) ? enterPass(t, sig) : -2;
+        if (!on || !t.colorFbo || !t.depth || !known || current == t.fbo)
             return t.fbo;
         if (current == t.colorFbo || !draw)
             return t.colorFbo;
+        if (passPredict && last >= 0)
+            return last ? t.fbo : t.colorFbo;
         return (t.depthDrawPresent != 0u && presentCount + 1u - t.depthDrawPresent <= 2u) ? t.fbo : t.colorFbo;
     }
 
@@ -3078,6 +3149,8 @@ void main()
 
     void flushShuffle()
     {
+        if (shufflesTouchDeferred())
+            flushDeferred();
         if (haveShuffle && !stripHeld.empty())
             holdStripStep(); // (the queued batch may complete the chain's last triple)
         drawStrips();
@@ -3146,7 +3219,7 @@ void main()
         {
             g.UseProgram(shuffleProgram);
             const bool copied = g.es && &src == &dst && !shuffleSrcZ;
-            const GLuint srcColor = shuffleSrcTexture ? shuffleSrcTexture : copied ? selfCopy(dst, false) : src.color;
+            const GLuint srcColor = shuffleSrcTexture ? shuffleSrcTexture : copied ? selfCopy(dst, false, shuffleSwapHalves ? "shuffle-swap" : shuffleConflict ? "shuffle-conflict" : "shuffle") : src.color;
             stats.shuffleSelfCopies += (&src == &dst && !shuffleSrcZ) ? 1u : 0u; // (forced desktop test: the batches fetch would not take)
             g.ActiveTexture(kTexture0);
             g.BindTexture(kTexture2D, shuffleSrcZ ? src.depth : srcColor);
@@ -3538,6 +3611,13 @@ void main()
         uint64_t texBefore[kTexParts];
         std::memcpy(texBefore, texParts, sizeof(texBefore));
         drawFirstProgram = drawFirstPipeline = false;
+        if (deferZInversion(pendingState, pending))
+        {
+            pending.clear();
+            return;
+        }
+        if (touchesDeferred(pendingState))
+            flushDeferred();
         draw(pendingState, pending);
         const uint64_t spent = nanosSince(drawStart);
         cpuTiming.drawNanos += spent;
@@ -4233,6 +4313,150 @@ void main()
         }
     }
 
+    // the render targets a textured draw samples: one of the same format family (src), a depth buffer (zsrc), or memory a
+    // target owns read through another format (rsrc). Only render-target bookkeeping is read (no GL).
+    struct TexSources
+    {
+        RenderTarget *src = nullptr, *zsrc = nullptr, *rsrc = nullptr;
+    };
+    TexSources textureSources(const GSDrawState &s)
+    {
+        TexSources r;
+        const GSContext &c = s.context;
+        if (!s.prim.tme)
+            return r;
+        const auto family = [](uint8_t psm) { return (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S) ? 16 : (psm == GS_PSM_CT32 || psm == GS_PSM_CT24) ? 32 : 0; };
+        if (family(c.tex0.psm) != 0 && (c.tex0.tbp0 % 32u) == 0u)
+            if (RenderTarget *candidate = findTarget(c.tex0.tbp0 / 32u))
+                if (family(candidate->psm) == family(c.tex0.psm) && !uploadedSinceDraw(*candidate, c.tex0.tbp0) &&
+                    !overwrittenByDepth(*candidate))
+                    r.src = candidate;
+        const bool zFormat = c.tex0.psm == 0x30 || c.tex0.psm == 0x31 || c.tex0.psm == 0x32 || c.tex0.psm == 0x3A;
+        if (zFormat && (c.tex0.tbp0 % 32u) == 0u)
+            for (RenderTarget &t : targets)
+                if (t.depth && t.zbp == c.tex0.tbp0 / 32u && t.fbp != t.zbp)
+                    r.zsrc = &t;
+        if (!r.src && !r.zsrc)
+            r.rsrc = findReinterpretSource(c.tex0.tbp0, c.tex0.psm);
+        return r;
+    }
+
+    // GOW-Port: GoW inverts its 24-bit Z buffer through colour draws: a full-screen CT24 sprite into the Z buffer's own
+    // memory (fbp 104 = ZBP) writing 255 - Cd, twice a frame. The renderer keeps depth in the main target's depth
+    // attachment and follows each inversion by flipping its depth tests (isZInversion / invertedZ); the inversion draw
+    // itself only changes the colour target at that memory, which gameplay never reads. Drawing it in place broke the
+    // main target's pass twice a frame (each break moves the 1536x1536 colour and depth buffers out of tile memory and
+    // back, plus the colour target's own pass). So it is recorded with its bookkeeping (version, write order, the
+    // depth-test flip) done now, in order, and drawn later, before anything uses that target: a draw into it, a draw,
+    // shuffle or CLUT load reading it, a clear, its growth, and every present (so at most one frame's inversions wait).
+    // PS2X_GS_DEFER_ZINV=0: drawn in place.
+    struct DeferredDraw
+    {
+        GSDrawState state{};
+        std::vector<HwVertex> verts;
+        uint32_t fbp = 0;
+    };
+    std::vector<DeferredDraw> deferredDraws;
+    bool replaying = false; // draw() is drawing a deferred draw: its bookkeeping was done when it was recorded
+    bool deferredFbp(uint32_t fbp) const
+    {
+        for (const DeferredDraw &d : deferredDraws)
+            if (d.fbp == fbp)
+                return true;
+        return false;
+    }
+    bool deferredTarget(const RenderTarget *t) const { return t && !deferredDraws.empty() && deferredFbp(t->fbp); }
+    void flushDeferred()
+    {
+        if (deferredDraws.empty() || replaying)
+            return;
+        std::vector<DeferredDraw> list;
+        list.swap(deferredDraws);
+        replaying = true;
+        for (const DeferredDraw &d : list)
+            draw(d.state, d.verts);
+        replaying = false;
+    }
+    // the pending draw (state s) would touch a target with deferred draws: draws into it or samples it
+    bool touchesDeferred(const GSDrawState &s)
+    {
+        if (deferredDraws.empty())
+            return false;
+        if (deferredFbp(s.context.frame.fbp))
+            return true;
+        if (!s.prim.tme)
+            return false;
+        // (a texture can only come from a target whose memory it starts in, or from a depth buffer at its base: the full
+        // source lookup runs for those alone)
+        const uint32_t tbp = s.context.tex0.tbp0;
+        bool near = false;
+        for (const DeferredDraw &d : deferredDraws)
+            if (const RenderTarget *t = findTarget(d.fbp))
+            {
+                const uint32_t lo = t->fbp * 32u, hi = lo + std::max(spanBlocks(t->psm, t->fbw, t->usedH), spanBlocks(t->psm, t->fbw, t->pxH));
+                near = near || (tbp >= lo && tbp < hi) || tbp == t->zbp * 32u;
+            }
+        if (!near)
+            return false;
+        const TexSources t = textureSources(s);
+        return deferredTarget(t.src) || deferredTarget(t.zsrc) || deferredTarget(t.rsrc);
+    }
+    // a queued or held shuffle reads or writes a target with deferred draws
+    bool shufflesTouchDeferred() const
+    {
+        if (deferredDraws.empty())
+            return false;
+        if (haveShuffle && (deferredTarget(shuffleSrc) || deferredTarget(shuffleDst)))
+            return true;
+        for (const std::vector<HeldShuffle> *list : {&stripHeld, &heldWrites})
+            for (const HeldShuffle &h : *list)
+                if (deferredTarget(h.src) || deferredTarget(h.dst) || deferredFbp(h.srcFbp) || deferredFbp(h.dstFbp))
+                    return true;
+        return false;
+    }
+    // the draw's render-target bookkeeping (draw() does it for a draw drawn in place)
+    void drawBookkeeping(RenderTarget &rt, const GSDrawState &s, const std::vector<HwVertex> &verts)
+    {
+        const GSContext &c = s.context;
+        rt.psm = c.frame.psm;
+        ++rt.version;
+        rt.lastDrawSeq = ++writeSeq;
+        // real extent of what was drawn (vertices clipped to the scissor), not the scissor itself
+        float maxX = 0.0f, maxY = 0.0f;
+        for (const HwVertex &v : verts)
+        {
+            maxX = std::max(maxX, v.x);
+            maxY = std::max(maxY, v.y);
+        }
+        const uint32_t bx = static_cast<uint32_t>(std::min<float>(std::max(maxX, 0.0f), static_cast<float>(c.scissor.x1 + 1u)));
+        const uint32_t by = static_cast<uint32_t>(std::min<float>(std::max(maxY, 0.0f), static_cast<float>(c.scissor.y1 + 1u)));
+        rt.usedW = std::max<uint32_t>(rt.usedW, std::min<uint32_t>(bx, rt.pxW));
+        rt.usedH = std::max<uint32_t>(rt.usedH, std::min<uint32_t>(by, rt.pxH));
+    }
+    bool deferZInversion(const GSDrawState &s, const std::vector<HwVertex> &verts)
+    {
+        static const bool on = [] { const char *v = std::getenv("PS2X_GS_DEFER_ZINV"); return !(v && *v == '0'); }();
+        if (!on || replaying || !isZInversion(s, verts))
+            return false;
+        const GSContext &c = s.context;
+        RenderTarget *t = findTarget(c.frame.fbp);
+        GLuint current = 0;
+        // (an existing target of that width with its depth attachment: nothing to create; not the one being drawn into)
+        if (!t || t->fbw < std::max<uint32_t>(c.frame.fbw, 1u) || !t->depth || t->zbp != c.zbuf.zbp || !GSGL::CurrentDrawFramebuffer(current) ||
+            current == t->fbo || current == t->colorFbo)
+            return false;
+        if (deferredDraws.size() >= 16u)
+            flushDeferred();
+        drawBookkeeping(*t, s, verts);
+        if (zInverted(c.zbuf.zbp))
+            invertedZ.erase(std::find(invertedZ.begin(), invertedZ.end(), c.zbuf.zbp));
+        else
+            invertedZ.push_back(c.zbuf.zbp);
+        deferredDraws.push_back({s, verts, c.frame.fbp});
+        ++stats.deferred;
+        return true;
+    }
+
     void draw(const GSDrawState &s, const std::vector<HwVertex> &verts)
     {
         const Api &g = gl();
@@ -4292,39 +4516,46 @@ void main()
         }
         RenderTarget &rt = target(c.frame.fbp, c.frame.fbw);
         attachDepth(rt, c.zbuf.zbp);
-        rt.psm = c.frame.psm;
-        ++rt.version;
+        if (!replaying)
+            drawBookkeeping(rt, s, verts);
         if (opTrace)
         {
             char op[64];
             std::snprintf(op, sizeof(op), " D%u<%s%x/%u", c.frame.fbp, s.prim.tme ? "t" : "-", c.tex0.tbp0, c.tex0.psm);
             *opTrace += op;
-        }
-        rt.lastDrawSeq = ++writeSeq;
-        {
-            // real extent of what was drawn (vertices clipped to the scissor), not the scissor itself
-            float maxX = 0.0f, maxY = 0.0f;
-            for (const HwVertex &v : verts)
+            if (!s.prim.tme)
             {
-                maxX = std::max(maxX, v.x);
-                maxY = std::max(maxY, v.y);
+                float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+                for (const HwVertex &v : verts)
+                    x0 = std::min(x0, v.x), y0 = std::min(y0, v.y), x1 = std::max(x1, v.x), y1 = std::max(y1, v.y);
+                char more[200];
+                std::snprintf(more, sizeof(more), "[prim%u n%zu xy%.0f-%.0f,%.0f-%.0f fpsm%x fbmsk%x zbp%x zpsm%x zmsk%d test%llx abe%d alpha%llx col%.0f,%.0f,%.0f,%.0f z%.4f]",
+                              (unsigned)s.prim.type, verts.size(), x0, x1, y0, y1, c.frame.psm, c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm,
+                              c.zbuf.zmask ? 1 : 0, (unsigned long long)c.test, s.prim.abe ? 1 : 0, (unsigned long long)c.alpha,
+                              float(verts[0].r), float(verts[0].g), float(verts[0].b), float(verts[0].a), verts[0].z);
+                *opTrace += more;
             }
-            const uint32_t bx = static_cast<uint32_t>(std::min<float>(std::max(maxX, 0.0f), static_cast<float>(c.scissor.x1 + 1u)));
-            const uint32_t by = static_cast<uint32_t>(std::min<float>(std::max(maxY, 0.0f), static_cast<float>(c.scissor.y1 + 1u)));
-            rt.usedW = std::max<uint32_t>(rt.usedW, std::min<uint32_t>(bx, rt.pxW));
-            rt.usedH = std::max<uint32_t>(rt.usedH, std::min<uint32_t>(by, rt.pxH));
         }
         cpuMark(0);
         // no depth test (ZTE off or ZTST ALWAYS) and no depth write (ZMSK), or Z in the target's own colour (zAlias below):
         // the depth attachment is not used
+        bool drawDepthFree = false;
+        const uint64_t selfCopiesBefore = stats.selfCopies;
         {
             const bool zte = ((c.test >> 16) & 1u) != 0u;
             const bool alwaysPass = !zte || ((c.test >> 17) & 3u) == 1u;
             const bool aliased = c.zbuf.zbp == c.frame.fbp && zte && (c.frame.psm == GS_PSM_CT32 || c.frame.psm == GS_PSM_CT24);
             const bool depthFree = aliased || (alwaysPass && c.zbuf.zmask);
+            drawDepthFree = depthFree;
             if (!depthFree)
                 rt.depthDrawPresent = static_cast<uint64_t>(presentCount) + 1u;
-            const GLuint drawFb = depthFree ? colourOnlyFramebuffer(rt, true) : rt.fbo;
+            if (!depthFree && passModel.on)
+                GSGL::NoteDepthDraw();
+            if (!depthFree && entering(rt))
+                enterPass(rt, passSignature(s, false));
+            const GLuint drawFb = depthFree ? colourOnlyFramebuffer(rt, true, passSignature(s, false)) : rt.fbo;
+            if (!depthFree)
+                notePassDepth(rt);
             g.BindFramebuffer(kFramebuffer, drawFb);
             drawTargetDepth = rt.depth != 0u && drawFb == rt.fbo; // (pipeline records: the attachment formats)
         }
@@ -4357,7 +4588,7 @@ void main()
                 v.z = 1.0f - v.z;
         }
         const std::vector<HwVertex> &dverts = zInv ? flippedZ : verts;
-        if (isZInversion(s, verts))
+        if (!replaying && isZInversion(s, verts))
         {
             if (zInverted(c.zbuf.zbp))
                 invertedZ.erase(std::find(invertedZ.begin(), invertedZ.end(), c.zbuf.zbp));
@@ -4365,7 +4596,7 @@ void main()
                 invertedZ.push_back(c.zbuf.zbp);
         }
         const bool zwrite = !c.zbuf.zmask && !zAlias;
-        if (zwrite && ((c.test >> 16) & 1u) != 0u)
+        if (zwrite && ((c.test >> 16) & 1u) != 0u && !replaying)
             rt.lastDepthSeq = rt.lastDrawSeq;
         const bool zAliasWrite = zAlias && !c.zbuf.zmask;
 
@@ -4486,7 +4717,7 @@ void main()
             if ((date || softBlend || zAlias) && !g.fbFetch)
             {
                 g.ActiveTexture(kTexture0 + 4);
-                g.BindTexture(kTexture2D, destCopyMode ? selfCopy(rt, true) : rt.color);
+                g.BindTexture(kTexture2D, destCopyMode ? selfCopy(rt, true, "dest") : rt.color);
                 u1i(locDest, 4);
                 g.ActiveTexture(kTexture0);
                 if (!destCopyMode && !profileFetch)
@@ -4506,20 +4737,15 @@ void main()
         {
             // a texture that lives in a render target of the same format is sampled straight from it
             std::optional<TexSpan> findSpan(std::in_place, texParts[TexFind]);
-            RenderTarget *src = nullptr;
-            const auto family = [](uint8_t psm) { return (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S) ? 16 : (psm == GS_PSM_CT32 || psm == GS_PSM_CT24) ? 32 : 0; };
-            if (family(c.tex0.psm) != 0 && (c.tex0.tbp0 % 32u) == 0u)
-                if (RenderTarget *candidate = findTarget(c.tex0.tbp0 / 32u))
-                    if (family(candidate->psm) == family(c.tex0.psm) && !uploadedSinceDraw(*candidate, c.tex0.tbp0) &&
-                        !overwrittenByDepth(*candidate))
-                        src = candidate;
+            const TexSources sources = textureSources(s);
+            RenderTarget *src = sources.src;
             GLuint selfTex = 0; // ES: the copy sampled instead of the target being drawn into
             if (src == &rt)
             {
                 if (g.es)
                 {
                     TexSpan span{texParts[TexCopy]};
-                    selfTex = selfCopy(rt, true);
+                    selfTex = selfCopy(rt, true, "tex-self");
                 }
                 else
                     g.TextureBarrier(), ++stats.barriers;
@@ -4531,31 +4757,38 @@ void main()
                                   (unsigned)s.prim.type, verts.size(), s.linearFilter ? 1 : 0, s.prim.fst ? 1 : 0, s.prim.abe ? 1 : 0,
                                   (unsigned long long)c.alpha, a.x, a.y, a.u, a.v, a.s, a.t, a.q, b.x, b.y, b.u, b.v);
                     *opTrace += op;
+                    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f, u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f, dmax = 0.0f;
+                    for (const HwVertex &v : verts)
+                    {
+                        const float uu = s.prim.fst ? v.u : (v.q != 0.0f ? v.s / v.q * s.textureWidth : 0.0f);
+                        const float vv = s.prim.fst ? v.v : (v.q != 0.0f ? v.t / v.q * s.textureHeight : 0.0f);
+                        x0 = std::min(x0, v.x), y0 = std::min(y0, v.y), x1 = std::max(x1, v.x), y1 = std::max(y1, v.y);
+                        u0 = std::min(u0, uu), v0 = std::min(v0, vv), u1 = std::max(u1, uu), v1 = std::max(v1, vv);
+                        dmax = std::max({dmax, std::fabs(uu - v.x), std::fabs(vv - v.y)});
+                    }
+                    std::snprintf(op, sizeof(op), "[fbmsk%x test%llx tex%ux%u xy%.0f-%.0f,%.0f-%.0f uv%.1f-%.1f,%.1f-%.1f |uv-xy|max%.2f clamp%llx]", c.frame.fbmsk,
+                                  (unsigned long long)c.test, s.textureWidth, s.textureHeight, x0, x1, y0, y1, u0, u1, v0, v1, dmax, (unsigned long long)c.clamp);
+                    *opTrace += op;
                 }
             }
             Texture dummy;
-            RenderTarget *zsrc = nullptr;
-            const bool zFormat = c.tex0.psm == 0x30 || c.tex0.psm == 0x31 || c.tex0.psm == 0x32 || c.tex0.psm == 0x3A;
-            if (zFormat && (c.tex0.tbp0 % 32u) == 0u)
-                for (RenderTarget &t : targets)
-                    if (t.depth && t.zbp == c.tex0.tbp0 / 32u && t.fbp != t.zbp)
-                        zsrc = &t;
+            RenderTarget *zsrc = sources.zsrc;
             if (zsrc)
                 src = nullptr, selfTex = 0;
-            RenderTarget *rsrc = nullptr;
-            if (!src && !zsrc)
-                rsrc = findReinterpretSource(c.tex0.tbp0, c.tex0.psm);
+            RenderTarget *rsrc = sources.rsrc;
             if (rsrc == &rt)
             {
                 if (g.es)
                 {
                     TexSpan span{texParts[TexCopy]};
-                    selfTex = selfCopy(rt, true);
+                    selfTex = selfCopy(rt, true, "tex-reinterp-self");
                 }
                 else
                     g.TextureBarrier(), ++stats.barriers;
             }
             findSpan.reset();
+            if (passModel.on && (src || rsrc || zsrc))
+                ++passModel.reads[std::string(src ? "draw<t" : rsrc ? "reinterp<t" : "zsrc<t") + std::to_string((src ? src : rsrc ? rsrc : zsrc)->fbp)];
             if (!heldWrites.empty() && ((src && src->fbp == heldWrites.front().dstFbp) || (rsrc && rsrc->fbp == heldWrites.front().dstFbp)))
             {
                 // (drawKeepsWrites let through a draw that samples the target the held writes go to: they would be missed)
@@ -4625,6 +4858,19 @@ void main()
                 u2f(locTexSize, static_cast<float>(src->pxW), static_cast<float>(src->pxH));
             else
                 u2f(locTexSize, static_cast<float>(tex.width), static_cast<float>(tex.height));
+        }
+        // GOW-Port (ES): a self copy above ended the target's pass, so the draw starts a new one: colour-only when the same
+        // pass of the previous frame used no depth (colourOnlyFramebuffer)
+        if (g.es && stats.selfCopies != selfCopiesBefore && rt.depth && rt.colorFbo)
+        {
+            const int last = enterPass(rt, passSignature(s, true));
+            if (!drawDepthFree)
+                notePassDepth(rt);
+            else if (passPredict && last == 0)
+            {
+                g.BindFramebuffer(kFramebuffer, rt.colorFbo);
+                drawTargetDepth = false;
+            }
         }
         cpuMark(2);
         g.BindVertexArray(vao);
@@ -4980,21 +5226,148 @@ void main()
         if (now - stats.last < std::chrono::seconds(5))
             return;
         stats.last = now;
-        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu shuffleSelfCopies=%llu shuffleFetches=%llu stripsFused=%llu writesHeld=%llu failPasses=%llu failMerged=%llu alphaProved=%llu fbChanges=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
+        std::fprintf(stderr, "[gs-hw] shuffles=%llu draws=%llu batches=%llu texDecodes=%llu texHits=%llu skippedPsm=%llu skippedPrim=%llu unsupportedBlend=%llu textures=%zu glDraws=%llu barriers=%llu selfCopies=%llu shuffleSelfCopies=%llu shuffleFetches=%llu stripsFused=%llu writesHeld=%llu failPasses=%llu failMerged=%llu alphaProved=%llu deferred=%llu fbChanges=%llu uploadKB=%llu orphans=%llu clutReadbacks=%llu paletteUploads=%llu\n",
                      (unsigned long long)stats.shuffles, (unsigned long long)stats.draws, (unsigned long long)stats.batches, (unsigned long long)stats.texDecodes,
                      (unsigned long long)stats.texHits, (unsigned long long)stats.skippedPsm, (unsigned long long)stats.skippedPrim,
                      (unsigned long long)stats.unsupportedBlend, textures.size(), (unsigned long long)stats.glDraws, (unsigned long long)stats.barriers,
                      (unsigned long long)stats.selfCopies, (unsigned long long)stats.shuffleSelfCopies, (unsigned long long)stats.shuffleFetches,
                      (unsigned long long)stats.stripsFused, (unsigned long long)stats.writesHeld, (unsigned long long)stats.failPasses,
-                     (unsigned long long)stats.failMerged, (unsigned long long)stats.alphaProved,
+                     (unsigned long long)stats.failMerged, (unsigned long long)stats.alphaProved, (unsigned long long)stats.deferred,
                      (unsigned long long)(GSGL::DrawFramebufferChanges() - stats.fbChangesAtLast),
                      (unsigned long long)(stats.uploadBytes >> 10), (unsigned long long)stats.orphans,
                      (unsigned long long)stats.clutReadbacks, (unsigned long long)stats.paletteUploads);
         stats.shuffles = stats.draws = stats.batches = stats.texDecodes = stats.texHits = stats.skippedPsm = stats.skippedPrim = stats.unsupportedBlend = 0;
-        stats.shuffleSelfCopies = stats.shuffleFetches = stats.stripsFused = stats.writesHeld = stats.failPasses = stats.failMerged = stats.alphaProved = 0;
+        stats.shuffleSelfCopies = stats.shuffleFetches = stats.stripsFused = stats.writesHeld = stats.failPasses = stats.failMerged = stats.alphaProved = stats.deferred = 0;
         stats.fbChangesAtLast = GSGL::DrawFramebufferChanges();
         stats.glDraws = stats.barriers = stats.selfCopies = stats.uploadBytes = stats.orphans = stats.clutReadbacks = stats.paletteUploads = 0;
         GSGL::ReportStateCacheVerify();
+    }
+
+    // GOW-Port: PS2X_GS_PASS_MODEL=1 (PC tests): the frames' render passes as a tile-based GPU (Apple's) runs them and the
+    // bytes each moves between tile memory and RAM. A pass loads every attachment it did not begin by clearing and stores
+    // every attachment (GL cannot tell the driver a store is not needed); a blit reads its source and writes its
+    // destination. Printed every 5 s as [gs-passes]: per frame, passes and MB by framebuffer kind.
+    struct PassModel
+    {
+        bool on = [] { const char *v = std::getenv("PS2X_GS_PASS_MODEL"); return v && *v == '1'; }();
+        bool started = false;
+        std::vector<GSGL::PassRecord> passes;
+        uint64_t frames = 0, depthIdle = 0; // depthIdle: depth bytes moved by passes none of whose draws used depth
+        struct Kind { uint64_t passes = 0, colourLoad = 0, depthLoad = 0, colourStore = 0, depthStore = 0, blitRead = 0, blitWrite = 0; };
+        std::map<std::string, Kind> kinds;
+        std::map<std::string, uint64_t> reads; // render targets read as sources (draw texture, reinterpret, Z, shuffle, CLUT)
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    } passModel;
+    void framebufferBytes(GLuint fb, uint64_t &colour, uint64_t &depth, std::string &kind) const
+    {
+        colour = depth = 0u;
+        kind = "fb?";
+        for (const RenderTarget &t : targets)
+            if (t.fbo == fb || t.colorFbo == fb)
+            {
+                colour = uint64_t(t.glW) * t.glH * 4u;
+                depth = t.fbo == fb && t.depth ? colour : 0u;
+                kind = "t" + std::to_string(t.fbp) + (depth ? "z" : "c");
+                return;
+            }
+        for (const auto &c : selfCopies)
+            if (c.second.fbo == fb)
+            {
+                colour = (c.first >> 32) * (c.first & 0xFFFFFFFFull) * 4u;
+                kind = "copy";
+                return;
+            }
+        for (const VerifyTarget &t : stashes)
+            if (t.fbo == fb)
+            {
+                colour = uint64_t(stashW) * stashH * 4u;
+                kind = "stash";
+                return;
+            }
+        if (fb == presentFbo)
+            colour = uint64_t(presentW) * presentH * 4u, kind = "present";
+        else if (fb == clutFbo)
+            colour = 256u * 4u, kind = "clut";
+    }
+    void notePasses()
+    {
+        PassModel &m = passModel;
+        if (!m.on)
+            return;
+        if (!m.started)
+        {
+            GSGL::RecordPasses(&m.passes);
+            m.started = true;
+            return;
+        }
+        ++m.frames;
+        std::string sequence; // this frame's passes: kind, ops (and *c / *z when it began with a clear)
+        for (const GSGL::PassRecord &p : m.passes)
+        {
+            uint64_t colour = 0, depth = 0;
+            std::string kind;
+            framebufferBytes(p.fb, colour, depth, kind);
+            sequence += " " + kind + (p.blitFrom ? "<blit" : "") + ":" + std::to_string(p.ops) + (depth ? "/d" + std::to_string(p.depthOps) : "") +
+                        ((p.firstClear & 1u) ? "*c" : "") + ((p.firstClear & 2u) ? "*z" : "");
+            if (depth && p.depthOps == 0u && !p.blitFrom)
+                m.depthIdle += 2u * depth;
+            if (p.blitFrom)
+            {
+                uint64_t srcColour = 0, srcDepth = 0;
+                std::string srcKind;
+                framebufferBytes(p.blitFrom, srcColour, srcDepth, srcKind);
+                PassModel::Kind &k = m.kinds["blit " + srcKind + ">" + kind];
+                ++k.passes;
+                k.blitRead += srcColour;
+                k.blitWrite += colour;
+                continue;
+            }
+            PassModel::Kind &k = m.kinds[kind];
+            ++k.passes;
+            k.colourLoad += (p.firstClear & 1u) ? 0u : colour;
+            k.depthLoad += (p.firstClear & 2u) ? 0u : depth;
+            k.colourStore += colour;
+            k.depthStore += depth;
+        }
+        m.passes.clear();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m.last < std::chrono::seconds(5) || m.frames == 0)
+            return;
+        m.last = now;
+        const double f = static_cast<double>(m.frames), mb = 1.0 / (1024.0 * 1024.0);
+        double total = 0.0, depthTotal = 0.0, passes = 0.0;
+        std::vector<std::pair<double, std::string>> rows;
+        for (const auto &kv : m.kinds)
+        {
+            const PassModel::Kind &k = kv.second;
+            const double bytes = static_cast<double>(k.colourLoad + k.depthLoad + k.colourStore + k.depthStore + k.blitRead + k.blitWrite);
+            total += bytes;
+            depthTotal += static_cast<double>(k.depthLoad + k.depthStore);
+            passes += static_cast<double>(k.passes);
+            char item[160];
+            std::snprintf(item, sizeof(item), " %s=%.1f/%.0fMB(cl%.0f dl%.0f cs%.0f ds%.0f)", kv.first.c_str(), k.passes / f, bytes * mb / f,
+                          k.colourLoad * mb / f, k.depthLoad * mb / f, k.colourStore * mb / f, k.depthStore * mb / f);
+            rows.emplace_back(bytes, item);
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        std::string line;
+        for (size_t i = 0; i < rows.size() && i < 12u; ++i)
+            line += rows[i].second;
+        std::fprintf(stderr, "[gs-passes] frames=%llu per_frame: passes=%.1f MB=%.0f depth_MB=%.0f depth_unused_MB=%.0f |%s\n",
+                     static_cast<unsigned long long>(m.frames), passes / f, total * mb / f, depthTotal * mb / f, m.depthIdle * mb / f, line.c_str());
+        m.depthIdle = 0;
+        std::fprintf(stderr, "[gs-passes-seq]%s\n", sequence.c_str());
+        std::string used;
+        for (const RenderTarget &t : targets)
+            used += " t" + std::to_string(t.fbp) + "=" + std::to_string(t.usedW) + "x" + std::to_string(t.usedH) + (t.depth ? "z" : "");
+        std::fprintf(stderr, "[gs-passes-used]%s\n", used.c_str());
+        std::string reads;
+        for (const auto &kv : m.reads)
+            reads += " " + kv.first + "=" + std::to_string(kv.second);
+        std::fprintf(stderr, "[gs-passes-reads]%s\n", reads.c_str());
+        m.reads.clear();
+        m.kinds.clear();
+        m.frames = 0;
     }
 
     RenderTarget *findTarget(uint32_t fbp)
@@ -5028,6 +5401,7 @@ void GSHwBackend::Reset()
 {
     Impl &d = *m_impl;
     d.flushPending();
+    d.flushDeferred();
     d.store.Reset();
     d.invertedZ.clear();
     for (auto &kv : d.textures)
@@ -5155,6 +5529,8 @@ bool GSHwBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     if (!d.ensure() || context.frame.fbw == 0u)
         return false;
     d.flushPending();
+    if (d.deferredFbp(context.frame.fbp))
+        d.flushDeferred();
     Impl::GpuSpan gpuSpan(d, Impl::GpuClear);
     const Api &g = d.gl();
     RenderTarget &rt = d.target(context.frame.fbp, context.frame.fbw);
@@ -5207,6 +5583,7 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
     static const bool timed = ps2_perf::countFrames();
     const auto t0 = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     d.flushPending();
+    d.flushDeferred(); // (the frame's Z-inversion draws, in one pass of their target)
     struct PresentTimer
     {
         Impl &d;
@@ -5281,6 +5658,7 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
     d.dumpAfterSkip = false;
     d.frameBatch = 0;
     d.reportStats();
+    d.notePasses();
     if (request.asyncReadback)
     {
         const auto shown = [&d](uint64_t dispfb) -> uint64_t

@@ -245,5 +245,17 @@ namespace GSGL
     uint64_t PipelineGeneration(); // changes whenever a part of the pipeline state does (this thread)
     uint64_t DrawFramebufferChanges(); // draw framebuffer binds that changed it (this thread, state cache on)
     void TraceFramebufferChanges(std::vector<uint32_t> *sink); // records them into sink (nullptr stops)
+    // GOW-Port: render passes as a tile-based GPU runs them (PS2X_GS_PASS_MODEL, tests): one record per run of draws,
+    // clears and blits into the same draw framebuffer; a blit is a pass of its own
+    struct PassRecord
+    {
+        GLuint fb = 0;
+        uint32_t ops = 0;
+        uint8_t firstClear = 0; // the pass began with a full clear: bit 0 colour, bit 1 depth (nothing to load)
+        GLuint blitFrom = 0;    // a blit pass: its source framebuffer
+        uint32_t depthOps = 0;  // draws that tested or wrote depth (NoteDepthDraw before them)
+    };
+    void RecordPasses(std::vector<PassRecord> *sink); // appends finished passes to sink (nullptr stops)
+    void NoteDepthDraw(); // the next draw tests or writes depth (pass model)
     bool CurrentDrawFramebuffer(GLuint &fb); // false: not known (state cache not installed)
 }

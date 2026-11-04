@@ -86,6 +86,10 @@ namespace GSGL
         // draw framebuffer changes (each one ends a render pass on a tile-based GPU), for GOW_GS_HW_STATS
         thread_local uint64_t t_drawFbChanges = 0;
         thread_local std::vector<uint32_t> *t_fbTrace = nullptr; // PS2X_GS_FBTRACE: the framebuffers switched to, in order
+        thread_local std::vector<PassRecord> *t_passSink = nullptr; // PS2X_GS_PASS_MODEL: finished render passes
+        thread_local PassRecord t_pass;
+        thread_local bool t_passOpen = false;
+        thread_local uint32_t t_pendingDepth = 0;
 
         struct Verify
         {
@@ -383,6 +387,66 @@ namespace GSGL
             g_real.DeleteBuffers(n, names);
         }
 
+        // PS2X_GS_PASS_MODEL: GPU work into the current draw framebuffer (a new pass when it is not the open pass's)
+        void closePass()
+        {
+            if (t_passOpen && t_passSink)
+                t_passSink->push_back(t_pass);
+            t_passOpen = false;
+        }
+        void passWork(uint8_t fullClear)
+        {
+            const GLuint fb = t_state.drawFb.value[0];
+            if (t_passOpen && t_pass.fb != fb)
+                closePass();
+            if (!t_passOpen)
+            {
+                t_pass = {};
+                t_pass.fb = fb;
+                t_pass.firstClear = fullClear;
+                t_passOpen = true;
+            }
+            ++t_pass.ops;
+            t_pass.depthOps += t_pendingDepth;
+            t_pendingDepth = 0;
+        }
+        void drawArrays(GLenum mode, GLint first, GLsizei count)
+        {
+            if (t_passSink)
+                passWork(0);
+            g_real.DrawArrays(mode, first, count);
+        }
+        void clear(GLbitfield mask)
+        {
+            if (t_passSink)
+            {
+                // full: no scissor, every channel written (else it is a partial draw and the old contents are kept)
+                const bool noScissor = t_state.caps[2].known && t_state.caps[2].value[0] == 0;
+                const auto &cm = t_state.colorMask;
+                const bool allColour = cm.known && cm.value[0] && cm.value[1] && cm.value[2] && cm.value[3];
+                const bool depthWritten = t_state.depthMask.known && t_state.depthMask.value[0];
+                const uint8_t full = noScissor ? static_cast<uint8_t>(((mask & 0x4000u) && allColour ? 1u : 0u) |
+                                                                      ((mask & 0x0100u) && depthWritten ? 2u : 0u))
+                                               : 0u;
+                passWork(full);
+            }
+            g_real.Clear(mask);
+        }
+        void blitFramebuffer(GLint a, GLint b, GLint c, GLint d, GLint e, GLint f, GLint h, GLint i, GLbitfield mask, GLenum filter)
+        {
+            if (t_passSink)
+            {
+                closePass();
+                t_pass = {};
+                t_pass.fb = t_state.drawFb.value[0];
+                t_pass.ops = 1;
+                t_pass.blitFrom = t_state.readFb.value[0];
+                t_passOpen = true;
+                closePass();
+            }
+            g_real.BlitFramebuffer(a, b, c, d, e, f, h, i, mask, filter);
+        }
+
         void setUpVerify()
         {
             const char *setting = std::getenv("PS2X_GS_STATE_CACHE_VERIFY");
@@ -433,6 +497,24 @@ namespace GSGL
         wrap(api.DeleteFramebuffers, &deleteFramebuffers);
         wrap(api.DeleteVertexArrays, &deleteVertexArrays);
         wrap(api.DeleteBuffers, &deleteBuffers);
+        static const bool passModel = [] { const char *v = std::getenv("PS2X_GS_PASS_MODEL"); return v && *v == '1'; }();
+        if (passModel)
+        {
+            wrap(api.DrawArrays, &drawArrays);
+            wrap(api.Clear, &clear);
+            wrap(api.BlitFramebuffer, &blitFramebuffer);
+        }
+    }
+
+    void NoteDepthDraw()
+    {
+        t_pendingDepth = 1;
+    }
+    void RecordPasses(std::vector<PassRecord> *sink)
+    {
+        if (!sink)
+            closePass();
+        t_passSink = sink;
     }
 
     void SetStateCacheEnabled(bool enabled)
