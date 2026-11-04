@@ -107,6 +107,10 @@ public:
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
+    // GOW-Port: save states (ps2_savestate.h): the GS registers and vertex queue, GS memory and the backend's state
+    // (render targets), with everything queued before drawn first. The privileged registers live in PS2Memory.
+    bool saveState(ps2_state::Writer &w);
+    bool loadState(ps2_state::Reader &r);
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, GifPathId path = GifPathId::Path1);

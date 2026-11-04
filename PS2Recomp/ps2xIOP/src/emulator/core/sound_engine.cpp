@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "sound_engine.h"
 
 #include <algorithm>
@@ -723,5 +724,45 @@ namespace ps2x::iop::detail
             }
         }
         return frames;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void SoundEngine::saveState(ps2_state::Writer &w, const uint8_t *ramBase) const
+    {
+        w.begin("SPU2");
+        w.block(m_ram.data(), m_ram.size() * sizeof(uint16_t));
+        w.pod(m_cores);
+        for (const StreamRing &s : m_stream)
+        {
+            w.u32(s.base ? static_cast<uint32_t>(s.base - ramBase) : UINT32_MAX);
+            w.u32(s.size), w.u32(s.position), w.boolean(s.active), w.boolean(s.loop);
+        }
+        w.pod(m_streamHalf), w.pod(m_resamplePhase), w.u64(m_lastCycle), w.u64(m_lastPollCycle), w.u64(m_maxAdvance);
+        w.pod(m_blockHash);
+        w.end();
+    }
+
+    bool SoundEngine::loadState(ps2_state::Reader &r, const uint8_t *ramBase)
+    {
+        if (!r.begin("SPU2"))
+            return false;
+        r.block(m_ram.data(), m_ram.size() * sizeof(uint16_t));
+        r.pod(m_cores);
+        for (StreamRing &s : m_stream)
+        {
+            const uint32_t offset = r.u32();
+            s.base = offset == UINT32_MAX ? nullptr : ramBase + offset;
+            s.size = r.u32(), s.position = r.u32(), s.active = r.boolean(), s.loop = r.boolean();
+        }
+        r.pod(m_streamHalf), r.pod(m_resamplePhase);
+        m_lastCycle = r.u64(), m_lastPollCycle = r.u64(), m_maxAdvance = r.u64();
+        r.pod(m_blockHash);
+        {
+            std::lock_guard<std::mutex> lock(m_outputMutex);
+            m_output.clear(); // (samples of the old timeline not yet played)
+        }
+        return r.end();
     }
 }

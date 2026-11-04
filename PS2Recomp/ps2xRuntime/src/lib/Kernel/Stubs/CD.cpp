@@ -1,3 +1,4 @@
+#include "runtime/ps2_state_io.h"
 #include "Common.h"
 #include "CD.h"
 #include "MPEG.h"
@@ -986,4 +987,24 @@ namespace ps2_stubs
         }
         setReturnS32(ctx, 1);
     }
+}
+
+// GOW-Port: save states (Syscalls/KernelState.cpp): the EE-side CD stub's mode and stream position (the file index is
+// rebuilt from the disc)
+void ps2CdSaveState(ps2_state::Writer &w)
+{
+    w.begin("CDST");
+    w.pod(g_lastCdError), w.u32(g_cdMode), w.u32(g_cdStreamingLbn), w.u32(g_cdStreamingEndLbn), w.boolean(g_cdInitialized);
+    w.pod(ps2_stubs::g_cdStreamTiming);
+    w.end();
+}
+
+bool ps2CdLoadState(ps2_state::Reader &r)
+{
+    if (!r.begin("CDST"))
+        return false;
+    r.pod(g_lastCdError);
+    g_cdMode = r.u32(), g_cdStreamingLbn = r.u32(), g_cdStreamingEndLbn = r.u32(), g_cdInitialized = r.boolean();
+    r.pod(ps2_stubs::g_cdStreamTiming);
+    return r.end();
 }

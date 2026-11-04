@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/state_io.h"
 #include "ps2x/iop/iop_types.h"
 
 #include <cstdint>
@@ -28,6 +29,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool isLoaded(std::span<const std::string_view> aliases) const;
         [[nodiscard]] bool recognizes(std::string_view path) const;
 
+        // GOW-Port: save states (ps2_savestate.h)
+        void saveState(ps2_state::Writer &w) const;
+        bool loadState(ps2_state::Reader &r);
     private:
         struct Record
         {

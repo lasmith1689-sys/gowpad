@@ -6,6 +6,12 @@
 #include <functional>
 #include <vector>
 
+namespace ps2_state
+{
+    class Writer;
+    class Reader;
+}
+
 enum class GifPathId : uint8_t
 {
     Path1 = 1,
@@ -42,6 +48,10 @@ public:
 
     void drain();
     bool empty() const { return m_queue.empty(); }
+
+    // GOW-Port: save states (ps2_savestate.h): queued packets and the PATH3 tag tracking
+    void saveState(ps2_state::Writer &w) const;
+    bool loadState(ps2_state::Reader &r);
 
 private:
     ProcessPathPacketFn m_processFn;

@@ -1,4 +1,6 @@
 // GOW-Port: enlaces manuales para God of War (SCUS-97399).
+#include "runtime/ps2_savestate.h"
+#include "runtime/ps2_state_io.h"
 #include "runtime/ee_scheduler.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -2621,6 +2623,25 @@ namespace
 
     void applyGowOverrides(PS2Runtime &runtime)
     {
+        // GOW-Port: save states: the libpad2 sockets (opened once at boot) and the operator new block table
+        ps2_savestate::registerExtraState("GOWO", [](ps2_state::Writer &w) {
+            w.begin("GOWO");
+            w.pod(g_padSockets);
+            std::vector<std::pair<uint32_t, uint32_t>> blocks; // address -> live | freedBy << 1
+            for (const auto &kv : heap_guard::blocks)
+                blocks.emplace_back(kv.first, (kv.second.live ? 1u : 0u) | (kv.second.freedBy << 1));
+            std::sort(blocks.begin(), blocks.end());
+            w.pairs(blocks);
+            w.end();
+        }, [](ps2_state::Reader &r) {
+            if (!r.begin("GOWO"))
+                return false;
+            r.pod(g_padSockets);
+            heap_guard::blocks.clear();
+            for (const auto &kv : r.pairs<uint32_t, uint32_t>())
+                heap_guard::blocks[kv.first] = heap_guard::Block{(kv.second & 1u) != 0u, kv.second >> 1};
+            return r.end();
+        });
         // GOW-Port: GOW_THREAD_WATCH=<s> (debug): every <s> seconds a host thread prints the EE threads (status, wait,
         // pc, ra) from the scheduler's snapshot, so a guest that blocks for good (no frames, no pad polls, where
         // GOW_THREAD_DUMP never fires) still shows where each thread waits

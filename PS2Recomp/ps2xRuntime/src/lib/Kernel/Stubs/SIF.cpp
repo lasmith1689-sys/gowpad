@@ -1,3 +1,4 @@
+#include "runtime/ps2_state_io.h"
 #include "Common.h"
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
@@ -844,4 +845,46 @@ namespace ps2_stubs
     {
         setReturnS32(ctx, 0);
     }
+}
+
+// GOW-Port: save states (Syscalls/KernelState.cpp)
+void ps2SifSaveState(ps2_state::Writer &w)
+{
+    using namespace ps2_stubs;
+    w.begin("SIFS");
+    {
+        std::lock_guard<std::mutex> lock(g_sifDmaTransferMutex);
+        w.u32(g_nextSifDmaTransferId);
+    }
+    std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+    const auto sortedMap = [](const auto &map) {
+        std::vector<std::pair<uint32_t, typename std::decay_t<decltype(map)>::mapped_type>> v(map.begin(), map.end());
+        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+        return v;
+    };
+    w.pairs(sortedMap(g_sifRegs));
+    w.pairs(sortedMap(g_sifSregs));
+    w.pairs(sortedMap(g_sifCmdHandlers));
+    w.u32(g_sifCmdBuffer), w.u32(g_sifSysCmdBuffer), w.boolean(g_sifCmdInitialized);
+    w.end();
+}
+
+bool ps2SifLoadState(ps2_state::Reader &r)
+{
+    using namespace ps2_stubs;
+    if (!r.begin("SIFS"))
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(g_sifDmaTransferMutex);
+        g_nextSifDmaTransferId = r.u32();
+    }
+    std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+    const auto regs = r.pairs<uint32_t, uint32_t>();
+    const auto sregs = r.pairs<uint32_t, uint32_t>();
+    const auto handlers = r.pairs<uint32_t, SifCmdHandler>();
+    g_sifRegs = {regs.begin(), regs.end()};
+    g_sifSregs = {sregs.begin(), sregs.end()};
+    g_sifCmdHandlers = {handlers.begin(), handlers.end()};
+    g_sifCmdBuffer = r.u32(), g_sifSysCmdBuffer = r.u32(), g_sifCmdInitialized = r.boolean();
+    return r.end();
 }

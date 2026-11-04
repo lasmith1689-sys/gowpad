@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_cdvd.h"
 
 #include "../core/iop_cpu.h"
@@ -159,6 +160,7 @@ namespace ps2x::iop::detail
     class IopCdvd::Impl
     {
     public:
+        friend class IopCdvd; // (save states read and restore its fields)
         struct Callback
         {
             uint32_t address = 0u;
@@ -797,5 +799,41 @@ namespace ps2x::iop::detail
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
     {
         return m_impl->takeCompletionCallback();
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    // (the disc stays open; the virtual ISO tables are built from it)
+    void IopCdvd::saveState(ps2_state::Writer &w) const
+    {
+        const Impl &d = *m_impl;
+        w.begin("ICDV");
+        w.pod(d.callback);
+        w.boolean(d.completionCallback.has_value());
+        if (d.completionCallback)
+            w.pod(*d.completionCallback);
+        w.boolean(d.initialized), w.u32(d.mediaMode), w.u32(d.currentLsn), w.u32(d.lastError), w.u32(d.streamFlag);
+        w.u32(d.lastReadTimeout), w.pod(d.interruptEventFlagId);
+        w.end();
+    }
+
+    bool IopCdvd::loadState(ps2_state::Reader &r)
+    {
+        Impl &d = *m_impl;
+        if (!r.begin("ICDV"))
+            return false;
+        r.pod(d.callback);
+        d.completionCallback.reset();
+        if (r.boolean())
+        {
+            CompletionCallback c{};
+            r.pod(c);
+            d.completionCallback = c;
+        }
+        d.initialized = r.boolean(), d.mediaMode = r.u32(), d.currentLsn = r.u32(), d.lastError = r.u32(), d.streamFlag = r.u32();
+        d.lastReadTimeout = r.u32();
+        r.pod(d.interruptEventFlagId);
+        return r.end();
     }
 }

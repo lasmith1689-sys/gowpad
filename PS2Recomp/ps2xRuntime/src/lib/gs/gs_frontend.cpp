@@ -6,6 +6,7 @@
 #include "ps2_log.h"
 #include "runtime/ps2_perf.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_state_io.h"
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -2147,4 +2148,66 @@ void GS::updatePreferredDisplaySourceForDraw(const GSDrawState &state, const GSP
         m_preferredDisplayDestFbp = ctx.frame.fbp;
         m_hasPreferredDisplaySource = true;
     }
+}
+
+// GOW-Port: save states. Called on the EE executor at a safe point with the VIF1/GIF worker drained (no packet in
+// flight into the GS). The backend's section comes first: SaveState runs on its thread after everything queued, so GS
+// memory (which that thread writes when it stores uploads) is complete when it is copied after it.
+bool GS::saveState(ps2_state::Writer &w)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    flushRun();
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        if (!m_backend || !m_backend->SaveState(w))
+            return false;
+    }
+    w.begin("GSFE");
+    w.block(m_localMemoryStorage, m_localMemorySize);
+    w.pod(m_gifInput);
+    w.pod(m_ctx);
+    w.pod(m_prim), w.pod(m_primRegister), w.pod(m_prmodeRegister);
+    w.pod(m_curR), w.pod(m_curG), w.pod(m_curB), w.pod(m_curA);
+    w.pod(m_curQ), w.pod(m_packedStQ), w.pod(m_curS), w.pod(m_curT), w.pod(m_curU), w.pod(m_curV);
+    w.pod(m_curFog), w.pod(m_fogR), w.pod(m_fogG), w.pod(m_fogB);
+    w.boolean(m_prmodecont), w.boolean(m_pabe);
+    w.u64(m_scanmsk), w.u64(m_dimx), w.u64(m_dthe), w.u64(m_colclamp);
+    w.pod(m_texa), w.pod(m_texclut);
+    w.pod(m_bitbltbuf), w.pod(m_trxpos), w.pod(m_trxreg), w.u32(m_trxdir);
+    w.pod(m_vtxQueue), w.pod(m_vtxCount), w.pod(m_vtxIndex);
+    w.pod(m_preferredDisplaySourceFrame), w.u32(m_preferredDisplayDestFbp), w.boolean(m_hasPreferredDisplaySource);
+    w.end();
+    return true;
+}
+
+bool GS::loadState(ps2_state::Reader &r)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    flushRun();
+    {
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        if (!m_backend || !m_backend->LoadState(r))
+            return false;
+    }
+    if (!r.begin("GSFE"))
+        return false;
+    r.block(m_localMemoryStorage, m_localMemorySize);
+    r.pod(m_gifInput);
+    r.pod(m_ctx);
+    r.pod(m_prim), r.pod(m_primRegister), r.pod(m_prmodeRegister);
+    r.pod(m_curR), r.pod(m_curG), r.pod(m_curB), r.pod(m_curA);
+    r.pod(m_curQ), r.pod(m_packedStQ), r.pod(m_curS), r.pod(m_curT), r.pod(m_curU), r.pod(m_curV);
+    r.pod(m_curFog), r.pod(m_fogR), r.pod(m_fogG), r.pod(m_fogB);
+    m_prmodecont = r.boolean(), m_pabe = r.boolean();
+    m_scanmsk = r.u64(), m_dimx = r.u64(), m_dthe = r.u64(), m_colclamp = r.u64();
+    r.pod(m_texa), r.pod(m_texclut);
+    r.pod(m_bitbltbuf), r.pod(m_trxpos), r.pod(m_trxreg);
+    m_trxdir = r.u32();
+    r.pod(m_vtxQueue), r.pod(m_vtxCount), r.pod(m_vtxIndex);
+    r.pod(m_preferredDisplaySourceFrame);
+    m_preferredDisplayDestFbp = r.u32();
+    m_hasPreferredDisplaySource = r.boolean();
+    ++m_stateSerial; // (the next draw rebuilds its state)
+    m_run.clear();
+    return r.end();
 }

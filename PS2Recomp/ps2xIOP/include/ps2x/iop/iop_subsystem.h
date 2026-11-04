@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/state_io.h"
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
 
@@ -53,6 +54,11 @@ namespace ps2x::iop
         // host. Si hay mas de maxLatencyFrames acumulados, se descartan los mas antiguos.
         size_t drainAudio(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames = SIZE_MAX);
 
+        // GOW-Port: save states (ps2_savestate.h): the whole IOP (RAM, kernel objects, modules, sound engine, RPC, timers,
+        // CDVD position); the memory card images are not part of a state. quiescent(): no IOP code is running.
+        [[nodiscard]] bool quiescent() const noexcept;
+        void saveState(ps2_state::Writer &w) const;
+        bool loadState(ps2_state::Reader &r);
     private:
         class Impl;
         std::unique_ptr<Impl> m_impl;

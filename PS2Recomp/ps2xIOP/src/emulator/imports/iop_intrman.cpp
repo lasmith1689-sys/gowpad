@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_intrman.h"
 
 #include "../core/iop_cpu.h"
@@ -109,5 +110,42 @@ namespace ps2x::iop::detail
                                                       handler->second.gp,
                                                       100000u);
         return true;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopIntrman::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("IINT");
+        w.u32(static_cast<uint32_t>(m_handlers.size()));
+        for (const auto &kv : m_handlers)
+            w.pod(kv.first), w.pod(kv.second);
+        w.u32(static_cast<uint32_t>(m_enabled.size()));
+        for (const auto &kv : m_enabled)
+            w.pod(kv.first), w.boolean(kv.second);
+        w.end();
+    }
+
+    bool IopIntrman::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("IINT"))
+            return false;
+        m_handlers.clear();
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            int irq = 0;
+            Handler h{};
+            r.pod(irq), r.pod(h);
+            m_handlers[irq] = h;
+        }
+        m_enabled.clear();
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            int irq = 0;
+            r.pod(irq);
+            m_enabled[irq] = r.boolean();
+        }
+        return r.end();
     }
 }

@@ -338,3 +338,27 @@ namespace ps2x::iop
         return snapshot;
     }
 }
+
+namespace ps2x::iop
+{
+    bool IopSubsystem::quiescent() const noexcept
+    {
+        return m_impl->emulator.quiescent();
+    }
+
+    void IopSubsystem::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("IOPS");
+        m_impl->moduleManager.saveState(w);
+        m_impl->emulator.saveState(w);
+        w.end();
+    }
+
+    bool IopSubsystem::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("IOPS") || !m_impl->moduleManager.loadState(r) || !m_impl->emulator.loadState(r) || !r.end())
+            return false;
+        m_impl->rebuildRoutes();
+        return true;
+    }
+}

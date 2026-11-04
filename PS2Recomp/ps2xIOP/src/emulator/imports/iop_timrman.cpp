@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_timrman.h"
 
 #include "../core/iop_cpu.h"
@@ -472,5 +473,24 @@ namespace ps2x::iop::detail
             next = std::min(next, timer.overflowCycle);
         }
         return next;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopTimrman::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("ITIM");
+        w.pod(m_timers), w.u32(m_holdMode), w.boolean(m_servicing);
+        w.end();
+    }
+
+    bool IopTimrman::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("ITIM"))
+            return false;
+        r.pod(m_timers);
+        m_holdMode = r.u32(), m_servicing = r.boolean();
+        return r.end();
     }
 }

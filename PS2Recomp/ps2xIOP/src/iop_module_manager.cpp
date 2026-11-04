@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_module_manager.h"
 
 #include "ps2x/iop/ps2_path.h"
@@ -176,5 +177,66 @@ namespace ps2x::iop::detail
             --found->second;
         else
             m_loadedKeyReferences.erase(found);
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopModuleManager::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("IMOD");
+        std::vector<std::pair<int32_t, const Record *>> records;
+        for (const auto &kv : m_records)
+            records.emplace_back(kv.first, &kv.second);
+        std::sort(records.begin(), records.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+        w.u32(static_cast<uint32_t>(records.size()));
+        for (const auto &[id, rec] : records)
+            w.pod(id), w.string(rec->key), w.u32(rec->references), w.boolean(rec->physical);
+        w.u32(static_cast<uint32_t>(m_hleIdsByKey.size()));
+        for (const auto &kv : m_hleIdsByKey)
+            w.string(kv.first), w.pod(kv.second);
+        w.u32(static_cast<uint32_t>(m_loadedKeyReferences.size()));
+        for (const auto &kv : m_loadedKeyReferences)
+            w.string(kv.first), w.u32(kv.second);
+        w.pod(m_nextHleId);
+        w.end();
+    }
+
+    bool IopModuleManager::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("IMOD"))
+            return false;
+        std::unordered_map<int32_t, Record> records;
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            int32_t id = 0;
+            r.pod(id);
+            Record rec;
+            rec.key = r.string(), rec.references = r.u32(), rec.physical = r.boolean();
+            records.emplace(id, std::move(rec));
+        }
+        std::unordered_map<std::string, int32_t> ids;
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            std::string key = r.string();
+            int32_t id = 0;
+            r.pod(id);
+            ids.emplace(std::move(key), id);
+        }
+        std::unordered_map<std::string, uint32_t> refs;
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            std::string key = r.string();
+            refs.emplace(std::move(key), r.u32());
+        }
+        int32_t next = 0;
+        r.pod(next);
+        if (!r.end())
+            return false;
+        m_records = std::move(records);
+        m_hleIdsByKey = std::move(ids);
+        m_loadedKeyReferences = std::move(refs);
+        m_nextHleId = next;
+        return true;
     }
 }

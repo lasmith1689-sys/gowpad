@@ -7,6 +7,16 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ps2_state
+{
+    class Writer;
+    class Reader;
+}
+
+// GOW-Port: save states: the native IRX overrides' own state (SIO2 control latch, LIBSD transfer handlers)
+void iopNativeOverridesSave(ps2_state::Writer &w);
+bool iopNativeOverridesLoad(ps2_state::Reader &r);
+
 namespace ps2x::iop
 {
     class IopHost;

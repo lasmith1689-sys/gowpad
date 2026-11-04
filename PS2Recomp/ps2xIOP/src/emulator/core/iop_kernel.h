@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/state_io.h"
 #include "iop_cpu.h"
 
 #include <cstddef>
@@ -82,6 +83,9 @@ namespace ps2x::iop::detail
             return false;
         }
 
+        // GOW-Port: save states (ps2_savestate.h)
+        void saveState(ps2_state::Writer &w) const;
+        bool loadState(ps2_state::Reader &r);
     private:
         struct Semaphore
         {

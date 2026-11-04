@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <vector>
 
+namespace ps2_state
+{
+    class Writer;
+    class Reader;
+}
+
 class GSRasterBackend
 {
 public:
@@ -48,4 +54,9 @@ public:
     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
+
+    // GOW-Port: save states (ps2_savestate.h): the backend's own state beyond GS memory (render targets on the GPU,
+    // CLUT, transfer progress), written / restored on the thread that renders. false: not supported.
+    virtual bool SaveState(ps2_state::Writer &) { return false; }
+    virtual bool LoadState(ps2_state::Reader &) { return false; }
 };

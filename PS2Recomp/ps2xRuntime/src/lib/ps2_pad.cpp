@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include "runtime/ps2_pause_menu.h"
 #if defined(PS2X_IOS)
 #include "runtime/ps2_touch_pad.h"
 #endif
@@ -164,6 +165,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
 #endif
     }
 
+    // GOW-Port: the pause menu takes the controls while it is open (and its closing press must not reach the game)
+    if (ps2_pause_menu::isOpen())
+    {
+        btns = 0xFFFFu;
+        data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+    }
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
 

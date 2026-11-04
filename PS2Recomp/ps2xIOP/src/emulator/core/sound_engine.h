@@ -8,6 +8,7 @@
 // DSP algorithms as in PCSX2 (pcsx2/SPU2) and psx-spx (ADPCM / ADSR are the same as on the PS1). Reverb: parameters
 // stored, not mixed yet. docs/native-port.md (step 3), docs/sound.md.
 
+#include "ps2x/state_io.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -64,6 +65,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] size_t pendingFrames() const;
         size_t drainOutput(int16_t *stereo, size_t maxFrames, size_t maxLatencyFrames = SIZE_MAX);
 
+        // GOW-Port: save states (ps2_savestate.h); the stream rings are stored as offsets into IOP RAM (ramBase)
+        void saveState(ps2_state::Writer &w, const uint8_t *ramBase) const;
+        bool loadState(ps2_state::Reader &r, const uint8_t *ramBase);
     private:
         struct Voice
         {

@@ -13,8 +13,15 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <string>
 #include <variant>
 #include <vector>
+
+namespace ps2_state
+{
+    class Writer;
+    class Reader;
+}
 
 // This exception is the EE equivalent of a longjmp to the dispatcher.  It is
 // not an error and must only be caught at EeScheduler::run().
@@ -74,11 +81,26 @@ using EeWaitPayload = std::variant<std::monostate,
                                    EeVSyncWait,
                                    EeExternalWait>;
 
+// GOW-Port: save states (ps2_savestate.h): what a completion function does, as data, so a waiting thread can be saved
+// and its completion made again on load. kind 0 = not describable: no state is saved while such a completion waits.
+struct EeContinuation
+{
+    enum Kind : uint32_t
+    {
+        Unknown = 0,
+        SetPc = 1,     // context.pc = arg
+        GuestFree = 2, // runtime.guestFree(arg)
+    };
+    uint32_t kind = Unknown;
+    uint32_t arg = 0;
+};
+
 struct EeWaitState
 {
     EeWaitReason reason = EeWaitReason::None;
     EeWaitPayload payload{};
     std::function<void(R5900Context &)> completion;
+    EeContinuation completionKind{}; // (save states: what completion does)
 };
 
 enum class GuestInvocationKind : uint8_t
@@ -100,6 +122,7 @@ struct GuestInvocation
     uint64_t tag = 0;
     R5900Context context{};
     std::function<void(const R5900Context &, R5900Context &)> onComplete;
+    EeContinuation onCompleteKind{}; // (save states: what onComplete does)
 };
 
 struct GuestThread
@@ -122,6 +145,7 @@ struct GuestThread
     uint32_t tlsBase = 0;
     EeWaitState wait{};
     std::function<void(R5900Context &)> resumeCompletion;
+    EeContinuation resumeKind{}; // (save states: what resumeCompletion does)
     std::vector<GuestInvocation> invocations;
 
     [[nodiscard]] R5900Context &activeContext()
@@ -351,7 +375,8 @@ public:
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
-    [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {},
+                                EeContinuation describe = {});
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
@@ -374,6 +399,17 @@ public:
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
     void publishSnapshot();
+
+    // GOW-Port: save states, on the executor at a safe point (run(): no guest code on the stack). canSaveState: every
+    // completion function waiting is describable (EeContinuation); else why not. Host deadlines are stored relative to
+    // now and laid out from now on load; shiftHostDeadlines moves them after a pause.
+    [[nodiscard]] bool canSaveState(std::string &why) const;
+    // (host deadlines relative to `stopped`: when the guest stopped, e.g. the pause menu opening)
+    void saveState(ps2_state::Writer &w, std::chrono::steady_clock::time_point stopped) const;
+    bool loadState(ps2_state::Reader &r);
+    void shiftHostDeadlines(std::chrono::steady_clock::duration by);
+    // the VBlank pacing's host-time statics (catch-up anchor, stall hold) start over at the next field
+    void resyncHostPacing() { m_pacingResync.store(true, std::memory_order_release); }
 
 private:
     struct ScheduledEvent
@@ -469,6 +505,7 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    std::atomic<bool> m_pacingResync{false}; // (resyncHostPacing)
     bool checkpointDueFull(uint32_t cycles) noexcept;
     uint64_t quietCycles() const noexcept;
 

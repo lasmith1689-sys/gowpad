@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/state_io.h"
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -33,6 +34,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] int32_t setRebootTimeLibraryHandlingMode(uint32_t address, uint32_t mode);
         void eraseRange(uint32_t base, uint32_t size);
 
+        // GOW-Port: save states (ps2_savestate.h)
+        void saveState(ps2_state::Writer &w) const;
+        bool loadState(ps2_state::Reader &r);
     private:
         struct ExportLibrary
         {

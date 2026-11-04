@@ -662,6 +662,27 @@ GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
     return result;
 }
 
+// GOW-Port: save states: on the GL thread, after everything queued before them (RunOnWorker drains the queue first)
+bool GSThreadedBackend::SaveState(ps2_state::Writer &w)
+{
+    bool result = false;
+    RunOnWorker([&] { result = m_inner->SaveState(w); });
+    return result;
+}
+
+bool GSThreadedBackend::LoadState(ps2_state::Reader &r)
+{
+    bool result = false;
+    RunOnWorker([&] { result = m_inner->LoadState(r); });
+    {
+        std::lock_guard<std::mutex> lock(m_frameMutex);
+        m_lastFrame = {}; // (a RAM frame read back before the load)
+    }
+    std::lock_guard<std::mutex> lock(m_producerMutex);
+    m_drawStateValid = false; // (the next batch sends its full draw state)
+    return result;
+}
+
 bool GSThreadedBackend::ExportState(GSBackendState &out)
 {
     bool result = false;

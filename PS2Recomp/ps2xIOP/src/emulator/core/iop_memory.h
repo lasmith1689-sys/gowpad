@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/state_io.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -149,6 +150,9 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept { return address & 0x1FFFFFFFu; }
 
+        // GOW-Port: save states (ps2_savestate.h)
+        void saveState(ps2_state::Writer &w) const;
+        bool loadState(ps2_state::Reader &r);
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);

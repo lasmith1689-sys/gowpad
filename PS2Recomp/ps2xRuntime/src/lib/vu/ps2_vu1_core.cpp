@@ -1,5 +1,6 @@
 #include <chrono>
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_state_io.h"
 #include "runtime/ps2_vu1_native.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
@@ -2462,3 +2463,53 @@ void ps2Vu1ReloadEnvironmentOptions()
 }
 
 #include "ps2_vu1_native.inl"
+
+// GOW-Port: save states
+void VU1Interpreter::saveState(ps2_state::Writer &w) const
+{
+    w.begin("VUNT");
+    w.pod(m_unit);
+    w.pod(m_state);
+    w.pod(m_flagPipeline), w.pod(m_fdiv), w.pod(m_efu), w.pod(m_storePipeline), w.pod(m_vfWritePipeline);
+    w.pod(m_viWritePipeline), w.pod(m_accWritePipeline);
+    w.u32(m_storePending), w.u32(m_vfPending), w.u32(m_viPending), w.u32(m_accPending);
+    w.u32(m_flagHead), w.u32(m_flagCount);
+    w.pod(m_xgkick);
+    w.pod(m_vfReady), w.pod(m_viReady), w.pod(m_accReady), w.pod(m_vfLatestWrite), w.pod(m_viLatestWrite), w.pod(m_accLatestWrite);
+    w.u64(m_cycle), w.u64(m_nextWriteSequence), w.u64(m_efuResourceReady), w.u64(m_nextCommitCycle);
+    w.u32(m_workingClip), w.u32(m_currentUpperInstruction), w.pod(m_viBranchBackupValue), w.pod(m_viBranchBackupReg);
+    w.boolean(m_viBranchBackupValid), w.u32(m_activeVuDataSize);
+    w.boolean(m_stopRequested), w.boolean(m_pendingHaltD), w.boolean(m_pendingHaltT), w.boolean(m_lastRunHitBudget);
+    w.boolean(m_statusUnread), w.boolean(m_statusQuiet), w.boolean(m_directRegisterWrites);
+    w.end();
+}
+
+bool VU1Interpreter::loadState(ps2_state::Reader &r)
+{
+    if (!r.begin("VUNT"))
+        return false;
+    Unit unit{};
+    r.pod(unit);
+    if (unit != m_unit)
+        r.fail("VU unit");
+    r.pod(m_state);
+    r.pod(m_flagPipeline), r.pod(m_fdiv), r.pod(m_efu), r.pod(m_storePipeline), r.pod(m_vfWritePipeline);
+    r.pod(m_viWritePipeline), r.pod(m_accWritePipeline);
+    m_storePending = r.u32(), m_vfPending = r.u32(), m_viPending = r.u32(), m_accPending = r.u32();
+    m_flagHead = r.u32(), m_flagCount = r.u32();
+    r.pod(m_xgkick);
+    r.pod(m_vfReady), r.pod(m_viReady), r.pod(m_accReady), r.pod(m_vfLatestWrite), r.pod(m_viLatestWrite), r.pod(m_accLatestWrite);
+    m_cycle = r.u64(), m_nextWriteSequence = r.u64(), m_efuResourceReady = r.u64(), m_nextCommitCycle = r.u64();
+    m_workingClip = r.u32(), m_currentUpperInstruction = r.u32();
+    r.pod(m_viBranchBackupValue), r.pod(m_viBranchBackupReg);
+    m_viBranchBackupValid = r.boolean();
+    m_activeVuDataSize = r.u32();
+    m_stopRequested = r.boolean(), m_pendingHaltD = r.boolean(), m_pendingHaltT = r.boolean(), m_lastRunHitBudget = r.boolean();
+    m_statusUnread = r.boolean(), m_statusQuiet = r.boolean(), m_directRegisterWrites = r.boolean();
+    // (programs decoded / compiled from the old micro memory)
+    m_decodedCodeCacheValid = false;
+    m_cachedCodeSize = 0;
+    m_cachedCodeGeneration = 0;
+    m_compiledGeneration = ~0ull;
+    return r.end();
+}

@@ -3060,3 +3060,10 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 }
+
+// GOW-Port: save states are refused while a movie plays (its decoder is host state)
+bool ps2MpegPlaying()
+{
+    std::lock_guard<std::mutex> lock(ps2_stubs::g_mpeg_stub_mutex);
+    return !ps2_stubs::g_mpeg_stub_state.playbackByMpeg.empty();
+}

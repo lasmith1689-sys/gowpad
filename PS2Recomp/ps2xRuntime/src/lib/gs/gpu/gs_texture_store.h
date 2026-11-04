@@ -9,6 +9,7 @@
 
 #include "runtime/gs/gs_types.h"
 #include "runtime/gs/gs_upload24.h"
+#include "runtime/ps2_state_io.h"
 
 #include <array>
 #include <cstdint>
@@ -43,6 +44,10 @@ public:
     uint32_t Read(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
     void Write(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
     void Snapshot(std::vector<uint8_t> &out) const;
+
+    // GOW-Port: save states: the CLUT and transfer progress (GS memory itself is saved with the GS)
+    void SaveState(ps2_state::Writer &w) const;
+    bool LoadState(ps2_state::Reader &r);
 
 private:
     uint32_t ClutColor(const GSDrawState &state, uint32_t index) const;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/state_io.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +19,9 @@ namespace ps2x::iop::detail
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
 
+        // GOW-Port: save states (ps2_savestate.h)
+        void saveState(ps2_state::Writer &w) const;
+        bool loadState(ps2_state::Reader &r);
     private:
         struct Callback
         {

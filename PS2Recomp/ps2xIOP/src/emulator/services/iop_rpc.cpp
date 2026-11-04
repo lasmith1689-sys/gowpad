@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_rpc.h"
 
 #include "../core/iop_cpu.h"
@@ -394,5 +395,34 @@ namespace ps2x::iop::detail
     {
         const auto server = m_servers.find(sid);
         return server != m_servers.end() && server->second.function != 0u;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopRpcBridge::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("IRPC");
+        w.pod(m_dmaCallback);
+        std::vector<RpcServer> servers;
+        for (const auto &kv : m_servers)
+            servers.push_back(kv.second);
+        std::sort(servers.begin(), servers.end(), [](const RpcServer &a, const RpcServer &b) { return a.sid < b.sid; });
+        w.vector(servers);
+        w.u32(m_nextDmaId), w.boolean(m_sifInitialized);
+        w.end();
+    }
+
+    bool IopRpcBridge::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("IRPC"))
+            return false;
+        r.pod(m_dmaCallback);
+        const auto servers = r.vector<RpcServer>();
+        m_servers.clear();
+        for (const RpcServer &s : servers)
+            m_servers.emplace(s.sid, s);
+        m_nextDmaId = r.u32(), m_sifInitialized = r.boolean();
+        return r.end();
     }
 }

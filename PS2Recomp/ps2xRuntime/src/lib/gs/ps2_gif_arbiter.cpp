@@ -1,3 +1,4 @@
+#include "runtime/ps2_state_io.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include <algorithm>
 #include <cstring>
@@ -138,4 +139,40 @@ void GifArbiter::drain()
 uint8_t GifArbiter::pathPriority(GifPathId id)
 {
     return static_cast<uint8_t>(id);
+}
+
+// GOW-Port: save states
+void GifArbiter::saveState(ps2_state::Writer &w) const
+{
+    w.begin("GIFA");
+    w.u32(static_cast<uint32_t>(m_queue.size()));
+    for (const GifArbiterPacket &p : m_queue)
+    {
+        w.pod(p.pathId), w.boolean(p.path2DirectHl), w.boolean(p.path3Image);
+        w.vector(p.data);
+    }
+    w.pod(m_path3Input);
+    w.end();
+}
+
+bool GifArbiter::loadState(ps2_state::Reader &r)
+{
+    if (!r.begin("GIFA"))
+        return false;
+    std::vector<GifArbiterPacket> queue;
+    for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+    {
+        GifArbiterPacket p{};
+        r.pod(p.pathId);
+        p.path2DirectHl = r.boolean(), p.path3Image = r.boolean();
+        p.data = r.vector<uint8_t>();
+        queue.push_back(std::move(p));
+    }
+    Path3InputState path3{};
+    r.pod(path3);
+    if (!r.end())
+        return false;
+    m_queue = std::move(queue);
+    m_path3Input = path3;
+    return true;
 }

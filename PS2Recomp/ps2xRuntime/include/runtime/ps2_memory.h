@@ -190,6 +190,12 @@ inline const uint8_t *getConstMemPtr(const uint8_t *rdram, uint32_t addr)
     return rdram + offset;
 }
 
+namespace ps2_state
+{
+    class Writer;
+    class Reader;
+}
+
 // PS2 GS (Graphics Synthesizer) registers
 struct GSRegisters
 {
@@ -414,6 +420,11 @@ public:
     bool isCodeAddress(uint32_t address) const;
     bool isCodeModified(uint32_t address, uint32_t size);
     void clearModifiedFlag(uint32_t address, uint32_t size);
+
+    // GOW-Port: save states (ps2_savestate.h): EE RAM, scratchpad, VU memory, the register files, EE timers and the
+    // VIF1 / PATH3 partial-packet state, with the GS worker drained first (GS memory is saved with the GS)
+    void saveState(ps2_state::Writer &w);
+    bool loadState(ps2_state::Reader &r);
 
     // GS register accessors
     GSRegisters &gs() { return gs_regs; }

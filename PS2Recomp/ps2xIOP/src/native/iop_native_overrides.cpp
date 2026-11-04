@@ -1,5 +1,6 @@
 // GOW-Port: IRX functions replaced by native C++ (see iop_native.h). Each entry must also be listed in
 // tools/iop/native_overrides.txt so the generated code hands control to the dispatcher at that address.
+#include "ps2x/state_io.h"
 #include "native/iop_native.h"
 
 #include "emulator/core/iop_cpu.h"
@@ -86,10 +87,25 @@ namespace ps2x::iop::detail
             ret(c, c.memory.writeRam(arg(c, 2), specs, sizeof(specs)) ? 1u : 0u);
         }
 
+        // GOW-Port: save states: after a load the cards read as absent for the driver's next probes of each port, so it
+        // sees them removed and inserted again and reads their directory afresh (its copy in IOP RAM is from the saved
+        // moment, the card files are not part of a state), like PCSX2's card eject on state load
+        std::array<uint32_t, 2> g_cardEjectProbes{};
+        bool cardEjected(uint32_t port)
+        {
+            uint32_t &left = g_cardEjectProbes[port & 1u];
+            if (!left)
+                return false;
+            --left;
+            return true;
+        }
+
         // 0x0650 init_card, 0x164c probe, 0x08d8 probe_f3: (port, slot) -> 1 when a card image is present
         // (a real card echoes the 0x55 terminator the driver sets, which gives 1)
         void mcPresent(IopNativeCall &c)
         {
+            if (cardEjected(arg(c, 0)))
+                return ret(c, 0u);
             ret(c, cardFor(c, arg(c, 0)) ? 1u : 0u);
         }
 
@@ -124,6 +140,8 @@ namespace ps2x::iop::detail
         void sio2dProbeCard(IopNativeCall &c)
         {
             const uint32_t port = arg(c, 0);
+            if ((port == 2u || port == 3u) && cardEjected(port))
+                return ret(c, 0u);
             ret(c, (port == 2u || port == 3u) && arg(c, 1) == 0u && cardFor(c, port) ? 1u : 0u);
         }
 
@@ -350,4 +368,32 @@ namespace ps2x::iop::detail
         count = sizeof(kOverrides) / sizeof(kOverrides[0]);
         return kOverrides;
     }
+
+    // GOW-Port: save states
+    void nativeOverridesSave(ps2_state::Writer &w)
+    {
+        w.begin("INOV");
+        w.u32(g_sio2Ctrl);
+        w.pod(g_libsd);
+        w.end();
+    }
+    bool nativeOverridesLoad(ps2_state::Reader &r)
+    {
+        if (!r.begin("INOV"))
+            return false;
+        g_sio2Ctrl = r.u32();
+        r.pod(g_libsd);
+        g_cardEjectProbes = {3u, 3u};
+        return r.end();
+    }
+}
+
+void iopNativeOverridesSave(ps2_state::Writer &w)
+{
+    ps2x::iop::detail::nativeOverridesSave(w);
+}
+
+bool iopNativeOverridesLoad(ps2_state::Reader &r)
+{
+    return ps2x::iop::detail::nativeOverridesLoad(r);
 }

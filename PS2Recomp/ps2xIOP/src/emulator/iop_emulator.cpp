@@ -1033,6 +1033,93 @@ namespace ps2x::iop::detail
             return true;
         }
 
+        // GOW-Port: save states (ps2_savestate.h)
+        bool quiescent() const noexcept
+        {
+            return activeCpu == nullptr && callDepth == 0u && !servicingDmaInterrupts && !servicingGuestCallbacks;
+        }
+
+        void saveState(ps2_state::Writer &w) const
+        {
+            w.begin("IOPE");
+            memory.saveState(w);
+            kernel.saveState(w);
+            cdvd.saveState(w);
+            rpc.saveState(w);
+            intrman.saveState(w);
+            timrman.saveState(w);
+            ioman.saveState(w);
+            imports.saveState(w);
+            iopNativeOverridesSave(w);
+            w.u32(static_cast<uint32_t>(modules.size()));
+            for (const auto &kv : modules)
+            {
+                const Module &m = kv.second;
+                w.pod(m.id), w.string(m.path), w.string(m.name), w.u32(m.base), w.u32(m.size), w.u32(m.entry), w.u32(m.gp);
+                w.u32(m.textSize), w.boolean(m.resident);
+            }
+            w.u32(static_cast<uint32_t>(pendingDmaInterrupts.size()));
+            for (const auto &kv : pendingDmaInterrupts)
+                w.pod(kv.first), w.u64(kv.second);
+            w.u32(static_cast<uint32_t>(pendingGuestCallbacks.size()));
+            for (const auto &kv : pendingGuestCallbacks)
+                w.u64(kv.first), w.pod(kv.second);
+            w.u32(nextModuleId), w.u32(moduleCursor), w.u64(totalCycles), w.u64(soundBase), w.u64(runStartTotal), w.u64(runGrant);
+            w.u64(lastRunEnd), w.u64(totalInstructions), w.u64(eeCycleCarry), w.u64(pendingIopCycles), w.u32(nativeBudget);
+            w.pod(secrMcCommandHandler), w.pod(secrMcDevIdHandler), w.pod(checkKelfPathCallback);
+            w.end();
+        }
+
+        bool loadState(ps2_state::Reader &r)
+        {
+            if (!r.begin("IOPE"))
+                return false;
+            if (!memory.loadState(r) || !kernel.loadState(r) || !cdvd.loadState(r) || !rpc.loadState(r) || !intrman.loadState(r) ||
+                !timrman.loadState(r) || !ioman.loadState(r) || !imports.loadState(r) || !iopNativeOverridesLoad(r))
+                return false;
+            std::map<int, Module> loaded;
+            for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+            {
+                Module m;
+                r.pod(m.id);
+                m.path = r.string(), m.name = r.string();
+                m.base = r.u32(), m.size = r.u32(), m.entry = r.u32(), m.gp = r.u32(), m.textSize = r.u32(), m.resident = r.boolean();
+                loaded.emplace(m.id, std::move(m));
+            }
+            std::map<int, uint64_t> dma;
+            for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+            {
+                int irq = 0;
+                r.pod(irq);
+                dma[irq] = r.u64();
+            }
+            std::multimap<uint64_t, ScheduledGuestCallback> callbacks;
+            for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+            {
+                const uint64_t at = r.u64();
+                ScheduledGuestCallback c{};
+                r.pod(c);
+                callbacks.emplace(at, c);
+            }
+            nextModuleId = r.u32(), moduleCursor = r.u32(), totalCycles = r.u64(), soundBase = r.u64(), runStartTotal = r.u64();
+            runGrant = r.u64(), lastRunEnd = r.u64(), totalInstructions = r.u64(), eeCycleCarry = r.u64(), pendingIopCycles = r.u64();
+            nativeBudget = r.u32();
+            r.pod(secrMcCommandHandler), r.pod(secrMcDevIdHandler), r.pod(checkKelfPathCallback);
+            if (!r.end())
+                return false;
+            modules = std::move(loaded);
+            pendingDmaInterrupts = std::move(dma);
+            pendingGuestCallbacks = std::move(callbacks);
+            activeCpu = nullptr;
+            callDepth = 0u;
+            // the compiled IRX code that runs each module, found again from the restored code bytes
+            nativeRanges.clear();
+            nativeOverrides.clear();
+            for (const auto &kv : modules)
+                attachNative(kv.second);
+            return true;
+        }
+
         IopHost &host;
         IopMemory memory;
         IopSysmem sysmem;
@@ -1237,4 +1324,22 @@ namespace ps2x::iop::detail
         return static_cast<uint32_t>(m_impl->rpc.serverCount());
     }
 
+}
+
+namespace ps2x::iop::detail
+{
+    bool IopEmulator::quiescent() const noexcept
+    {
+        return m_impl->quiescent();
+    }
+
+    void IopEmulator::saveState(ps2_state::Writer &w) const
+    {
+        m_impl->saveState(w);
+    }
+
+    bool IopEmulator::loadState(ps2_state::Reader &r)
+    {
+        return m_impl->loadState(r);
+    }
 }

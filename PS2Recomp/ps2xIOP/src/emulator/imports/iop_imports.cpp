@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_imports.h"
 
 #include "../core/iop_memory.h"
@@ -191,5 +192,39 @@ namespace ps2x::iop::detail
             else
                 ++library;
         }
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopImportRegistry::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("IIMP");
+        w.u32(static_cast<uint32_t>(m_libraries.size()));
+        for (const auto &kv : m_libraries)
+        {
+            w.u32(kv.first), w.u32(kv.second.tableAddress), w.pod(kv.second.version), w.string(kv.second.name);
+            w.vector(kv.second.functions);
+        }
+        w.end();
+    }
+
+    bool IopImportRegistry::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("IIMP"))
+            return false;
+        std::map<uint32_t, ExportLibrary> libraries;
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            const uint32_t key = r.u32();
+            ExportLibrary lib;
+            lib.tableAddress = r.u32();
+            r.pod(lib.version);
+            lib.name = r.string();
+            lib.functions = r.vector<uint32_t>();
+            libraries.emplace(key, std::move(lib));
+        }
+        m_libraries = std::move(libraries);
+        return r.end();
     }
 }

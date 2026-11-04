@@ -1,3 +1,4 @@
+#include "runtime/ps2_state_io.h"
 #include "runtime/ps2_memory.h"
 #include "ThreadNaming.h"
 #include "runtime/gs/gs_stage.h"
@@ -2509,4 +2510,111 @@ void PS2Memory::clearModifiedFlag(uint32_t address, uint32_t size)
             }
         }
     }
+}
+
+// GOW-Port: save states
+void PS2Memory::saveState(ps2_state::Writer &w)
+{
+    syncGsWorker("save state");
+    w.begin("MEMR");
+    w.block(m_rdram, PS2_RAM_SIZE);
+    w.block(m_scratchpad, PS2_SCRATCHPAD_SIZE);
+    w.block(m_vu0Code, PS2_VU0_CODE_SIZE), w.block(m_vu0Data, PS2_VU0_DATA_SIZE);
+    w.block(m_vu1Code, PS2_VU1_CODE_SIZE), w.block(m_vu1Data, PS2_VU1_DATA_SIZE);
+    std::vector<std::pair<uint32_t, uint32_t>> io(m_ioRegisters.begin(), m_ioRegisters.end());
+    std::sort(io.begin(), io.end());
+    w.pairs(io);
+    const uint64_t gsPlain[] = {gs_regs.pmode, gs_regs.smode1, gs_regs.smode2, gs_regs.srfsh, gs_regs.synch1, gs_regs.synch2, gs_regs.syncv,
+                                gs_regs.dispfb1, gs_regs.display1, gs_regs.dispfb2, gs_regs.display2, gs_regs.extbuf, gs_regs.extdata,
+                                gs_regs.extwrite, gs_regs.bgcolor, gs_regs.csr.load(), gs_regs.vsyncTick.load(), gs_regs.imr,
+                                gs_regs.busdir, gs_regs.siglblid};
+    w.pod(gsPlain);
+    w.pod(vif0_regs), w.pod(vif1_regs), w.pod(dma_regs);
+    w.u32(static_cast<uint32_t>(m_tlbEntries.size()));
+    for (const TLBEntry &e : m_tlbEntries)
+        w.u32(e.vpn), w.u32(e.pfn), w.u32(e.mask), w.boolean(e.valid);
+    w.boolean(m_seenGifCopy), w.boolean(m_path3Masked);
+    w.u32(m_vif1DirectBytesRemaining), w.boolean(m_vif1DirectHl);
+    w.vector(m_vif1DirectPayload);
+    w.u32(static_cast<uint32_t>(m_path3MaskedFifo.size()));
+    for (const auto &packet : m_path3MaskedFifo)
+        w.vector(packet);
+    {
+        std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+        w.vector(m_completedDmacCauses);
+    }
+    w.u32(static_cast<uint32_t>(m_codeRegions.size()));
+    for (const CodeRegion &region : m_codeRegions)
+    {
+        w.u32(region.start), w.u32(region.end);
+        std::vector<uint8_t> bits(region.modified.begin(), region.modified.end());
+        w.vector(bits);
+    }
+    w.pod(m_eeTimers);
+    w.u64(m_eeTimerPendingCycles), w.u64(m_eeTimerBudget), w.u64(m_eeCycleTotal);
+    w.end();
+}
+
+bool PS2Memory::loadState(ps2_state::Reader &r)
+{
+    syncGsWorker("load state");
+    if (!r.begin("MEMR"))
+        return false;
+    r.block(m_rdram, PS2_RAM_SIZE);
+    r.block(m_scratchpad, PS2_SCRATCHPAD_SIZE);
+    r.block(m_vu0Code, PS2_VU0_CODE_SIZE), r.block(m_vu0Data, PS2_VU0_DATA_SIZE);
+    r.block(m_vu1Code, PS2_VU1_CODE_SIZE), r.block(m_vu1Data, PS2_VU1_DATA_SIZE);
+    const auto io = r.pairs<uint32_t, uint32_t>();
+    // (assigned in place, not cleared: m_gifStatSlot points at GIF_STAT's element)
+    std::unordered_map<uint32_t, uint32_t> saved(io.begin(), io.end());
+    for (auto it = m_ioRegisters.begin(); it != m_ioRegisters.end();)
+        if (!saved.count(it->first) && &it->second != m_gifStatSlot)
+            it = m_ioRegisters.erase(it);
+        else
+            ++it;
+    for (const auto &kv : io)
+        m_ioRegisters[kv.first] = kv.second;
+    uint64_t gsPlain[20] = {};
+    r.pod(gsPlain);
+    gs_regs.pmode = gsPlain[0], gs_regs.smode1 = gsPlain[1], gs_regs.smode2 = gsPlain[2], gs_regs.srfsh = gsPlain[3];
+    gs_regs.synch1 = gsPlain[4], gs_regs.synch2 = gsPlain[5], gs_regs.syncv = gsPlain[6], gs_regs.dispfb1 = gsPlain[7];
+    gs_regs.display1 = gsPlain[8], gs_regs.dispfb2 = gsPlain[9], gs_regs.display2 = gsPlain[10], gs_regs.extbuf = gsPlain[11];
+    gs_regs.extdata = gsPlain[12], gs_regs.extwrite = gsPlain[13], gs_regs.bgcolor = gsPlain[14];
+    gs_regs.csr.store(gsPlain[15]), gs_regs.vsyncTick.store(gsPlain[16]);
+    gs_regs.imr = gsPlain[17], gs_regs.busdir = gsPlain[18], gs_regs.siglblid = gsPlain[19];
+    r.pod(vif0_regs), r.pod(vif1_regs), r.pod(dma_regs);
+    std::vector<TLBEntry> tlb;
+    for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+    {
+        TLBEntry e{};
+        e.vpn = r.u32(), e.pfn = r.u32(), e.mask = r.u32(), e.valid = r.boolean();
+        tlb.push_back(e);
+    }
+    m_tlbEntries = std::move(tlb);
+    m_seenGifCopy = r.boolean(), m_path3Masked = r.boolean();
+    m_vif1DirectBytesRemaining = r.u32(), m_vif1DirectHl = r.boolean();
+    m_vif1DirectPayload = r.vector<uint8_t>();
+    m_path3MaskedFifo.clear();
+    for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        m_path3MaskedFifo.push_back(r.vector<uint8_t>());
+    {
+        std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+        m_completedDmacCauses = r.vector<uint32_t>();
+    }
+    std::vector<CodeRegion> regions;
+    for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+    {
+        CodeRegion region{};
+        region.start = r.u32(), region.end = r.u32();
+        const auto bits = r.vector<uint8_t>();
+        region.modified.assign(bits.begin(), bits.end());
+        regions.push_back(std::move(region));
+    }
+    m_codeRegions = std::move(regions);
+    r.pod(m_eeTimers);
+    m_eeTimerPendingCycles = r.u64(), m_eeTimerBudget = r.u64(), m_eeCycleTotal = r.u64();
+    // VU programs decoded / compiled from the old micro memory
+    markVU0CodeModified();
+    markVU1CodeModified();
+    return r.end();
 }

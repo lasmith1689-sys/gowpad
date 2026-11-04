@@ -3,6 +3,7 @@
 #include "rlgl.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_perf.h"
+#include "runtime/ps2_pause_menu.h"
 #include "ps2_log.h"
 
 #include <algorithm>
@@ -620,6 +621,7 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         drawPerfHud();
     ps2_touch_pad::updateAndDraw(); // on-screen controls while no controller is connected
 #endif
+    ps2_pause_menu::updateAndDraw(); // the pause menu (save states) and its button
     // GOW-Port: GOW_HOST_SHOT=<n>: at host frame n write the window's back buffer (what is about to be shown) to
     // host_shot.png in the working directory, plus the frame / window sizes, to check presentation without a desktop grab.
     static const long hostShotAt = [] { const char *v = std::getenv("GOW_HOST_SHOT"); return v ? std::atol(v) : -1L; }();

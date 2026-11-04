@@ -61,6 +61,12 @@ enum PS2Exception
 };
 
 // PS2 CPU context (R5900)
+namespace ps2_state
+{
+    class Writer;
+    class Reader;
+}
+
 struct alignas(16) R5900Context
 {
     // General Purpose Registers (128-bit)
@@ -383,6 +389,15 @@ public:
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
     void guestFree(uint32_t guestAddr);
+
+    // GOW-Port: save states (ps2_savestate.h, ps2_runtime_state.cpp), on the EE executor at a safe point
+    [[nodiscard]] bool stateSaveable(std::string &why);
+    bool saveState(ps2_state::Writer &w, std::string &message);
+    bool loadState(ps2_state::Reader &r, std::string &message);
+    [[nodiscard]] uint64_t stateBuildId() const { return currentStateBuildId(); }
+    static uint64_t currentStateBuildId(); // the recompiled code, the state layout and the game settings
+    static void wakeExecutorForSafePoint();
+    void onSafePointPark(bool parked);
     uint32_t guestHeapBase() const;
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;

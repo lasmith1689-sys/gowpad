@@ -6,6 +6,7 @@
 #include "../gs_gpu_helpers.h"
 #include "runtime/gs/gs_shared_present.h"
 #include "runtime/ps2_perf.h"
+#include "runtime/ps2_state_io.h"
 
 #include <map>
 #include <algorithm>
@@ -5086,6 +5087,29 @@ void main()
         if (ate && afail != 0u && !noFailPass && !failLikePass && !failWritesNothing && !allPass && bisect.mode != BisectNoFail)
         {
             ++stats.failPasses;
+            // GOW-Port: PS2X_GS_FAIL_STATS=1 (tests): the fail passes' alpha test, blend and masks, counted every 5 s
+            static const bool failStats = [] { const char *v = std::getenv("PS2X_GS_FAIL_STATS"); return v && *v == '1'; }();
+            if (failStats)
+            {
+                static std::map<std::string, uint64_t> seen;
+                static auto last = std::chrono::steady_clock::now();
+                char key[160];
+                std::snprintf(key, sizeof(key), "atst%u aref%02x afail%u alpha%llx fbmsk%08x fpsm%x tfx%u tcc%u tex%d a%d-%d zmsk%d",
+                              atst, aref, afail, (unsigned long long)(c.alpha & 0xFF00000000FFull), c.frame.fbmsk, c.frame.psm,
+                              (unsigned)c.tex0.tfx, (unsigned)c.tex0.tcc, s.prim.tme ? 1 : 0, texAlphaLo, texAlphaHi, c.zbuf.zmask ? 1 : 0);
+                seen[key] += verts.size();
+                if (std::chrono::steady_clock::now() - last > std::chrono::seconds(5))
+                {
+                    last = std::chrono::steady_clock::now();
+                    std::vector<std::pair<uint64_t, std::string>> rows;
+                    for (const auto &kv : seen)
+                        rows.emplace_back(kv.second, kv.first);
+                    std::sort(rows.rbegin(), rows.rend());
+                    for (size_t i = 0; i < rows.size() && i < 12u; ++i)
+                        std::fprintf(stderr, "[gs-failstats] verts=%llu %s\n", (unsigned long long)rows[i].first, rows[i].second.c_str());
+                    seen.clear();
+                }
+            }
             // failing fragments: 1 FB_ONLY (colour+alpha, no Z), 2 ZB_ONLY (Z only), 3 RGB_ONLY (colour, no alpha, no Z)
             u1i(locPass, 2);
             gpuTag(GpuFailPass);
@@ -5370,6 +5394,253 @@ void main()
         m.frames = 0;
     }
 
+    // ---- save states (ps2_savestate.h) ---------------------------------------------------------------------------
+    // GOW-Port: the render targets exist only on the GPU. A state holds each target's bookkeeping, its colour (read
+    // back) and its depth (packed into RGBA8 by a shader pass: OpenGL ES cannot read depth back; unpacked into
+    // gl_FragDepth on load, exact), the depth-test flips and the upload log. Decoded textures, palettes, CLUT reads
+    // and pass predictions are caches, dropped on load (rebuilt from GS memory and the next frames).
+    GLuint depthPackProgram = 0, depthUnpackProgram = 0, stateFbo = 0, stateTex = 0;
+    uint32_t stateTexW = 0, stateTexH = 0;
+    bool ensureStatePrograms()
+    {
+        if (depthPackProgram && depthUnpackProgram)
+            return true;
+        const Api &g = gl();
+        static const char *kPackFs = R"(#version 430 core
+out vec4 oColor;
+uniform sampler2D uSrc;
+void main()
+{
+    uint b = floatBitsToUint(texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0).r);
+    oColor = vec4(float(b & 255u), float((b >> 8) & 255u), float((b >> 16) & 255u), float(b >> 24)) / 255.0;
+}
+)";
+        static const char *kUnpackFs = R"(#version 430 core
+out vec4 oColor;
+uniform sampler2D uSrc;
+void main()
+{
+    uvec4 c = uvec4(texelFetch(uSrc, ivec2(gl_FragCoord.xy), 0) * 255.0 + 0.5);
+    gl_FragDepth = uintBitsToFloat(c.r | (c.g << 8) | (c.b << 16) | (c.a << 24));
+    oColor = vec4(0.0);
+}
+)";
+        const auto link = [&](const char *fs) -> GLuint
+        {
+            const GLuint v = compile(GSGL::kVertexShader, kPresentVs), f = compile(GSGL::kFragmentShader, fs);
+            if (!v || !f)
+                return 0u;
+            const GLuint prog = g.CreateProgram();
+            g.AttachShader(prog, v);
+            g.AttachShader(prog, f);
+            g.LinkProgram(prog);
+            g.DeleteShader(v);
+            g.DeleteShader(f);
+            GLint ok = 0;
+            g.GetProgramiv(prog, kLinkStatus, &ok);
+            if (!ok)
+            {
+                g.DeleteProgram(prog);
+                return 0u;
+            }
+            g.UseProgram(prog);
+            g.Uniform1i(g.GetUniformLocation(prog, "uSrc"), 7);
+            return prog;
+        };
+        if (!depthPackProgram)
+            depthPackProgram = link(kPackFs);
+        if (!depthUnpackProgram)
+            depthUnpackProgram = link(kUnpackFs);
+        return depthPackProgram && depthUnpackProgram && presentVao;
+    }
+    // an RGBA8 scratch texture of w x h behind stateFbo (left bound as the draw framebuffer)
+    void stateScratch(uint32_t w, uint32_t h)
+    {
+        const Api &g = gl();
+        if (!stateFbo)
+            g.GenFramebuffers(1, &stateFbo);
+        if (!stateTex || stateTexW != w || stateTexH != h)
+        {
+            if (stateTex)
+                g.DeleteTextures(1, &stateTex);
+            g.GenTextures(1, &stateTex);
+            g.BindTexture(kTexture2D, stateTex);
+            g.TexImage2D(kTexture2D, 0, static_cast<GLint>(kRgba8), static_cast<GLsizei>(w), static_cast<GLsizei>(h), 0, kRgba, kUnsignedByte, nullptr);
+            g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+            g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
+            stateTexW = w, stateTexH = h;
+            g.BindFramebuffer(kFramebuffer, stateFbo);
+            g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, stateTex, 0);
+        }
+        g.BindFramebuffer(kFramebuffer, stateFbo);
+    }
+    // draw state for the full-target passes below
+    void statePassState(uint32_t w, uint32_t h)
+    {
+        const Api &g = gl();
+        g.Viewport(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+        g.Disable(kScissorTest);
+        g.Disable(kBlend);
+        g.Disable(kCullFace);
+        g.BindVertexArray(presentVao);
+    }
+    void readPixels(GLuint fbo, uint32_t w, uint32_t h, std::vector<uint8_t> &out)
+    {
+        const Api &g = gl();
+        constexpr GLenum kReadFramebuffer = 0x8CA8;
+        out.resize(static_cast<size_t>(w) * h * 4u);
+        g.BindFramebuffer(kReadFramebuffer, fbo);
+        g.PixelStorei(kPackAlignment, 1);
+        g.ReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), kRgba, kUnsignedByte, out.data());
+    }
+
+    bool saveState(ps2_state::Writer &w)
+    {
+        if (!ensure() || !ensureStatePrograms())
+            return false;
+        flushPending();
+        flushDeferred();
+        flushShuffle();
+        const Api &g = gl();
+        w.begin("GSHW");
+        w.pod(scale);
+        w.vector(invertedZ);
+        w.u64(writeSeq);
+        w.vector(uploadLog);
+        store.SaveState(w);
+        w.u32(static_cast<uint32_t>(targets.size()));
+        std::vector<uint8_t> pixels;
+        for (const RenderTarget &t : targets)
+        {
+            w.u32(t.fbp), w.u32(t.fbw), w.pod(t.psm), w.u32(t.zbp), w.u32(t.pxW), w.u32(t.pxH), w.u32(t.glW), w.u32(t.glH);
+            w.u32(t.usedW), w.u32(t.usedH), w.u64(t.version), w.u64(t.lastDrawSeq), w.u64(t.lastDepthSeq);
+            w.u64(t.depthDrawPresent), w.boolean(t.depthCleared), w.boolean(t.depth != 0u);
+            readPixels(t.fbo, t.glW, t.glH, pixels);
+            w.block(pixels.data(), pixels.size());
+            if (t.depth)
+            {
+                stateScratch(t.glW, t.glH);
+                statePassState(t.glW, t.glH);
+                g.Disable(kDepthTest);
+                g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+                g.UseProgram(depthPackProgram);
+                g.ActiveTexture(kTexture0 + 7);
+                g.BindTexture(kTexture2D, t.depth);
+                g.DrawArrays(kTriangles, 0, 3);
+                g.BindTexture(kTexture2D, 0u);
+                g.ActiveTexture(kTexture0);
+                readPixels(stateFbo, t.glW, t.glH, pixels);
+                w.block(pixels.data(), pixels.size());
+            }
+        }
+        w.end();
+        reportGlError("save state");
+        return true;
+    }
+
+    bool loadState(ps2_state::Reader &r)
+    {
+        if (!ensure() || !ensureStatePrograms())
+            return false;
+        // what was queued belongs to the old timeline: drawn into the old targets, which go now
+        flushPending();
+        flushDeferred();
+        flushShuffle();
+        const Api &g = gl();
+        if (!r.begin("GSHW"))
+            return false;
+        float savedScale = 0.0f;
+        r.pod(savedScale);
+        std::vector<uint32_t> savedInverted = r.vector<uint32_t>();
+        const uint64_t savedWriteSeq = r.u64();
+        std::vector<UploadRecord> savedUploads = r.vector<UploadRecord>();
+        if (!store.LoadState(r))
+            return false;
+        const uint32_t count = r.u32();
+        if (!r.ok() || count > 64u)
+            return false;
+        for (RenderTarget &t : targets)
+            destroy(t);
+        targets.clear();
+        targets.reserve(count);
+        std::vector<uint8_t> pixels;
+        for (uint32_t i = 0; i < count && r.ok(); ++i)
+        {
+            const uint32_t fbp = r.u32(), fbw = r.u32();
+            uint8_t psm = 0;
+            r.pod(psm);
+            const uint32_t zbp = r.u32(), pxW = r.u32(), pxH = r.u32(), glW = r.u32(), glH = r.u32();
+            const uint32_t usedW = r.u32(), usedH = r.u32();
+            const uint64_t version = r.u64(), lastDrawSeq = r.u64(), lastDepthSeq = r.u64(), depthDrawPresent = r.u64();
+            const bool depthCleared = r.boolean(), hasDepth = r.boolean();
+            if (!r.ok())
+                break;
+            targets.emplace_back();
+            RenderTarget &t = targets.back();
+            createTarget(t, fbp, fbw);
+            if (hasDepth)
+                attachDepth(t, zbp);
+            t.psm = psm, t.zbp = zbp, t.usedW = usedW, t.usedH = usedH, t.version = version + 1u;
+            t.lastDrawSeq = lastDrawSeq, t.lastDepthSeq = lastDepthSeq, t.depthDrawPresent = depthDrawPresent, t.depthCleared = depthCleared;
+            // (a state from another internal scale: the pictures do not fit; the targets start black and the game
+            // draws them again)
+            const bool fits = t.glW == glW && t.glH == glH && t.pxW == pxW && t.pxH == pxH;
+            pixels.assign(static_cast<size_t>(glW) * glH * 4u, 0u);
+            r.block(pixels.data(), pixels.size());
+            if (fits && r.ok())
+            {
+                g.BindTexture(kTexture2D, t.color);
+                g.PixelStorei(kUnpackAlignment, 1);
+                g.TexSubImage2D(kTexture2D, 0, 0, 0, static_cast<GLsizei>(glW), static_cast<GLsizei>(glH), kRgba, kUnsignedByte, pixels.data());
+            }
+            if (hasDepth)
+            {
+                r.block(pixels.data(), pixels.size());
+                if (fits && r.ok())
+                {
+                    stateScratch(glW, glH);
+                    g.BindTexture(kTexture2D, stateTex);
+                    g.PixelStorei(kUnpackAlignment, 1);
+                    g.TexSubImage2D(kTexture2D, 0, 0, 0, static_cast<GLsizei>(glW), static_cast<GLsizei>(glH), kRgba, kUnsignedByte, pixels.data());
+                    g.BindFramebuffer(kFramebuffer, t.fbo);
+                    statePassState(glW, glH);
+                    g.ColorMask(kFalse, kFalse, kFalse, kFalse);
+                    g.Enable(kDepthTest);
+                    g.DepthFunc(kAlways);
+                    g.DepthMask(kTrue);
+                    g.UseProgram(depthUnpackProgram);
+                    g.ActiveTexture(kTexture0 + 7);
+                    g.BindTexture(kTexture2D, stateTex);
+                    g.DrawArrays(kTriangles, 0, 3);
+                    g.BindTexture(kTexture2D, 0u);
+                    g.ActiveTexture(kTexture0);
+                    g.ColorMask(kTrue, kTrue, kTrue, kTrue);
+                }
+            }
+        }
+        if (!r.end())
+            return false;
+        invertedZ = std::move(savedInverted);
+        writeSeq = std::max(writeSeq, savedWriteSeq);
+        uploadLog = std::move(savedUploads);
+        // caches built from the old GS memory
+        for (auto &kv : textures)
+            kv.second.valid = false;
+        rgbaDemand.clear();
+        clutCache.clear();
+        clutHash = store.ClutHash();
+        deferredDraws.clear();
+        heldWrites.clear();
+        stripHeld.clear();
+        stripFused = 0;
+        haveShuffle = false;
+        havePending = false;
+        pending.clear();
+        std::memset(readbackKey, 0, sizeof(readbackKey));
+        reportGlError("load state");
+        return r.ok();
+    }
+
     RenderTarget *findTarget(uint32_t fbp)
     {
         for (RenderTarget &t : targets)
@@ -5567,6 +5838,16 @@ void GSHwBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x
 void GSHwBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
     m_impl->store.Snapshot(out);
+}
+
+bool GSHwBackend::SaveState(ps2_state::Writer &w)
+{
+    return m_impl->saveState(w);
+}
+
+bool GSHwBackend::LoadState(ps2_state::Reader &r)
+{
+    return m_impl->loadState(r);
 }
 
 GSTransferSnapshot GSHwBackend::GetTransferSnapshot() const

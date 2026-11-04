@@ -49,6 +49,9 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    bool SaveState(ps2_state::Writer &w) override;
+    bool LoadState(ps2_state::Reader &r) override;
+
     bool ExportState(GSBackendState &out) override;
     bool ImportState(const GSBackendState &state) override;
 

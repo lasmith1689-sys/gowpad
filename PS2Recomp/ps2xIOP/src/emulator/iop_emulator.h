@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/state_io.h"
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
 
@@ -46,6 +47,11 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
         [[nodiscard]] uint32_t threadCount() const noexcept;
         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
+
+        // GOW-Port: save states (ps2_savestate.h), between IOP batches (no IOP code on the host stack)
+        [[nodiscard]] bool quiescent() const noexcept;
+        void saveState(ps2_state::Writer &w) const;
+        bool loadState(ps2_state::Reader &r);
 
     private:
         class Impl;

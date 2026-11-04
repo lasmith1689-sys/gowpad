@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_ioman.h"
 
 #include "../core/iop_cpu.h"
@@ -87,5 +88,32 @@ namespace ps2x::iop::detail
         default:
             return false;
         }
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopIoman::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("IIOM");
+        w.u32(static_cast<uint32_t>(m_devices.size()));
+        for (const Device &d : m_devices)
+            w.u32(d.address), w.u32(d.gp), w.string(d.name);
+        w.end();
+    }
+
+    bool IopIoman::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("IIOM"))
+            return false;
+        std::vector<Device> devices;
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            Device d;
+            d.address = r.u32(), d.gp = r.u32(), d.name = r.string();
+            devices.push_back(std::move(d));
+        }
+        m_devices = std::move(devices);
+        return r.end();
     }
 }

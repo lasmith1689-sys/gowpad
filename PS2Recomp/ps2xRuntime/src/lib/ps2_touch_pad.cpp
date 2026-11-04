@@ -7,6 +7,7 @@
 // right, L1/L2 and R1/R2 in the top corners, SELECT/START at the top and a D-pad left of centre. A finger keeps the role
 // it got when it landed; a button finger presses whatever it is over, so sliding across buttons works.
 #include "runtime/ps2_touch_pad.h"
+#include "runtime/ps2_pause_menu.h"
 #include "raylib.h"
 #include <SDL.h>
 
@@ -189,7 +190,7 @@ namespace ps2_touch_pad
             controller = false;
         else if (setting && *setting == '0')
             controller = true;
-        if (controller)
+        if (controller || ps2_pause_menu::isOpen()) // (the menu takes the touches while it is open)
         {
             g_state.store(0u, std::memory_order_release);
             g_fingers.clear();

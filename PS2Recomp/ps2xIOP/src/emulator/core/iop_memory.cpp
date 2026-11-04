@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_memory.h"
 
 #include <algorithm>
@@ -368,5 +369,51 @@ namespace ps2x::iop::detail
             result.push_back(ch);
         }
         return result;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopMemory::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("IMEM");
+        w.block(m_ram.data(), m_ram.size());
+        w.block(m_owned.data(), m_owned.size());
+        w.block(m_scratch.data(), m_scratch.size());
+        std::vector<std::pair<uint32_t, uint32_t>> hw(m_hardware.begin(), m_hardware.end());
+        std::sort(hw.begin(), hw.end());
+        w.pairs(hw);
+        w.vector(m_allocations);
+        w.u32(m_heapCursor), w.u32(m_interruptStatus), w.u32(m_interruptMask), w.u32(m_interruptControl);
+        w.boolean(m_dmaStart.has_value());
+        if (m_dmaStart)
+            w.pod(*m_dmaStart);
+        m_sound.saveState(w, m_ram.data());
+        w.end();
+    }
+
+    bool IopMemory::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("IMEM"))
+            return false;
+        r.block(m_ram.data(), m_ram.size());
+        r.block(m_owned.data(), m_owned.size());
+        r.block(m_scratch.data(), m_scratch.size());
+        const auto hw = r.pairs<uint32_t, uint32_t>();
+        m_hardware.clear();
+        for (const auto &kv : hw)
+            m_hardware.emplace(kv.first, kv.second);
+        m_allocations = r.vector<Allocation>();
+        m_heapCursor = r.u32(), m_interruptStatus = r.u32(), m_interruptMask = r.u32(), m_interruptControl = r.u32();
+        m_dmaStart.reset();
+        if (r.boolean())
+        {
+            DmaStart d{};
+            r.pod(d);
+            m_dmaStart = d;
+        }
+        if (!m_sound.loadState(r, m_ram.data()))
+            return false;
+        return r.end();
     }
 }

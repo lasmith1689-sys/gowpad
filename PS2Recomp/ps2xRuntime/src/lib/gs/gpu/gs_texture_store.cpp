@@ -336,3 +336,26 @@ void GSTextureStore::Snapshot(std::vector<uint8_t> &out) const
     }
     out.assign(m_vram, m_vram + m_vramSize);
 }
+
+void GSTextureStore::SaveState(ps2_state::Writer &w) const
+{
+    w.begin("GSTS");
+    w.pod(m_clut);
+    w.pod(m_clutCbp);
+    w.pod(m_transfer);
+    w.pod(m_state);
+    w.pod(m_upload24);
+    w.end();
+}
+
+bool GSTextureStore::LoadState(ps2_state::Reader &r)
+{
+    if (!r.begin("GSTS"))
+        return false;
+    r.pod(m_clut);
+    r.pod(m_clutCbp);
+    r.pod(m_transfer);
+    r.pod(m_state);
+    r.pod(m_upload24);
+    return r.end();
+}

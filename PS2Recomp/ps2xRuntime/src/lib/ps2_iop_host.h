@@ -104,5 +104,15 @@ private:
     };
     mutable std::mutex m_hostFileMutex;
     std::unordered_map<uint64_t, HostFile> m_hostFiles;
+
+public:
+    // GOW-Port: save states are refused while the IOP has host files open (their streams are not part of a state)
+    size_t openHostFileCount() const
+    {
+        std::lock_guard<std::mutex> lock(m_hostFileMutex);
+        return m_hostFiles.size();
+    }
+
+private:
     uint64_t m_nextHostFileHandle = 1u;
 };

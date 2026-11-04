@@ -26,6 +26,12 @@
 class GS;
 class PS2Memory;
 
+namespace ps2_state
+{
+    class Writer;
+    class Reader;
+}
+
 struct VU1State
 {
     float vf[32][4];
@@ -107,6 +113,11 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+
+    // GOW-Port: save states (ps2_savestate.h): registers and the operations still in its pipelines; the decoded and
+    // compiled program caches are rebuilt from micro memory after a load
+    void saveState(ps2_state::Writer &w) const;
+    bool loadState(ps2_state::Reader &r);
 
 private:
     template <int Id>

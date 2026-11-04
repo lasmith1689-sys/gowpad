@@ -1,3 +1,4 @@
+#include "ps2x/state_io.h"
 #include "iop_kernel.h"
 
 #include "iop_memory.h"
@@ -815,5 +816,63 @@ namespace ps2x::iop::detail
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
         }
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    void IopKernel::saveState(ps2_state::Writer &w) const
+    {
+        w.begin("IKRN");
+        w.u32(static_cast<uint32_t>(m_threads.size()));
+        for (const auto &kv : m_threads)
+            w.pod(kv.second);
+        w.u32(static_cast<uint32_t>(m_semaphores.size()));
+        for (const auto &kv : m_semaphores)
+            w.pod(kv.second);
+        w.u32(static_cast<uint32_t>(m_eventFlags.size()));
+        for (const auto &kv : m_eventFlags)
+            w.pod(kv.second);
+        w.u32(m_nextThreadId), w.u32(m_nextSemaphoreId), w.u32(m_nextEventFlagId);
+        w.end();
+    }
+
+    bool IopKernel::loadState(ps2_state::Reader &r)
+    {
+        if (!r.begin("IKRN"))
+            return false;
+        std::map<int, IopThread> threads;
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            IopThread t{};
+            r.pod(t);
+            threads.emplace(t.id, t);
+        }
+        std::map<int, Semaphore> semaphores;
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            Semaphore s{};
+            r.pod(s);
+            semaphores.emplace(s.id, s);
+        }
+        std::map<int, EventFlag> flags;
+        for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+        {
+            EventFlag f{};
+            r.pod(f);
+            flags.emplace(f.id, f);
+        }
+        const uint32_t nextThread = r.u32(), nextSemaphore = r.u32(), nextFlag = r.u32();
+        if (!r.end())
+            return false;
+        m_threads = std::move(threads);
+        m_semaphores = std::move(semaphores);
+        m_eventFlags = std::move(flags);
+        m_nextThreadId = nextThread, m_nextSemaphoreId = nextSemaphore, m_nextEventFlagId = nextFlag;
+        m_currentThread = nullptr;
+        ++m_version; // (the idle cache)
+        m_idleVersion = 0;
+        m_idleUntil = 0;
+        return true;
     }
 }
