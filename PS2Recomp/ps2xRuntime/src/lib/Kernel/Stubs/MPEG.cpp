@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_state_io.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
 #define PS2X_HAS_FFMPEG 0
@@ -21,6 +22,7 @@ extern "C"
 }
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -2579,6 +2581,41 @@ namespace ps2_stubs
     // GOW-Port: llama a sceMpegCbNodata(mpeg, &cbData{type = Nodata}, data) en el hilo actual y despues vuelve a
     // evaluar sceMpegGetPicture. Si el callback no aporto datos, espera al siguiente VSync antes de reintentar
     // para no acaparar la CPU que necesita el hilo que lee del disco.
+    // (the game's sceMpegCbNodata returned: free its argument block, then evaluate sceMpegGetPicture again, after the
+    // next VSync when the callback brought nothing)
+    void nodataCallbackDone(PS2Runtime *runtime, R5900Context &parent, uint32_t mpegAddr, uint32_t cbDataAddr, uint64_t demuxedBefore)
+    {
+        uint8_t *rdram = runtime->memory().getRDRAM();
+        if (cbDataAddr != 0u)
+        {
+            runtime->guestFree(cbDataAddr);
+        }
+        bool progressed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            progressed = playback.demuxedBytes != demuxedBefore || !playback.decodedFrames.empty() ||
+                         playback.streamEnded || playback.decoderFailed ||
+                         g_mpeg_stub_state.currentCdStreamEofSeen;
+        }
+        if (!progressed)
+        {
+            runtime->eeScheduler().waitVSync(
+                runtime->eeScheduler().currentVSyncTick(),
+                -1,
+                [rdram, runtime](R5900Context &resumeContext)
+                {
+                    if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                    {
+                        return;
+                    }
+                    sceMpegGetPicture(rdram, &resumeContext, runtime);
+                },
+                EeContinuation{EeContinuation::MpegGetPicture, 0u});
+        }
+        sceMpegGetPicture(rdram, &parent, runtime);
+    }
+
     [[noreturn]] static void dispatchNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
                                                     uint32_t mpegAddr, const MpegRegisteredCallback &callback,
                                                     uint64_t demuxedBefore)
@@ -2602,37 +2639,11 @@ namespace ps2_stubs
         SET_GPR_U32(&invocation.context, 6, callback.data);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
-        invocation.onComplete = [rdram, runtime, mpegAddr, cbDataAddr, demuxedBefore](const R5900Context &,
-                                                                                      R5900Context &parent)
-        {
-            if (cbDataAddr != 0u)
-            {
-                runtime->guestFree(cbDataAddr);
-            }
-            bool progressed = false;
-            {
-                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
-                MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-                progressed = playback.demuxedBytes != demuxedBefore || !playback.decodedFrames.empty() ||
-                             playback.streamEnded || playback.decoderFailed ||
-                             g_mpeg_stub_state.currentCdStreamEofSeen;
-            }
-            if (!progressed)
-            {
-                runtime->eeScheduler().waitVSync(
-                    runtime->eeScheduler().currentVSyncTick(),
-                    -1,
-                    [rdram, runtime](R5900Context &resumeContext)
-                    {
-                        if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
-                        {
-                            return;
-                        }
-                        sceMpegGetPicture(rdram, &resumeContext, runtime);
-                    });
-            }
-            sceMpegGetPicture(rdram, &parent, runtime);
-        };
+        invocation.onComplete = [runtime, mpegAddr, cbDataAddr, demuxedBefore](const R5900Context &, R5900Context &parent)
+        { nodataCallbackDone(runtime, parent, mpegAddr, cbDataAddr, demuxedBefore); };
+        // (save states: the same, from these numbers)
+        invocation.onCompleteKind = EeContinuation{EeContinuation::MpegNodataDone, mpegAddr,
+                                                   {cbDataAddr, static_cast<uint32_t>(demuxedBefore), static_cast<uint32_t>(demuxedBefore >> 32u)}};
         scheduler.invokeCurrent(std::move(invocation));
     }
 
@@ -2700,7 +2711,8 @@ namespace ps2_stubs
                             return;
                         }
                         sceMpegGetPicture(rdram, &resumeContext, runtime);
-                    });
+                    },
+                    EeContinuation{EeContinuation::MpegGetPicture, 0u});
             }
 
             if (!playback.decodedFrames.empty())
@@ -2762,7 +2774,8 @@ namespace ps2_stubs
                                 return;
                             }
                             sceMpegGetPicture(rdram, &resumeContext, runtime);
-                        });
+                        },
+                        EeContinuation{EeContinuation::MpegGetPicture, 0u});
                 }
 
                 frame = std::move(playback.decodedFrames.front());
@@ -3061,9 +3074,131 @@ namespace ps2_stubs
     }
 }
 
-// GOW-Port: save states are refused while a movie plays (its decoder is host state)
-bool ps2MpegPlaying()
+// GOW-Port: save states (KernelState.cpp) are taken at any moment, a movie playing or not. Kept: every sceMpeg object
+// (God of War plays every movie on one, 0x304DC8, and never deletes it), its settings, end flags and clocks, its
+// pictures already decoded, the stream bytes not yet demuxed, the audio packets a callback refused, the registered
+// callbacks and the CD stream counters. Not kept: the decoder itself (host codec state); after a load a new one starts
+// at the next sequence header, so a movie loaded mid-way skips to its next group of pictures (well under a second).
+namespace
 {
-    std::lock_guard<std::mutex> lock(ps2_stubs::g_mpeg_stub_mutex);
-    return !ps2_stubs::g_mpeg_stub_state.playbackByMpeg.empty();
+    void saveCallbackEvent(ps2_state::Writer &w, const ps2_stubs::MpegStreamCallbackEvent &e)
+    {
+        w.u32(e.mpegAddr), w.u32(e.streamType), w.u32(e.dataAddr), w.u32(e.len), w.u64(e.pts), w.u64(e.dts);
+        w.vector(e.callbacks), w.vector(e.bytes);
+    }
+
+    ps2_stubs::MpegStreamCallbackEvent loadCallbackEvent(ps2_state::Reader &r)
+    {
+        ps2_stubs::MpegStreamCallbackEvent e;
+        e.mpegAddr = r.u32(), e.streamType = r.u32(), e.dataAddr = r.u32(), e.len = r.u32(), e.pts = r.u64(), e.dts = r.u64();
+        e.callbacks = r.vector<ps2_stubs::MpegRegisteredCallback>();
+        e.bytes = r.vector<uint8_t>();
+        return e;
+    }
+}
+
+void ps2MpegNodataDone(PS2Runtime *runtime, R5900Context &parent, uint32_t mpegAddr, uint32_t cbDataAddr, uint64_t demuxedBefore)
+{
+    ps2_stubs::nodataCallbackDone(runtime, parent, mpegAddr, cbDataAddr, demuxedBefore);
+}
+
+void ps2MpegSaveState(ps2_state::Writer &w)
+{
+    using namespace ps2_stubs;
+    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+    const MpegStubState &s = g_mpeg_stub_state;
+    w.begin("MPEG");
+    w.boolean(s.initialized), w.u32(s.nextCallbackHandle), w.u64(s.cdStreamGeneration), w.u64(s.cdStreamBytesProduced);
+    w.u64(s.cdStreamBytesDemuxed), w.boolean(s.cdStreamEofPending), w.boolean(s.currentCdStreamEofSeen);
+    std::vector<uint32_t> keys;
+    for (const auto &kv : s.callbacksByMpeg)
+        keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end());
+    w.u32(static_cast<uint32_t>(keys.size()));
+    for (const uint32_t k : keys)
+        w.u32(k), w.vector(s.callbacksByMpeg.at(k));
+    keys.clear();
+    for (const auto &kv : s.playbackByMpeg)
+        keys.push_back(kv.first);
+    std::sort(keys.begin(), keys.end());
+    w.u32(static_cast<uint32_t>(keys.size()));
+    for (const uint32_t k : keys)
+    {
+        const MpegPlaybackState &p = s.playbackByMpeg.at(k);
+        w.u32(k), w.u32(p.picturesServed), w.u32(p.width), w.u32(p.height), w.u32(p.decodeMode), w.u32(p.imageBufferAddr);
+        w.boolean(p.sawInput), w.boolean(p.sawSequenceEnd), w.boolean(p.streamEnded), w.boolean(p.decoderFailed);
+        w.u64(p.cdStreamGeneration);
+        w.pod(p.frameRateCode), w.pod(p.frameRateExtensionN), w.pod(p.frameRateExtensionD), w.boolean(p.hasFrameRateExtension);
+        w.u64(p.pictureIntervalQ32), w.u64(p.nextPictureTickQ32), w.u64(p.presentationEndTickQ32);
+        w.pod(p.firstPresentedPts90k), w.u64(p.ptsPresentationBaseTickQ32), w.u64(p.demuxedBytes);
+        w.vector(p.pssBuffer), w.vector(p.pssGuestAddrs), w.vector(p.videoTimingScanBuffer);
+        w.u32(static_cast<uint32_t>(p.decodedFrames.size()));
+        for (const MpegDecodedFrame &f : p.decodedFrames)
+            w.pod(f.width), w.pod(f.height), w.pod(f.repeatPict), w.pod(f.pts90k), w.vector(f.rgba);
+    }
+    w.u32(static_cast<uint32_t>(g_pendingAudio.size()));
+    for (const auto &[addr, packets] : g_pendingAudio) // (std::map: in address order)
+    {
+        w.u32(addr), w.u32(static_cast<uint32_t>(packets.size()));
+        for (const PendingAudioPacket &packet : packets)
+            saveCallbackEvent(w, packet.event), w.vector(packet.bytes);
+    }
+    w.end();
+}
+
+bool ps2MpegLoadState(ps2_state::Reader &r)
+{
+    using namespace ps2_stubs;
+    if (!r.begin("MPEG"))
+        return false;
+    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+    MpegStubState &s = g_mpeg_stub_state;
+    s.initialized = r.boolean(), s.nextCallbackHandle = r.u32(), s.cdStreamGeneration = r.u64(), s.cdStreamBytesProduced = r.u64();
+    s.cdStreamBytesDemuxed = r.u64(), s.cdStreamEofPending = r.boolean(), s.currentCdStreamEofSeen = r.boolean();
+    s.callbacksByMpeg.clear();
+    for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+    {
+        const uint32_t k = r.u32();
+        s.callbacksByMpeg[k] = r.vector<MpegRegisteredCallback>();
+    }
+    s.playbackByMpeg.clear(); // (drops the running decoders)
+    for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+    {
+        const uint32_t k = r.u32();
+        MpegPlaybackState &p = s.playbackByMpeg[k];
+        p.picturesServed = r.u32(), p.width = r.u32(), p.height = r.u32(), p.decodeMode = r.u32(), p.imageBufferAddr = r.u32();
+        p.sawInput = r.boolean(), p.sawSequenceEnd = r.boolean(), p.streamEnded = r.boolean(), p.decoderFailed = r.boolean();
+        p.cdStreamGeneration = r.u64();
+        r.pod(p.frameRateCode), r.pod(p.frameRateExtensionN), r.pod(p.frameRateExtensionD), p.hasFrameRateExtension = r.boolean();
+        p.pictureIntervalQ32 = r.u64(), p.nextPictureTickQ32 = r.u64(), p.presentationEndTickQ32 = r.u64();
+        r.pod(p.firstPresentedPts90k), p.ptsPresentationBaseTickQ32 = r.u64(), p.demuxedBytes = r.u64();
+        p.pssBuffer = r.vector<uint8_t>();
+        p.pssGuestAddrs = r.vector<uint32_t>();
+        p.videoTimingScanBuffer = r.vector<uint8_t>();
+        for (uint32_t f = 0, frames = r.u32(); f < frames && r.ok(); ++f)
+        {
+            MpegDecodedFrame frame;
+            r.pod(frame.width), r.pod(frame.height), r.pod(frame.repeatPict), r.pod(frame.pts90k);
+            frame.rgba = r.vector<uint8_t>();
+            p.decodedFrames.push_back(std::move(frame));
+        }
+        // a new decoder: it starts at the stream's next sequence header (the pictures before it need the old one's
+        // reference pictures)
+        p.waitingForVideoSequenceHeader = true;
+        p.videoSequenceSyncBuffer.clear();
+    }
+    g_pendingAudio.clear();
+    for (uint32_t i = 0, n = r.u32(); i < n && r.ok(); ++i)
+    {
+        const uint32_t addr = r.u32();
+        std::deque<PendingAudioPacket> &packets = g_pendingAudio[addr];
+        for (uint32_t j = 0, count = r.u32(); j < count && r.ok(); ++j)
+        {
+            PendingAudioPacket packet;
+            packet.event = loadCallbackEvent(r);
+            packet.bytes = r.vector<uint8_t>();
+            packets.push_back(std::move(packet));
+        }
+    }
+    return r.end();
 }

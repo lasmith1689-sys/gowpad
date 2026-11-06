@@ -8,6 +8,8 @@ void ps2SifSaveState(ps2_state::Writer &w); // Stubs/SIF.cpp
 bool ps2SifLoadState(ps2_state::Reader &r);
 void ps2CdSaveState(ps2_state::Writer &w); // Stubs/CD.cpp
 bool ps2CdLoadState(ps2_state::Reader &r);
+void ps2MpegSaveState(ps2_state::Writer &w); // Stubs/MPEG.cpp
+bool ps2MpegLoadState(ps2_state::Reader &r);
 
 namespace
 {
@@ -55,6 +57,7 @@ void ps2KernelSaveState(ps2_state::Writer &w)
     }
     ps2SifSaveState(w);
     ps2CdSaveState(w);
+    ps2MpegSaveState(w);
     w.end();
 }
 
@@ -106,7 +109,7 @@ bool ps2KernelLoadState(ps2_state::Reader &r)
         }
         r.pod(g_next_sif_module_id);
     }
-    if (!ps2SifLoadState(r) || !ps2CdLoadState(r))
+    if (!ps2SifLoadState(r) || !ps2CdLoadState(r) || !ps2MpegLoadState(r))
         return false;
     return r.end();
 }

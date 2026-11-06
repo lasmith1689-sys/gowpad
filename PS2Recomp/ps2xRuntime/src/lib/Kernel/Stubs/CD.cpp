@@ -790,7 +790,9 @@ namespace ps2_stubs
                                 return;
                             }
                             continueCdStRead(rdram, &resumeContext, runtime, state);
-                        });
+                        },
+                        // (save states: the same, from these numbers; ps2CdStReadResume)
+                        EeContinuation{EeContinuation::CdStRead, state.requestedSectors, {state.buffer, state.errorAddress, state.sectorsRead}});
                 }
 
                 uint32_t sectors = std::min(remaining, available);
@@ -1007,4 +1009,13 @@ bool ps2CdLoadState(ps2_state::Reader &r)
     g_cdMode = r.u32(), g_cdStreamingLbn = r.u32(), g_cdStreamingEndLbn = r.u32(), g_cdInitialized = r.boolean();
     r.pod(ps2_stubs::g_cdStreamTiming);
     return r.end();
+}
+
+// GOW-Port: a loaded thread that was waiting in sceCdStRead for stream sectors (EeContinuation::CdStRead)
+void ps2CdStReadResume(PS2Runtime *runtime, R5900Context &context, const EeContinuation &kind)
+{
+    if (static_cast<int32_t>(getRegU32(&context, 2)) < 0)
+        return;
+    const ps2_stubs::CdStReadContinuation state{kind.arg, kind.extra[0], kind.extra[1], kind.extra[2]};
+    ps2_stubs::continueCdStRead(runtime->memory().getRDRAM(), &context, runtime, state);
 }

@@ -1503,9 +1503,10 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
 [[noreturn]] void EeScheduler::waitExternal(EeWaitReason reason,
                                             uint32_t type,
                                             uint64_t token,
-                                            std::function<void(R5900Context &)> completion)
+                                            std::function<void(R5900Context &)> completion,
+                                            EeContinuation describe)
 {
-    EeWaitState wait{reason, EeExternalWait{type, token}, std::move(completion)};
+    EeWaitState wait{reason, EeExternalWait{type, token}, std::move(completion), describe};
     blockCurrent(std::move(wait));
 }
 
@@ -2454,6 +2455,13 @@ namespace
     }
 }
 
+namespace ps2_stubs
+{
+    void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // Stubs/MPEG.cpp
+}
+void ps2MpegNodataDone(PS2Runtime *runtime, R5900Context &parent, uint32_t mpegAddr, uint32_t cbDataAddr, uint64_t demuxedBefore);
+void ps2CdStReadResume(PS2Runtime *runtime, R5900Context &context, const EeContinuation &kind); // Stubs/CD.cpp
+
 // (the functions a completion description stands for)
 static std::function<void(R5900Context &)> makeCompletion(PS2Runtime &runtime, const EeContinuation &kind)
 {
@@ -2463,6 +2471,14 @@ static std::function<void(R5900Context &)> makeCompletion(PS2Runtime &runtime, c
         return [pc = kind.arg](R5900Context &context) { context.pc = pc; };
     case EeContinuation::GuestFree:
         return [&runtime, address = kind.arg](R5900Context &) { runtime.guestFree(address); };
+    case EeContinuation::MpegGetPicture:
+        return [&runtime](R5900Context &context) {
+            if (static_cast<int32_t>(getRegU32(&context, 2)) < 0)
+                return;
+            ps2_stubs::sceMpegGetPicture(runtime.memory().getRDRAM(), &context, &runtime);
+        };
+    case EeContinuation::CdStRead:
+        return [&runtime, kind](R5900Context &context) { ps2CdStReadResume(&runtime, context, kind); };
     default:
         return {};
     }
@@ -2476,6 +2492,10 @@ static std::function<void(const R5900Context &, R5900Context &)> makeInvocationC
         return [pc = kind.arg](const R5900Context &, R5900Context &parent) { parent.pc = pc; };
     case EeContinuation::GuestFree:
         return [&runtime, address = kind.arg](const R5900Context &, R5900Context &) { runtime.guestFree(address); };
+    case EeContinuation::MpegNodataDone:
+        return [&runtime, kind](const R5900Context &, R5900Context &parent) {
+            ps2MpegNodataDone(&runtime, parent, kind.arg, kind.extra[0], kind.extra[1] | (static_cast<uint64_t>(kind.extra[2]) << 32u));
+        };
     default:
         return {};
     }
@@ -2485,11 +2505,7 @@ bool EeScheduler::canSaveState(std::string &why) const
 {
     for (const auto &[id, t] : m_threads)
     {
-        if (t.wait.reason == EeWaitReason::Mpeg)
-        {
-            why = "a movie is playing";
-            return false;
-        }
+        // (a thread waiting for a movie picture asks again after a load: EeContinuation::MpegGetPicture)
         if (!describable(static_cast<bool>(t.wait.completion), t.wait.completionKind) ||
             !describable(static_cast<bool>(t.resumeCompletion), t.resumeKind))
         {

@@ -19,7 +19,6 @@
 
 void ps2KernelSaveState(ps2_state::Writer &w); // Kernel/Syscalls/KernelState.cpp
 bool ps2KernelLoadState(ps2_state::Reader &r);
-bool ps2MpegPlaying(); // Kernel/Stubs/MPEG.cpp
 
 namespace
 {
@@ -37,7 +36,7 @@ namespace
     std::chrono::steady_clock::time_point g_parkStart{};
 
     // bump when anything saved changes shape (a field added to a saved structure, a section reordered)
-    constexpr uint64_t kStateLayout = 1;
+    constexpr uint64_t kStateLayout = 2; // 2: the MPEG section (sceMpeg objects between movies)
 }
 
 namespace ps2_savestate
@@ -108,11 +107,7 @@ bool PS2Runtime::stateSaveable(std::string &why)
         why = "the sound processor is busy";
         return false;
     }
-    if (ps2MpegPlaying())
-    {
-        why = "a movie is playing";
-        return false;
-    }
+    // (a movie may be playing: its decoder restarts at the next sequence header after a load, ps2MpegLoadState)
     if (!m_vfs.descriptors().empty() || (m_iopHost && m_iopHost->openHostFileCount() != 0u))
     {
         why = "the game has files open";

@@ -90,9 +90,13 @@ struct EeContinuation
         Unknown = 0,
         SetPc = 1,     // context.pc = arg
         GuestFree = 2, // runtime.guestFree(arg)
+        MpegGetPicture = 3, // v0 >= 0: sceMpegGetPicture again with the thread's registers (Kernel/Stubs/MPEG.cpp)
+        MpegNodataDone = 4, // the game's sceMpegCbNodata returned: arg mpeg, extra {cbData, demuxedBefore lo, hi}
+        CdStRead = 5,       // v0 >= 0: sceCdStRead goes on: arg sectors, extra {buffer, error address, sectors read}
     };
     uint32_t kind = Unknown;
     uint32_t arg = 0;
+    uint32_t extra[3] = {};
 };
 
 struct EeWaitState
@@ -379,7 +383,8 @@ public:
                                 EeContinuation describe = {});
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
-    [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {},
+                                   EeContinuation describe = {});
 
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;
