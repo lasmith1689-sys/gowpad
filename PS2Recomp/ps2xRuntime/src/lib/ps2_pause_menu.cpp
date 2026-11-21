@@ -114,7 +114,14 @@ namespace
         Layout l;
         const float u = height / 100.0f;
         l.u = u;
-        l.button = {width * 0.5f - 6.0f * u, 12.5f * u, 12.0f * u, 8.0f * u};
+        // the menu button sits in the black bar right of the 16:9 picture when there is one (the iPhone's: ~20 units),
+        // low down: below the face buttons' touch reach, above the rounded corner, away from the Dynamic Island at mid
+        // height; without a bar, small at the top centre
+        const float bar = (width - std::min(width, height * 16.0f / 9.0f)) * 0.5f;
+        if (bar >= 12.0f * u)
+            l.button = {width - bar * 0.5f - 4.5f * u, 80.5f * u, 9.0f * u, 7.0f * u};
+        else
+            l.button = {width * 0.5f - 4.5f * u, 12.5f * u, 9.0f * u, 6.0f * u};
         const float pw = std::min(width - 8.0f * u, 150.0f * u), ph = 88.0f * u;
         l.panel = {(width - pw) * 0.5f, (height - ph) * 0.5f, pw, ph};
         const float px = l.panel.x + 5.0f * u, inner = pw - 10.0f * u;
